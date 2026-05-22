@@ -1,0 +1,113 @@
+#!/bin/bash
+# fleet — one-glance status across every project running fleet agents.
+#
+# Usage:
+#   fleet status         survey all projects (default)
+#   fleet status <slug>  just one
+#   fleet list           list discovered projects and their manifests
+#
+# Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
+# (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
+# it is not subject to the launchd TCC restriction the agents are.
+
+set -uo pipefail
+
+ROOT="${FLEET_PROJECTS_ROOT:-$HOME/Desktop/projects}"
+DOMAIN="gui/$UID"
+CMD="${1:-status}"
+WANT="${2:-}"
+
+c_dim=$'\033[2m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'
+c_bld=$'\033[1m'; c_rst=$'\033[0m'
+
+discover() { find "$ROOT" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort; }
+
+human_age() {  # $1 = epoch seconds of an mtime → "3m" / "2h" / "5d" / "—"
+  [ -z "${1:-}" ] && { echo "—"; return; }
+  local now diff; now=$(date +%s); diff=$(( now - $1 ))
+  if   [ $diff -lt 3600 ];  then echo "$(( diff/60 ))m ago"
+  elif [ $diff -lt 86400 ]; then echo "$(( diff/3600 ))h ago"
+  else echo "$(( diff/86400 ))d ago"; fi
+}
+
+days_until() {  # $1 = YYYYMMDD → integer days from today (may be negative)
+  local target; target=$(date -j -f "%Y%m%d" "$1" +%s 2>/dev/null) || { echo 999; return; }
+  local today; today=$(date -j -f "%Y%m%d" "$(date +%Y%m%d)" +%s)
+  echo $(( (target - today) / 86400 ))
+}
+
+newest_log_epoch() {  # $1 = log dir → mtime of newest *.log, or empty
+  local d="$1"; [ -d "$d" ] || return
+  local f; f=$(ls -t "$d"/*.log 2>/dev/null | head -1) || return
+  [ -n "$f" ] && stat -f %m "$f" 2>/dev/null
+}
+
+if [ "$CMD" = "list" ]; then
+  echo "${c_bld}fleet projects under $ROOT${c_rst}"
+  while read -r m; do
+    [ -z "$m" ] && continue
+    ( source "$m"; printf "  %-14s %s\n" "${SLUG:-?}" "$(dirname "$m")" )
+  done < <(discover)
+  exit 0
+fi
+
+printf "${c_bld}%-12s %-9s %-11s %-7s %-9s %s${c_rst}\n" \
+  PROJECT INSTALLED "LAST RUN" PRS LESSONS "SELF-CANCEL"
+echo "${c_dim}$(printf '%.0s─' {1..68})${c_rst}"
+
+while read -r m; do
+  [ -z "$m" ] && continue
+  PROJECT_DIR="$(dirname "$m")"
+
+  # Read manifest in a subshell so vars don't leak between projects.
+  eval "$(
+    source "$m"
+    echo "SLUG='${SLUG:-?}'"
+    echo "NS='${NAMESPACE:-com.fleet.${SLUG:-x}}'"
+    echo "REPO='$(echo "${REPO_URL:-}" | sed -E 's#https?://github.com/##; s#\.git$##')'"
+    echo "SC='${SELF_CANCEL:-}'"
+    echo "ENG='${ENG_ENABLED:-0}'"
+  )"
+  [ -n "$WANT" ] && [ "$WANT" != "$SLUG" ] && continue
+
+  # installed? — count loaded launchd jobs for this namespace
+  loaded=0
+  for s in ship groom review eng; do
+    launchctl print "$DOMAIN/$NS.agent-$s" >/dev/null 2>&1 && loaded=$(( loaded+1 ))
+  done
+  expected=3; [ "$ENG" = "1" ] && expected=4
+  if   [ $loaded -eq 0 ];         then inst="${c_red}no${c_rst}      "
+  elif [ $loaded -lt $expected ]; then inst="${c_ylw}$loaded/$expected${c_rst}     "
+  else inst="${c_grn}yes${c_rst}     "; fi
+
+  last="$(human_age "$(newest_log_epoch "$HOME/.cache/${SLUG}-agent/logs")")"
+
+  # open agent PRs (best-effort; needs gh auth + network)
+  prs="—"
+  if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
+    n=$(gh pr list --repo "$REPO" --state open --base main \
+          --json headRefName --jq \
+          '[.[] | select(.headRefName | test("^(feat/|chore/gtm-|eng/)"))] | length' \
+          2>/dev/null)
+    [ -n "$n" ] && prs="$n"
+  fi
+
+  # lessons count (entries in the source repo's LESSONS.md)
+  les="—"
+  for lf in "$PROJECT_DIR/docs/LESSONS.md" "$PROJECT_DIR/LESSONS.md"; do
+    [ -f "$lf" ] && { les=$(grep -cE '^(- |## )' "$lf" 2>/dev/null); break; }
+  done
+
+  # self-cancel
+  if [ -n "$SC" ]; then
+    d=$(days_until "$SC")
+    if   [ "$d" -lt 0 ];  then sc="${c_red}EXPIRED ($SC)${c_rst}"
+    elif [ "$d" -le 3 ];  then sc="${c_ylw}${d}d ($SC)${c_rst}"
+    else sc="${c_dim}${d}d${c_rst}"; fi
+  else sc="${c_dim}—${c_rst}"; fi
+
+  printf "%-12s %b %-11s %-7s %-9s %b\n" "$SLUG" "$inst" "$last" "$prs" "$les" "$sc"
+done < <(discover)
+
+echo
+echo "${c_dim}installed=launchd jobs loaded · last run=newest log · prs=open agent PRs · self-cancel=days left${c_rst}"

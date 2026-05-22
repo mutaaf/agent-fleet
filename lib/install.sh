@@ -1,0 +1,109 @@
+#!/bin/bash
+# agent-fleet/lib/install.sh — install one project's fleet agents into launchd.
+#
+# Usage: bash install.sh /abs/path/to/project   (the dir holding agents.config.sh)
+#
+# macOS refuses to let launchd-launched bash touch ~/Desktop without Full Disk
+# Access, so we copy the kit (lib + prompts) AND the project's manifest to a
+# TCC-safe location under ~/.local/share, and point the plists there. The agents
+# themselves operate on a fresh git checkout under ~/.cache, also TCC-safe.
+#
+# Idempotent — re-run after editing the manifest or any kit script to refresh.
+
+set -euo pipefail
+
+PROJECT_DIR="$( cd "${1:?usage: install.sh /abs/path/to/project}" && pwd )"
+[ -f "$PROJECT_DIR/agents.config.sh" ] || { echo "no agents.config.sh in $PROJECT_DIR" >&2; exit 2; }
+
+# shellcheck disable=SC1090
+source "$PROJECT_DIR/agents.config.sh"
+: "${SLUG:?manifest missing SLUG}"
+NAMESPACE="${NAMESPACE:-com.fleet.$SLUG}"
+SHIP_MINUTE="${SHIP_MINUTE:-41}"
+GROOM_HOURS="${GROOM_HOURS:-0 6 12 18}"
+GROOM_MINUTE="${GROOM_MINUTE:-17}"
+REVIEW_INTERVAL="${REVIEW_INTERVAL:-300}"
+ENG_ENABLED="${ENG_ENABLED:-0}"
+ENG_HOURS="${ENG_HOURS:-3 9 15 21}"
+ENG_MINUTE="${ENG_MINUTE:-23}"
+
+KIT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
+INSTALL_ROOT="$HOME/.local/share/agent-fleet"
+CFG_DIR="$INSTALL_ROOT/projects/$SLUG"
+LOG_DIR="$HOME/.cache/${SLUG}-agent/logs"
+AGENTS_DIR="$HOME/Library/LaunchAgents"
+DOMAIN="gui/$UID"
+
+mkdir -p "$INSTALL_ROOT" "$CFG_DIR" "$LOG_DIR" "$AGENTS_DIR"
+
+# TCC-safe copy of the engine (shared by all projects) + this project's manifest.
+/bin/cp -Rf "$KIT_ROOT/lib"     "$INSTALL_ROOT/"
+/bin/cp -Rf "$KIT_ROOT/prompts" "$INSTALL_ROOT/"
+/bin/cp -f  "$PROJECT_DIR/agents.config.sh" "$CFG_DIR/agents.config.sh"
+chmod +x "$INSTALL_ROOT/lib/"*.sh
+
+# Emit a <key>StartCalendarInterval</key> block from a list of hours at one minute.
+calendar_array() {  # $1 = "0 6 12 18", $2 = minute
+  echo "  <key>StartCalendarInterval</key>"; echo "  <array>"
+  for h in $1; do
+    echo "    <dict><key>Hour</key><integer>$h</integer><key>Minute</key><integer>$2</integer></dict>"
+  done
+  echo "  </array>"
+}
+
+# Emit one plist. $1=label suffix (ship/groom/review/eng) $2=runner $3=schedule-xml
+write_plist() {
+  local suffix="$1" runner="$2" schedule="$3"
+  local label="$NAMESPACE.agent-$suffix"
+  cat >"$AGENTS_DIR/$label.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$INSTALL_ROOT/lib/$runner</string>
+    <string>$CFG_DIR</string>
+  </array>
+$schedule
+  <key>StandardOutPath</key><string>$LOG_DIR/launchd-$suffix.out</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/launchd-$suffix.err</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+EOF
+}
+
+write_plist ship   ship.sh   "  <key>StartCalendarInterval</key>
+  <dict><key>Minute</key><integer>$SHIP_MINUTE</integer></dict>"
+write_plist groom  groom.sh  "$(calendar_array "$GROOM_HOURS" "$GROOM_MINUTE")"
+write_plist review review.sh "  <key>StartInterval</key><integer>$REVIEW_INTERVAL</integer>"
+
+LABELS="agent-ship agent-groom agent-review"
+if [ "$ENG_ENABLED" = "1" ]; then
+  write_plist eng eng.sh "$(calendar_array "$ENG_HOURS" "$ENG_MINUTE")"
+  LABELS="$LABELS agent-eng"
+fi
+
+# (Re)load. bootout is idempotent on a missing label.
+for L in $LABELS; do launchctl bootout "$DOMAIN/$NAMESPACE.$L" 2>/dev/null || true; done
+for L in $LABELS; do
+  launchctl bootstrap "$DOMAIN" "$AGENTS_DIR/$NAMESPACE.$L.plist"
+  launchctl enable "$DOMAIN/$NAMESPACE.$L"
+done
+
+echo
+echo "✓ installed fleet agents for $SLUG ($NAMESPACE.*):"
+echo "    agent-ship   — every hour at :$SHIP_MINUTE"
+echo "    agent-groom  — at :$GROOM_MINUTE on hours [$GROOM_HOURS]"
+echo "    agent-review — every $((REVIEW_INTERVAL/60)) min (polls; self-gates)"
+[ "$ENG_ENABLED" = "1" ] && echo "    agent-eng    — at :$ENG_MINUTE on hours [$ENG_HOURS]"
+echo
+echo "Engine:    $INSTALL_ROOT/lib  (TCC-safe)"
+echo "Manifest:  $CFG_DIR/agents.config.sh"
+echo "Logs:      $LOG_DIR/"
+echo "Run now:   launchctl kickstart -k $DOMAIN/$NAMESPACE.agent-ship"
+echo "Uninstall: bash $KIT_ROOT/lib/uninstall.sh $PROJECT_DIR"
