@@ -13,6 +13,7 @@
 set -uo pipefail
 
 ROOT="${FLEET_PROJECTS_ROOT:-$HOME/Desktop/projects}"
+INSTALLED="$HOME/.local/share/agent-fleet/projects"
 DOMAIN="gui/$UID"
 CMD="${1:-status}"
 WANT="${2:-}"
@@ -20,7 +21,20 @@ WANT="${2:-}"
 c_dim=$'\033[2m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'
 c_bld=$'\033[1m'; c_rst=$'\033[0m'
 
-discover() { find "$ROOT" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort; }
+# Manifests live in two places: the repo working tree (may be on a branch that
+# doesn't have it yet) and the TCC-safe install location (what's actually
+# deployed). Union both and de-dup by SLUG so a project shows whether its
+# manifest has merged to main or is still on a PR branch. Working-tree copies are
+# listed first, so they win the de-dup (they sit next to docs/LESSONS.md).
+discover() {
+  local _seen=""
+  { find "$ROOT" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$INSTALLED" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    local slug; slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    case " $_seen " in *" $slug "*) ;; *) _seen="$_seen $slug"; echo "$m";; esac
+  done
+}
 
 human_age() {  # $1 = epoch seconds of an mtime → "3m" / "2h" / "5d" / "—"
   [ -z "${1:-}" ] && { echo "—"; return; }
@@ -92,9 +106,12 @@ while read -r m; do
     [ -n "$n" ] && prs="$n"
   fi
 
-  # lessons count (entries in the source repo's LESSONS.md)
+  # lessons count — try the repo working tree, then the agent's fresh checkout
+  # (so it resolves even when discovery used the installed manifest).
   les="—"
-  for lf in "$PROJECT_DIR/docs/LESSONS.md" "$PROJECT_DIR/LESSONS.md"; do
+  for lf in "$PROJECT_DIR/docs/LESSONS.md" "$PROJECT_DIR/LESSONS.md" \
+            "$HOME/.cache/${SLUG}-agent/checkout/docs/LESSONS.md" \
+            "$HOME/.cache/${SLUG}-agent/checkout/LESSONS.md"; do
     [ -f "$lf" ] && { les=$(grep -cE '^(- |## )' "$lf" 2>/dev/null); break; }
   done
 
