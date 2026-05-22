@@ -16,6 +16,8 @@
   - `eng/` — engineering work (eng agent, only if ENG_ENABLED)
 - **Local gate command** — what the heal/dev step runs locally before pushing
   (must be green): `[npm run typecheck && npm run build && npx playwright test --project=chromium]`
+  Include `node scripts/check-backlog.mjs` here too if it's a CI gating step —
+  otherwise backlog drift passes the local gate and only fails in CI.
 - **Subagents** (in `.claude/agents/`): `implementation-dev`, `gtm-innovation`,
   `review`[, `eng-dev`]
 - **Backlog areas**: `[labs | plan | meals | today | progress | settings | infra | privacy | growth]`
