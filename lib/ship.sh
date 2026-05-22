@@ -14,7 +14,7 @@ fleet_log_init ship
 fleet_self_cancel || exit 0
 fleet_checkout checkout
 
-claude --print --dangerously-skip-permissions --model "$MODEL" < "$FLEET_PROMPTS/ship.prompt.md"
+fleet_run_claude ship < "$FLEET_PROMPTS/ship.prompt.md"
 EXIT=$?
 
 echo

@@ -68,6 +68,7 @@ fleet_log_init() {
   local ts; ts=$(date -u +%Y%m%d-%H%M%S)
   FLEET_LOG="$LOG_DIR/${phase}-${ts}.log"
   exec >"$FLEET_LOG" 2>&1
+  RUN_STARTED_UTC="$(date -u +%FT%TZ)"
   echo "=== ${SLUG}-${phase} firing $(date -u) (local $(date)) ==="
   echo "project=$PROJECT_NAME  model=$MODEL  repo=$REPO"
   echo "claude=$(command -v claude || echo MISSING)"
@@ -91,4 +92,33 @@ fleet_checkout() {
   git clean -fdq
   git config user.email "$GIT_AUTHOR_EMAIL"
   git config user.name "$GIT_AUTHOR_NAME"
+}
+
+# --- claude with structured capture ---------------------------------------
+# fleet_run_claude <phase>  — reads the prompt on stdin, runs claude in JSON mode,
+# emits the human-readable .result text to the log (back-compat for log parsers),
+# AND appends a structured record to ~/.cache/<slug>-agent/runs.jsonl for the
+# fleet-control cost engine (measured total_cost_usd + usage). Best-effort: if jq
+# or the JSON is missing, it still prints output and the run proceeds.
+fleet_run_claude() {
+  local phase="$1"
+  local tmp; tmp="$(mktemp)"
+  claude --print --output-format json --dangerously-skip-permissions --model "$MODEL" >"$tmp" 2>/dev/null
+  local exit=$?
+  if command -v jq >/dev/null 2>&1 && jq -e . "$tmp" >/dev/null 2>&1; then
+    jq -r '.result // empty' "$tmp"
+    local rec
+    rec="$(jq -c \
+      --arg slug "$SLUG" --arg phase "$phase" --arg exit "$exit" \
+      --arg s "${RUN_STARTED_UTC:-}" --arg e "$(date -u +%FT%TZ)" --arg model "$MODEL" \
+      '{slug:$slug,phase:$phase,ts_start:$s,ts_end:$e,exit:($exit|tonumber),model:$model,
+        session_id:.session_id, total_cost_usd:.total_cost_usd, duration_ms:.duration_ms,
+        num_turns:.num_turns, usage:.usage, is_error:.is_error, result_head:((.result//"")[0:500])}' \
+      "$tmp" 2>/dev/null)"
+    [ -n "$rec" ] && printf '%s\n' "$rec" >> "$CACHE_DIR/runs.jsonl"
+  else
+    cat "$tmp"   # fallback: claude didn't emit JSON
+  fi
+  rm -f "$tmp"
+  return $exit
 }

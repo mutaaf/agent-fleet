@@ -14,7 +14,7 @@ fleet_log_init groom
 fleet_self_cancel || exit 0
 fleet_checkout checkout
 
-claude --print --dangerously-skip-permissions --model "$MODEL" < "$FLEET_PROMPTS/groom.prompt.md"
+fleet_run_claude groom < "$FLEET_PROMPTS/groom.prompt.md"
 EXIT=$?
 
 echo

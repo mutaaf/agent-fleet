@@ -58,7 +58,7 @@ for PR in $UNREVIEWED; do
   echo "diff: $(wc -l </tmp/fleet-review/diff.patch | tr -d ' ') lines"; echo
 
   PR="$PR" REPO="$REPO" ME="$ME" \
-    claude --print --dangerously-skip-permissions --model "$MODEL" <<PROMPT
+    fleet_run_claude review <<PROMPT
 You are the autonomous Review agent for the $REPO repo, reviewing PR #$PR
 on branch \$(jq -r .headRefName /tmp/fleet-review/meta.json).
 
