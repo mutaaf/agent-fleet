@@ -94,6 +94,40 @@ Bigger lift because its data model differs. Order within:
 6. Fold its lessons (em-dash rule, two-stage review) into the standard prompts if
    not already covered.
 
+### DC cutover (gated runbook)
+
+Phase B's additive prep is **done and on a PR** (DC #27): `agents.config.sh`,
+`AGENTS.md` + `## Agent parameters`, the four `.claude/agents/` subagents, the
+`docs/backlog/` ticket system + validator (4 items seeded), and the validator
+wired into CI. All of it is **dormant** — the legacy `gtm`/`eng` shell agents read
+`AGENT.md` + the inline checklist, which are untouched, so #27 is safe to merge
+without changing the running loop.
+
+The remaining steps are the **behavioral cutover**, gated because DC is a live
+daily-committing marketing site and the change is real (not the near-identical
+swap the twins were). Do these together, watching the first ship run:
+
+1. Merge DC #27 to `main`.
+2. **Convert the remaining 7 legacy Tier-7 items** to ticket files (or let the
+   first kit groom run do it), then delete the inline backlog from `AGENT.md` and
+   point the file at `docs/backlog/`.
+3. **Add `.github/workflows/auto-merge.yml`** (mirror CourtIQ's) so the reviewer
+   becomes vote-only — this changes merge authority, so don't add it until step 5.
+4. **Decide detection**: the kit detects agent PRs by branch prefix
+   (`feat/`/`chore/gtm-`/`eng/`), DC's legacy loop used the `gtm-agent`/`eng-agent`
+   *labels*. The new subagents already open prefixed branches; confirm branch
+   protection requires `build` + `smoke-required`.
+5. **Cut over launchd**: `bash agent-fleet/lib/install.sh <dc>` to create
+   `com.digitalcraft.agent-{ship,groom,review,eng}`, then bootout the legacy
+   `com.digitalcraft.{gtm-worker,gtm-groomer,gtm-reviewer,eng-worker}`. (Note: a
+   `gtm-worker` run was observed hung for hours — clear it on cutover.)
+6. **Watch the first ship + review runs** (`~/.cache/digitalcraft-agent/logs/`,
+   `fleet status`) before walking away. Confirm the first PR respects the no-touch
+   zones (`/api/`), the em-dash ban, and dark-mode variants.
+
+Rollback: `bash agent-fleet/lib/uninstall.sh <dc>` then re-run DC's original
+`scripts/install plists` (the `gtm-*-local.sh` scripts are untouched).
+
 ### Phase C — Fleet hygiene (ongoing)
 
 - `fleet status` becomes the morning glance. Bump `SELF_CANCEL` from one place.
