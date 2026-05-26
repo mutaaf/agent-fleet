@@ -1,7 +1,7 @@
 ---
 id: 0014
 title: Trainee mode requires operator approval for the first N PRs
-status: groomed
+status: in-progress
 priority: P1
 area: safety
 created: 2026-05-26
@@ -114,4 +114,8 @@ Each box maps 1:1 to a test scenario in `tests/trainee.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 (implementation-dev): branched `feat/0014-trainee-mode`. Drift
+  cleanup on the same branch: ticket 0006 was merged (commit 1976339) but its
+  ticket file frontmatter + README index row both still said `in-progress`;
+  flipped both to `shipped` here. Writing `tests/trainee.sh` first (one test
+  per acceptance-criteria box), then implementing the kit changes.

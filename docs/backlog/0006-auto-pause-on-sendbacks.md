@@ -1,7 +1,7 @@
 ---
 id: 0006
 title: Auto-pause ship after N consecutive send-backs
-status: in-progress
+status: shipped
 priority: P1
 area: safety
 created: 2026-05-26
