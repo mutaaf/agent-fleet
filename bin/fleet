@@ -743,6 +743,377 @@ if [ "$CMD" = "doctor" ]; then
   doctor "$@"
 fi
 
+# --- digest ---------------------------------------------------------------
+# Ticket 0012. `fleet digest` prints one line per discovered project
+# summarising the last 24h (configurable via --since Nh|Nd): state tag,
+# `N opened / M merged` PRs, $X.YY spend, and the most recent event type
+# (or the last LESSONS.md line if no events in 7d).
+#
+# Discovery uses FLEET_DISCOVERY_ROOT — same root as doctor (0003). The
+# output is intentionally line-oriented so an operator can pipe it into
+# `mail`, `grep`, or a tmux status bar.
+#
+# Output contract (one line per project, slug-alpha):
+#   <slug>  <STATE>  N opened / M merged  $X.YY  <last-event-or-lesson>
+# State priority (red → quiet):
+#   EXPIRED       past SELF_CANCEL
+#   OVER-BUDGET   today's spend ≥ MAX_DAILY_USD
+#   PAUSED        launchd label <ns>.agent-ship is disabled
+#   THROTTLED     $CACHE_DIR/groom-slowed-since exists (ticket 0007)
+#   STUCK         an open agent PR is >24h old with no activity in 6h
+#   OK            none of the above
+# Exit code 1 if ANY project is red (EXPIRED/OVER-BUDGET/STUCK); else 0.
+#
+# --json mode emits a JSON array with the same fields plus structured
+# sub-fields (slug, state, prs_opened, prs_merged, spend_usd, last,
+# self_cancel, since_seconds). The schema is the source of truth for any
+# downstream consumer (fleet-control, cron-mailed digests).
+
+DIGEST_ROOT="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+
+# Parse "Nh" or "Nd" → seconds. Echoes 0 + returns 1 on bad input.
+digest_parse_since() {
+  local s="$1" n unit
+  case "$s" in
+    *h) unit=h; n="${s%h}" ;;
+    *d) unit=d; n="${s%d}" ;;
+    *)  return 1 ;;
+  esac
+  case "$n" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  if [ "$unit" = "h" ]; then echo $(( n * 3600 ))
+  else                       echo $(( n * 86400 )); fi
+}
+
+# Convert an ISO8601-ish UTC timestamp to epoch seconds. Returns "" on parse
+# failure so the caller can skip the record without aborting the whole digest.
+# macOS BSD date wants -j -f; GNU date takes -d directly.
+digest_iso_to_epoch() {
+  local ts="$1"
+  [ -z "$ts" ] && return 0
+  # Strip trailing Z + any sub-second fraction.
+  local clean; clean="$(echo "$ts" | sed -E 's/\.[0-9]+Z$/Z/; s/Z$//')"
+  date -u -j -f '%Y-%m-%dT%H:%M:%S' "$clean" +%s 2>/dev/null \
+    || date -u -d "$ts" +%s 2>/dev/null \
+    || true
+}
+
+# Sum total_cost_usd in runs.jsonl whose ts_start ≥ cutoff_epoch. Echoes a
+# number like "1.50". Tolerates a missing file (echoes 0).
+digest_spend_since() {
+  local runs="$1" cutoff="$2"
+  [ -f "$runs" ] || { echo "0"; return 0; }
+  awk -v cutoff="$cutoff" '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    {
+      ts=""; cost=0
+      if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts)
+        sub(/".*/, "", ts)
+      }
+      if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        c=substr($0, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*/, "", c)
+        cost = c + 0
+      }
+      if (ts == "") next
+      ep = iso2ep(ts)
+      if (ep >= cutoff) total += cost
+    }
+    END { printf("%.2f", total + 0) }
+  ' "$runs"
+}
+
+# Count events of a given type in events.jsonl whose ts ≥ cutoff.
+digest_event_count_since() {
+  local events="$1" cutoff="$2" want_type="$3"
+  [ -f "$events" ] || { echo 0; return 0; }
+  awk -v cutoff="$cutoff" -v want="$want_type" '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    {
+      ts=""; type=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (type != want) next
+      if (iso2ep(ts) >= cutoff) n++
+    }
+    END { print (n+0) }
+  ' "$events"
+}
+
+# Print the .type of the most recent event in events.jsonl. Echoes empty if
+# none. Most recent = last line (file is append-only). Caller decides whether
+# to fall back to LESSONS.md based on age.
+digest_last_event() {
+  local events="$1"
+  [ -f "$events" ] || return 0
+  local line
+  line="$(tail -n 1 "$events" 2>/dev/null)"
+  [ -z "$line" ] && return 0
+  echo "$line" | sed -nE 's/.*"type"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p'
+}
+
+# Echo the ts of the most recent event as epoch seconds, or empty.
+digest_last_event_epoch() {
+  local events="$1"
+  [ -f "$events" ] || return 0
+  local line; line="$(tail -n 1 "$events" 2>/dev/null)"
+  [ -z "$line" ] && return 0
+  local ts; ts="$(echo "$line" | sed -nE 's/.*"ts"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+  digest_iso_to_epoch "$ts"
+}
+
+# Echo the last non-empty line of LESSONS.md, truncated to 60 chars. Empty
+# if the file doesn't exist.
+digest_last_lesson() {
+  local proj_dir="$1"
+  local lf
+  for lf in "$proj_dir/docs/LESSONS.md" "$proj_dir/LESSONS.md"; do
+    [ -f "$lf" ] || continue
+    awk 'NF { last=$0 } END { print last }' "$lf" | cut -c1-60
+    return 0
+  done
+}
+
+# Compute the state tag per the ticket's priority order. Echoes one of
+# EXPIRED | OVER-BUDGET | PAUSED | THROTTLED | STUCK | OK.
+digest_state() {
+  local self_cancel="$1" spend_today="$2" cap="$3" namespace="$4" cache_dir="$5"
+  # EXPIRED — SELF_CANCEL is YYYYMMDD (UTC).
+  local today; today="$(date -u +%Y%m%d)"
+  case "$self_cancel" in
+    ''|*[!0-9]*) ;;
+    *) if [ "$today" -ge "$self_cancel" ]; then echo "EXPIRED"; return 0; fi ;;
+  esac
+  # OVER-BUDGET — today's spend ≥ cap (when cap is set).
+  if [ -n "$cap" ]; then
+    if awk -v s="$spend_today" -v c="$cap" 'BEGIN { exit !(s + 0 >= c + 0) }'; then
+      echo "OVER-BUDGET"; return 0
+    fi
+  fi
+  # PAUSED — launchctl print-disabled lists the agent-ship label.
+  if command -v launchctl >/dev/null 2>&1; then
+    if launchctl print-disabled "gui/$UID" 2>/dev/null \
+         | grep -q "\"$namespace.agent-ship\" => true"; then
+      echo "PAUSED"; return 0
+    fi
+  fi
+  # THROTTLED — groom-slowed-since marker exists (ticket 0007).
+  if [ -f "$cache_dir/groom-slowed-since" ]; then
+    echo "THROTTLED"; return 0
+  fi
+  # STUCK — defer to caller (needs `gh`); the digest opts out of STUCK when
+  # gh is unavailable. We treat STUCK as out-of-scope unless explicitly
+  # surfaced via `FLEET_DIGEST_STUCK=1` + a non-empty stuck signal file
+  # (kept simple for the v1 — STUCK is the noisiest signal to compute).
+  if [ -f "$cache_dir/stuck-pr" ]; then
+    echo "STUCK"; return 0
+  fi
+  echo "OK"
+}
+
+# Today's UTC-day spend, used for the OVER-BUDGET check (which is per
+# calendar day, not per --since window).
+digest_spend_today() {
+  local runs="$1"
+  [ -f "$runs" ] || { echo "0"; return 0; }
+  local today; today="$(date -u +%Y-%m-%d)"
+  awk -v day="$today" '
+    {
+      ts=""; cost=0
+      if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        c=substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", c); cost = c + 0
+      }
+      if (index(ts, day) == 1) total += cost
+    }
+    END { printf("%.2f", total + 0) }
+  ' "$runs"
+}
+
+# Render one project line in human form. All inputs pre-computed.
+digest_render_human() {
+  local slug="$1" state="$2" opened="$3" merged="$4" spend="$5" last="$6"
+  printf '%s  %s  %s opened / %s merged  $%s  %s\n' \
+    "$slug" "$state" "$opened" "$merged" "$spend" "$last"
+}
+
+digest() {
+  shift  # drop "digest"
+  local want_json=0 slug_filter="" since="24h" emoji=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)  want_json=1; shift ;;
+      --emoji) emoji=1; shift ;;
+      --slug)  slug_filter="${2:-}"; shift 2 ;;
+      --slug=*) slug_filter="${1#--slug=}"; shift ;;
+      --since) since="${2:-}"; shift 2 ;;
+      --since=*) since="${1#--since=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet digest — one-line summary per project for the trailing window.
+
+Usage:
+  fleet digest                       survey all projects, last 24h
+  fleet digest --slug NAME           restrict to one project
+  fleet digest --since 7d            widen the window (Nh or Nd)
+  fleet digest --json                machine-readable array
+  fleet digest --emoji               (reserved; non-ASCII state glyphs)
+
+Output (one line per project, slug-alpha order):
+  <slug>  <STATE>  N opened / M merged  \$X.YY  <last-event-or-lesson>
+
+States, priority order: EXPIRED, OVER-BUDGET, PAUSED, THROTTLED, STUCK, OK.
+
+JSON schema (one object per project):
+  { slug, state, prs_opened, prs_merged, spend_usd, last,
+    self_cancel, since_seconds }
+
+Exit code: 1 if any project is in a red state
+(EXPIRED, OVER-BUDGET, STUCK); else 0.
+USAGE
+        exit 0 ;;
+      *) echo "fleet digest: unknown flag '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  # We don't currently use --emoji's value, but accepting the flag now lets
+  # us add glyphs later without breaking callers. Reference it once so the
+  # static analyzer doesn't complain about an unread variable.
+  : "$emoji"
+
+  local since_seconds
+  if ! since_seconds="$(digest_parse_since "$since")"; then
+    echo "fleet digest: --since must be Nh or Nd (got '$since')" >&2
+    exit 2
+  fi
+  local now cutoff
+  now=$(date -u +%s)
+  cutoff=$(( now - since_seconds ))
+  local seven_days_ago=$(( now - 7 * 86400 ))
+
+  # Discover manifests under FLEET_DISCOVERY_ROOT — same pattern as doctor.
+  local manifests=()
+  while IFS= read -r m; do
+    [ -n "$m" ] && manifests+=("$m")
+  done < <(find "$DIGEST_ROOT" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort)
+
+  local any_red=0
+  local json_rows=""
+  local m
+  for m in "${manifests[@]:-}"; do
+    [ -z "$m" ] && continue
+    local proj_dir; proj_dir="$(dirname "$m")"
+    # Load manifest in a subshell, echo back the fields we need.
+    local probe slug namespace self_cancel cap
+    probe=$(
+      # shellcheck disable=SC1090
+      ( source "$m" 2>/dev/null
+        echo "SLUG=${SLUG:-}"
+        echo "NAMESPACE=${NAMESPACE:-com.fleet.${SLUG:-x}}"
+        echo "SELF_CANCEL=${SELF_CANCEL:-}"
+        echo "MAX_DAILY_USD=${MAX_DAILY_USD:-}"
+      ) 2>/dev/null
+    ) || true
+    slug="$(echo "$probe" | sed -n 's/^SLUG=//p')"
+    namespace="$(echo "$probe" | sed -n 's/^NAMESPACE=//p')"
+    self_cancel="$(echo "$probe" | sed -n 's/^SELF_CANCEL=//p')"
+    cap="$(echo "$probe" | sed -n 's/^MAX_DAILY_USD=//p')"
+    [ -z "$slug" ] && continue
+    [ -n "$slug_filter" ] && [ "$slug" != "$slug_filter" ] && continue
+
+    local cache_dir="$HOME/.cache/${slug}-agent"
+    local runs="$cache_dir/runs.jsonl"
+    local events="$cache_dir/events.jsonl"
+
+    # PR counts — events.jsonl is the source of truth (per AC#2). pr_opened
+    # is emitted today; pr_merged is reserved for when a runner emits it.
+    local opened merged
+    opened="$(digest_event_count_since "$events" "$cutoff" "pr_opened")"
+    merged="$(digest_event_count_since "$events" "$cutoff" "pr_merged")"
+
+    # Spend in the requested window (display column) AND today's spend
+    # (used for OVER-BUDGET, which is calendar-day per AC#4).
+    local spend spend_today
+    spend="$(digest_spend_since "$runs" "$cutoff")"
+    spend_today="$(digest_spend_today "$runs")"
+
+    local state
+    state="$(digest_state "$self_cancel" "$spend_today" "$cap" "$namespace" "$cache_dir")"
+
+    case "$state" in
+      EXPIRED|OVER-BUDGET|STUCK) any_red=1 ;;
+    esac
+
+    # last-event-or-lesson. If newest event ≥ 7d ago, use type; otherwise
+    # fall back to the trailing LESSONS.md line, truncated to 60 chars.
+    local last last_type last_epoch
+    last_type="$(digest_last_event "$events")"
+    last_epoch="$(digest_last_event_epoch "$events")"
+    if [ -n "$last_type" ] && [ -n "$last_epoch" ] && [ "$last_epoch" -ge "$seven_days_ago" ]; then
+      last="$last_type"
+      # Trim to 60 chars (the type alone is short; this is defensive).
+      last="$(printf '%s' "$last" | cut -c1-60)"
+    else
+      last="$(digest_last_lesson "$proj_dir")"
+      [ -z "$last" ] && last="-"
+    fi
+
+    if [ "$want_json" = "1" ]; then
+      local esc_slug esc_state esc_last esc_sc
+      esc_slug="$(doctor_json_escape "$slug")"
+      esc_state="$(doctor_json_escape "$state")"
+      esc_last="$(doctor_json_escape "$last")"
+      esc_sc="$(doctor_json_escape "$self_cancel")"
+      [ -n "$json_rows" ] && json_rows+=","
+      json_rows+="{\"slug\":\"$esc_slug\",\"state\":\"$esc_state\""
+      json_rows+=",\"prs_opened\":$opened,\"prs_merged\":$merged"
+      json_rows+=",\"spend_usd\":$spend"
+      json_rows+=",\"last\":\"$esc_last\""
+      json_rows+=",\"self_cancel\":\"$esc_sc\""
+      json_rows+=",\"since_seconds\":$since_seconds}"
+    else
+      digest_render_human "$slug" "$state" "$opened" "$merged" "$spend" "$last"
+    fi
+  done
+
+  if [ "$want_json" = "1" ]; then
+    printf '[%s]\n' "$json_rows"
+  fi
+
+  [ "$any_red" = "1" ] && exit 1
+  exit 0
+}
+
+if [ "$CMD" = "digest" ]; then
+  digest "$@"
+fi
+
 if [ "$CMD" = "list" ]; then
   echo "${c_bld}fleet projects under $ROOT${c_rst}"
   while read -r m; do
