@@ -36,39 +36,53 @@ kit. Compare to "trust the LLM not to do it."
 
 ## Acceptance criteria
 
-- [ ] `lib/common.sh` exposes `fleet_install_prepush_hook` which writes a
-      `.git/hooks/pre-push` to the current checkout. The hook runs
-      `gitleaks detect --no-banner --redact --staged` if `gitleaks` is on
-      `PATH`, else falls back to a small built-in regex scan of
-      `git diff --cached`.
-- [ ] The built-in fallback regex catches: `(?i)(api[_-]?key|secret|token|
-      bearer)\s*[:=]\s*["']?[A-Za-z0-9_\-]{20,}`, `sk-[a-zA-Z0-9]{20,}`,
-      `ghp_[A-Za-z0-9]{36}`, `gho_[A-Za-z0-9]{36}`, AWS access key ids
-      (`AKIA[0-9A-Z]{16}`), and Anthropic API keys (`sk-ant-[A-Za-z0-9_-]{30,}`).
-- [ ] `fleet_checkout` calls `fleet_install_prepush_hook` after the
+Each box maps 1:1 to a test scenario in `tests/secret-scan.sh`.
+
+- [ ] `lib/common.sh` exposes `fleet_install_prepush_hook <checkout_dir>`
+      which writes an executable `.git/hooks/pre-push` to that checkout.
+      Called automatically by `fleet_checkout` after the
       `git config user.email`/`user.name` block.
-- [ ] When the hook fires on a real match, it exits non-zero with a one-line
-      reason on stderr. The push command (run by the dev agent later) fails;
-      the dev agent must then handle the error.
-- [ ] `tests/secret-scan.sh` creates a fake commit with a fake `sk-ant-`
-      string and asserts the hook exits 1; then with a clean commit asserts
-      exit 0.
+- [ ] Given a checkout where the hook ran a `git commit` adding a file
+      containing `sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`, the hook
+      exits 1 with a stderr line matching `secret detected:` and the
+      pattern name.
+- [ ] Given a checkout where the hook ran with a clean commit (no
+      secret-like strings), the hook exits 0 silently.
+- [ ] The built-in fallback regex MUST match each of these patterns (one
+      test case per pattern):
+      `sk-ant-[A-Za-z0-9_-]{30,}` (Anthropic), `ghp_[A-Za-z0-9]{36}`
+      (GitHub PAT), `gho_[A-Za-z0-9]{36}` (GitHub OAuth),
+      `AKIA[0-9A-Z]{16}` (AWS), `sk-[A-Za-z0-9]{20,}` (OpenAI-shape),
+      and `(?i)(api[_-]?key|secret|token|bearer)\s*[:=]\s*["']?[A-Za-z0-9_\-]{20,}`.
+- [ ] If `gitleaks` is on PATH, the hook delegates to
+      `gitleaks detect --no-banner --redact --staged` and respects its exit
+      code. The test stubs `gitleaks` on PATH with a script that exits 1
+      and asserts the hook propagates the failure.
+- [ ] When the hook blocks a push, `fleet_emit_event push_blocked
+      reason=secret_match pattern=<name>` is emitted.
 - [ ] `AGENTS.md` Hard NOs already covers "never commit secrets"; add a
-      one-line link to this hook for context.
+      one-line cross-reference: "Enforced locally by the pre-push hook
+      installed by `fleet_install_prepush_hook` — see ticket 0008."
 
 ## Out of scope
 
 - Server-side scanning (GitHub's secret scanning is already on by default
   for public repos; that's the second line of defense).
 - Allow-list management. False positives mean the operator handles them
-  manually.
+  manually by amending the commit.
+- Scanning files already in `main`. Pre-push only — historical leaks are
+  out of scope.
 
 ## Engineering notes
 
 - `lib/common.sh` — `fleet_install_prepush_hook` near `fleet_checkout`. The
-  hook content is a heredoc; make it small and self-contained.
+  hook body is a heredoc; keep under 60 lines, self-contained, no `jq`
+  dependency.
+- The hook reads `git diff --cached` (or `git log -p $local_sha ^$remote_sha`
+  for pre-push specifically) and pipes through `grep -E` for each pattern.
 - `tests/secret-scan.sh` — `mktemp -d`, `git init`, stage a file with a
-  known secret-like string, run the hook directly, assert exit code.
+  fake matching string per pattern, invoke the hook directly (not via
+  `git push`, which needs a remote), assert exit code and stderr text.
 - Public API: additive.
 - Reinstall: all projects.
 

@@ -37,36 +37,48 @@ before adopting a new autonomous-agent kit.
 
 ## Acceptance criteria
 
-- [ ] When `AGENT_DRY_RUN=1` is set in the environment (or the manifest),
-      `fleet_run_claude` invokes `claude --print --allowedTools none` so
-      the model emits a plan but can't run tools. The .result is logged
-      and recorded normally.
-- [ ] The dev agent's prompt has no special accommodation needed — it just
-      can't execute tools. The log captures the model's intended plan.
-- [ ] `fleet_emit_event run_dry_run plan_head=<first-200-chars-of-result>`
-      is emitted instead of `run_completed` when dry-run mode is active.
-- [ ] `bin/fleet kickstart <slug> <phase> --dry-run` triggers a one-off
-      dry run by setting the env var and invoking `launchctl kickstart`.
-- [ ] `tests/dry-run.sh` stubs the `claude` binary with a script that asserts
-      `--allowedTools none` was passed when `AGENT_DRY_RUN=1` is set, and
-      not passed when unset.
+Each box maps 1:1 to a test scenario in `tests/dry-run.sh`.
+
+- [ ] Given `AGENT_DRY_RUN=1` and a stubbed `claude` on PATH that records
+      its argv, calling `fleet_run_claude` results in argv containing
+      `--allowedTools` followed by `none`.
+- [ ] Given `AGENT_DRY_RUN` unset, the same `fleet_run_claude` invocation
+      does NOT pass `--allowedTools none`.
+- [ ] In dry-run mode, `fleet_emit_event run_dry_run
+      plan_head=<first-200-chars-of-result>` is emitted; `run_completed`
+      is NOT emitted (it's replaced, not paired).
+- [ ] Dry-run mode still appends to `runs.jsonl` with the recorded cost
+      and result (it's a real claude call, just tool-locked).
+- [ ] `bin/fleet kickstart <slug> <phase> --dry-run` exports
+      `AGENT_DRY_RUN=1` and invokes `launchctl kickstart` against the
+      matching label. The test stubs `launchctl` and asserts the kickstart
+      call was made and the env was exported (by having the kickstart
+      stub echo `AGENT_DRY_RUN` into a file).
+- [ ] `bin/fleet kickstart <slug> <phase>` (without `--dry-run`) does NOT
+      set the env var.
 - [ ] `README.md` "Daily ops" section mentions the env var and the
-      `--dry-run` kickstart flag.
+      `--dry-run` kickstart flag (grep for `AGENT_DRY_RUN`).
 
 ## Out of scope
 
 - A separate dry-run prompt. The same prompt runs; only tool execution is
   disabled.
 - Dry-run-then-confirm flows. v1 is just observation.
+- Dry-run for the `review` phase (review already has no write effects on
+  the repo — its only mutation is the GitHub review comment; we'd need a
+  separate ticket for that).
 
 ## Engineering notes
 
 - `lib/common.sh` — branch in `fleet_run_claude` on `${AGENT_DRY_RUN:-}`.
-- `bin/fleet` — add `--dry-run` flag to `kickstart` subcommand (introduce
-  the subcommand if it doesn't exist yet; it's small).
-- Blocked-by: 0002 (events channel).
+  Append `--allowedTools none` to the existing argv when set. Replace the
+  `run_completed` emission with `run_dry_run` when set.
+- `bin/fleet` — introduce `kickstart <slug> <phase> [--dry-run]` subcommand
+  (small; wraps `launchctl kickstart -k gui/$UID/$NAMESPACE.agent-$PHASE`
+  with an optional `env AGENT_DRY_RUN=1` prefix via `launchctl setenv`).
 - Public API: additive — `fleet_run_claude` behavior gains an env-driven
   branch, signature unchanged.
+- Reinstall: all projects.
 
 ## Implementation log
 
