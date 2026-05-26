@@ -30,6 +30,7 @@ seatbelt. Hand-merge the first few PRs to be safe, then trust the loop.
   - `feat/` — feature work (ship agent)
   - `chore/gtm-` — backlog refresh (groom agent)
   - `eng/` — engineering work (eng agent, only if ENG_ENABLED)
+  - `revert/` — operator-initiated rollback (emitted by `fleet rollback`)
 - **Local gate command** — what the heal/dev step runs locally before pushing
   (must be green):
   `shellcheck lib/*.sh bin/fleet && bash -n lib/*.sh bin/fleet && node scripts/check-backlog.mjs`
@@ -121,6 +122,13 @@ postcard.
     pause persists across runner invocations. Resume = explicit
     `launchctl enable gui/$UID/$NAMESPACE.agent-ship` (or fleet-control's
     "Resume" action).
+  - `rollback_opened {pr, reverts, merge_commit}` — emitted by
+    `bin/fleet rollback` after a successful `gh pr create` of the
+    revert PR. `pr` is the new revert PR's number; `reverts` is the
+    original (agent-merged) PR's number; `merge_commit` is the SHA of
+    the squash/merge commit being reverted. Ticket 0017. Consumers can
+    treat this like any other PR-related event (it carries `slug` +
+    `phase=rollback` like the rest).
   - `trainee_pr_opened {number, remaining}` — emitted by the dev agent
     (driven from `prompts/ship.prompt.md`) immediately after `gh pr
     create` when `FLEET_TRAINEE_REMAINING > 0`, i.e. the project's
