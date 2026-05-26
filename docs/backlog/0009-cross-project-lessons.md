@@ -34,35 +34,49 @@ Doesn't have to copy/paste lessons between projects. One file lives in
 
 ## Acceptance criteria
 
-- [ ] `bin/fleet lessons-sync` discovers every project's `docs/LESSONS.md`,
-      concatenates them into `agent-fleet/CROSS_LESSONS.md` with one
-      `## <slug>` heading per project, deduped by line.
-- [ ] `prompts/ship.prompt.md` and `prompts/groom.prompt.md` get a one-line
-      addition in PHASE 0: "also read `<KIT>/CROSS_LESSONS.md` if it exists;
-      it contains lessons from other projects in the fleet."
+Each box maps 1:1 to a test scenario in `tests/lessons-sync.sh`.
+
+- [ ] Given a fixture with two projects (`almanac` and `courtiq`), each
+      with a `docs/LESSONS.md` containing 2 unique paragraphs, running
+      `bin/fleet lessons-sync` produces
+      `~/.local/share/agent-fleet/CROSS_LESSONS.md` containing both
+      `## almanac` and `## courtiq` headings with each project's lessons
+      underneath.
+- [ ] Given two projects with one byte-identical lesson line, the merged
+      output contains that line exactly once (de-duped) under one heading
+      with a `(also seen in <other-slug>)` annotation.
+- [ ] Running `bin/fleet lessons-sync` twice in a row produces a
+      byte-identical output file on the second run (idempotent); the
+      file's mtime is NOT updated when content would be identical.
 - [ ] `lib/common.sh` exports `FLEET_CROSS_LESSONS` pointing to the synced
-      file under `~/.local/share/agent-fleet/CROSS_LESSONS.md` so the prompt
-      can resolve it from inside a checkout.
-- [ ] `bin/fleet lessons-sync` runs idempotently and writes nothing if the
-      output would be byte-identical to the existing file.
-- [ ] `tests/lessons-sync.sh` creates two fixture project trees with sample
-      LESSONS.md files and asserts the merged output contains both sources
-      under the right headings.
-- [ ] `lib/install.sh` calls `bin/fleet lessons-sync` at the end of its run,
-      so reinstalling refreshes the cross-lessons file.
+      file path so prompts running inside a fresh checkout can resolve it.
+      The test sources `common.sh` and asserts the variable is set.
+- [ ] `prompts/ship.prompt.md` and `prompts/groom.prompt.md` reference
+      `FLEET_CROSS_LESSONS` in PHASE 0 (read-if-exists). Grep both files
+      for the exact string `FLEET_CROSS_LESSONS`.
+- [ ] `lib/install.sh` invokes `bin/fleet lessons-sync` at the end of its
+      run. The test stubs `bin/fleet` and asserts the call is made
+      exactly once.
+- [ ] When a project has no `docs/LESSONS.md`, sync skips it without error.
 
 ## Out of scope
 
 - Conflict resolution between contradictory lessons. The aggregator is
   string-level — duplicates are dropped, opinions stay separate.
 - A "promote to CROSS_LESSONS" workflow. v1 syncs everything.
+- Lesson tagging / categorization. Plain markdown for now.
 
 ## Engineering notes
 
-- `bin/fleet` — add `lessons-sync` subcommand.
-- `prompts/*.md` — minimal additions, do not bloat the prompt.
+- `bin/fleet` — add `lessons-sync` subcommand. Discovery uses the same
+  two-root pattern as `doctor`: `$FLEET_DISCOVERY_ROOT` (default
+  `~/Desktop/projects`) AND `~/.local/share/agent-fleet/projects`.
+- The merged file lives at `~/.local/share/agent-fleet/CROSS_LESSONS.md`
+  (installed location — survives working-tree deletion).
+- `prompts/*.md` — minimal additions, do not bloat the prompts.
 - `lib/install.sh` — append the call at the end (after launchctl bootstrap).
-- Reinstall: all projects (so the export is set).
+- `lib/common.sh` — single `export FLEET_CROSS_LESSONS=...` line.
+- Reinstall: all projects (so the export is set and `install.sh` runs sync).
 - Public API: additive.
 
 ## Implementation log
