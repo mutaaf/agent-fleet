@@ -1,7 +1,7 @@
 ---
 id: 0007
 title: Adaptive groom cadence when backlog is empty
-status: groomed
+status: in-progress
 priority: P2
 area: engine
 created: 2026-05-26
@@ -77,4 +77,10 @@ Each box maps 1:1 to a test scenario in `tests/cadence.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 (implementation-dev): Picked up ticket; flipped to `in-progress`
+  on `feat/0007-adaptive-cadence`. Plan: add `fleet_check_groom_cadence` to
+  `lib/common.sh` (parses the backlog README table, decides
+  throttle/proceed/clear-marker, emits `groom_throttled` events). Wire into
+  `lib/groom.sh` to gate before `fleet_run_claude`. Extend `bin/fleet doctor`
+  with a `groom_cadence` check that reports on the marker. Tests in
+  `tests/cadence.sh`.

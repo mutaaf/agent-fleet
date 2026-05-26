@@ -464,6 +464,118 @@ fleet_check_sendback_streak() {
   return 1
 }
 
+# --- adaptive groom cadence (ticket 0007) --------------------------------
+# fleet_check_groom_cadence — soft-abort gate that skips the groom spawn when
+# the backlog has nothing actionable. Cuts the cost of "run agent, find
+# nothing to do, exit" runs by N-1 of every N over a 12h floor.
+#
+# Trigger: the project's docs/backlog/README.md table has ZERO `proposed`
+# rows AND fewer than 3 `groomed` rows whose priority is P0 or P1. (P2/P3
+# work doesn't justify a groom pass on its own — those tickets bubble up
+# in the regular index-edit loop when an operator promotes them.)
+#
+# When the trigger fires:
+#   1. If $CACHE_DIR/groom-slowed-since does not exist, write the current
+#      ISO8601 UTC timestamp into it. This marker is the source of truth
+#      for "how long we've been throttled". `bin/fleet doctor`,
+#      `fleet digest`, and any future consumer all read it.
+#   2. Emit ONE `groom_throttled` event with reason=empty_backlog and
+#      since=<the marker contents>. We pass the MARKER timestamp, not
+#      "now", so a downstream "how long has this been throttled?" query
+#      can be answered from any single event without needing to chain
+#      back through events.jsonl.
+#   3. Return 1 — the caller in `lib/groom.sh` does
+#      `fleet_check_groom_cadence || exit 0`, which short-circuits the
+#      claude spawn.
+#
+# 12h floor: when the marker file's mtime is older than 12h, we treat the
+# throttle as expired — remove the marker and return 0 (proceed) regardless
+# of the current backlog state. The next groom run will re-evaluate; if
+# the backlog is still empty it'll write a fresh marker and start a new
+# 12h window. This is intentional simplicity: a long-running throttle that
+# never gets re-confirmed silently rots into "groom hasn't run in a week",
+# and the operator would have no signal.
+#
+# Backlog source: by default we read `docs/backlog/README.md` from
+# `$CACHE_DIR/checkout` (where `fleet_checkout` lands). Tests inject a
+# fixture via `FLEET_CADENCE_CHECKOUT`.
+#
+# Trigger thresholds are tunable via env (kept for tests; not surfaced in
+# the manifest by design — the floor is a fleet-wide constant per
+# AGENTS.md "Out of scope" #3).
+FLEET_CADENCE_FLOOR_SECONDS="${FLEET_CADENCE_FLOOR_SECONDS:-43200}"  # 12h
+FLEET_CADENCE_MIN_GROOMED_HIGH_PRIO="${FLEET_CADENCE_MIN_GROOMED_HIGH_PRIO:-3}"
+
+# Parse the docs/backlog/README.md table and echo two integers separated
+# by a space: `<proposed-count> <groomed-P0-or-P1-count>`. Rows are
+# matched on the canonical 4-digit-id pipe pattern check-backlog.mjs
+# uses, so we never pick up the header or stray formatting.
+_fleet_count_backlog_rows() {
+  local readme="${1:?_fleet_count_backlog_rows: readme path required}"
+  [ -f "$readme" ] || { echo "0 0"; return 0; }
+  awk -F'|' '
+    /^\|[[:space:]]*[0-9]{4}[[:space:]]*\|/ {
+      # Fields: $2=id $3=title $4=priority $5=status $6=area
+      pri=$4; gsub(/^[[:space:]]+|[[:space:]]+$/, "", pri)
+      stat=$5; gsub(/^[[:space:]]+|[[:space:]]+$/, "", stat)
+      if (stat == "proposed") proposed++
+      if (stat == "groomed" && (pri == "P0" || pri == "P1")) high++
+    }
+    END { printf("%d %d", proposed+0, high+0) }
+  ' "$readme"
+}
+
+fleet_check_groom_cadence() {
+  local checkout="${FLEET_CADENCE_CHECKOUT:-$CACHE_DIR/checkout}"
+  local readme="$checkout/docs/backlog/README.md"
+  local marker="$CACHE_DIR/groom-slowed-since"
+  local floor="$FLEET_CADENCE_FLOOR_SECONDS"
+  local min_high="$FLEET_CADENCE_MIN_GROOMED_HIGH_PRIO"
+
+  # --- 12h floor: stale marker → clear it, proceed.
+  if [ -f "$marker" ]; then
+    local now mtime age
+    now=$(date -u +%s)
+    mtime=$(stat -f %m "$marker" 2>/dev/null || stat -c %Y "$marker" 2>/dev/null || echo "$now")
+    age=$(( now - mtime ))
+    if [ "$age" -ge "$floor" ]; then
+      rm -f "$marker"
+      return 0
+    fi
+  fi
+
+  # --- evaluate trigger from the backlog table.
+  local counts proposed high
+  counts="$(_fleet_count_backlog_rows "$readme")"
+  proposed="${counts%% *}"
+  high="${counts##* }"
+
+  local empty=0
+  if [ "${proposed:-0}" -eq 0 ] && [ "${high:-0}" -lt "$min_high" ]; then
+    empty=1
+  fi
+
+  if [ "$empty" != "1" ]; then
+    # Backlog has work. If a stale marker somehow survived, the >=12h path
+    # above already cleaned it; a younger marker is paradoxical (we just
+    # found work), so clear it defensively so doctor/digest stop reporting
+    # THROTTLED on a project that's actually moving.
+    [ -f "$marker" ] && rm -f "$marker"
+    return 0
+  fi
+
+  # --- trigger fires.
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  if [ ! -f "$marker" ]; then
+    date -u +%FT%TZ > "$marker"
+  fi
+  local since
+  since="$(cat "$marker" 2>/dev/null || date -u +%FT%TZ)"
+  fleet_emit_event groom_throttled "since=$since" "reason=empty_backlog" || true
+  echo "${SLUG:-?} groom_throttled — empty_backlog since=$since (floor=${floor}s)"
+  return 1
+}
+
 # --- logging --------------------------------------------------------------
 # $1 = phase (ship/groom/review/eng). Redirects all output to a timestamped log.
 fleet_log_init() {

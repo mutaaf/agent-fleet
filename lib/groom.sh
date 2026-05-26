@@ -19,6 +19,15 @@ fleet_acquire_lock groom || exit 0
 trap 'fleet_release_lock groom' EXIT
 fleet_checkout checkout
 
+# Adaptive cadence (ticket 0007): when the backlog is empty AND we have
+# fewer than 3 groomed P0/P1 tickets, throttle the spawn behind a 12h
+# floor. The gate writes $CACHE_DIR/groom-slowed-since + emits a
+# `groom_throttled` event; the caller short-circuits without spawning.
+fleet_check_groom_cadence || {
+  fleet_emit_event run_completed "exit=0" "duration_ms=$(( ( $(date -u +%s) - RUN_STARTED_EPOCH ) * 1000 ))" "throttled=1" || true
+  exit 0
+}
+
 fleet_run_claude groom < "$FLEET_PROMPTS/groom.prompt.md"
 EXIT=$?
 
