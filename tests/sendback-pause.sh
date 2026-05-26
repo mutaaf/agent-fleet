@@ -310,3 +310,4 @@ if grep -q 'gh issue create' "$CALLS_LOG"; then
 fi
 
 echo "ok: tests/sendback-pause.sh passed"
+
