@@ -444,6 +444,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet doctor --slug courtiq   # one project
 ~/code/agent-fleet/bin/fleet doctor --json           # machine-readable, for fleet-control
 ~/code/agent-fleet/bin/fleet tail                    # stream live events from every project (Ctrl-C to stop)
+~/code/agent-fleet/bin/fleet rollback courtiq        # revert the last agent-shipped commit (revert/<id>-<slug> PR)
 ```
 
 Run `doctor` after upgrading the kit (`bash lib/install.sh ...`) or before a

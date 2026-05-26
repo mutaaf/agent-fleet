@@ -1459,6 +1459,347 @@ if [ "$CMD" = "tail" ]; then
   tail_cmd "$@"
 fi
 
+# --- rollback -------------------------------------------------------------
+# Ticket 0017. `fleet rollback <slug>` identifies the most recent
+# agent-authored merge (head:feat/ OR head:eng/) to main and opens a revert
+# PR on `revert/<id>-<slug>`, with the same gating contract as any other
+# agent PR. One subcommand, full audit trail.
+#
+# Discovery: the slug-to-repo resolver mirrors `tail`/`digest` (union of
+# FLEET_DISCOVERY_ROOT and ~/.local/share/agent-fleet/projects, de-duped by
+# SLUG). Once a slug resolves to a manifest, REPO_URL → owner/name is
+# derived the same way `bin/fleet status` derives it.
+#
+# Flags:
+#   --yes | -y         skip the "proceed with revert? [y/N]" prompt
+#   --dry-run          print metadata + the exact git/gh commands; do nothing
+#   --pr <N>           override auto-pick; revert the specific PR number
+#                      (uses `gh pr view <N>` instead of `gh pr list`)
+#
+# Squash vs true merge: `gh pr view --json mergeMethod` tells us how the
+# original PR landed. SQUASH → `git revert --no-edit <sha>` (single
+# linear commit). MERGE → `git revert -m 1 <sha>` (true merge commits need
+# the mainline-parent hint). The test covers both branches.
+#
+# Telemetry: emits `rollback_opened pr=<new> reverts=<orig>
+# merge_commit=<sha>` to the slug's events.jsonl on success.
+#
+# Hard-NOs honoured: never pushes to main; never bypasses branch
+# protection; the revert PR goes through the same `shellcheck` + `validate`
+# gates as any other agent PR.
+
+# Resolve slug → manifest path. Echoes the manifest path or empty.
+rollback_resolve_manifest() {
+  local want="$1"
+  local roots=("${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}" "$HOME/.local/share/agent-fleet/projects")
+  local root m slug
+  for root in "${roots[@]}"; do
+    [ -d "$root" ] || continue
+    while IFS= read -r m; do
+      [ -n "$m" ] || continue
+      # shellcheck disable=SC1090
+      slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+      if [ "$slug" = "$want" ]; then
+        echo "$m"
+        return 0
+      fi
+    done < <(find "$root" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort)
+  done
+}
+
+# Extract a single string-value JSON field from a flat object. The kit's
+# gh --json responses never embed objects beyond `mergeCommit.oid`, which
+# we handle as a special case below. Echoes the bare value (no quotes).
+rollback_json_string() {
+  local json="$1" key="$2"
+  printf '%s' "$json" | sed -nE "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\\1/p" | head -1
+}
+
+# Extract a number value (PR number, etc.). Echoes the digits.
+rollback_json_number() {
+  local json="$1" key="$2"
+  printf '%s' "$json" | sed -nE "s/.*\"$key\"[[:space:]]*:[[:space:]]*([0-9]+).*/\\1/p" | head -1
+}
+
+# Extract mergeCommit.oid (one-deep object) from a PR JSON object.
+rollback_json_merge_oid() {
+  local json="$1"
+  printf '%s' "$json" | sed -nE 's/.*"mergeCommit"[[:space:]]*:[[:space:]]*\{[[:space:]]*"oid"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1
+}
+
+# Parse the leading "<id>-<slug-tail>" out of an agent headRefName. Returns
+# the part after the prefix (feat/, eng/) — e.g. "feat/0019-broken-thing"
+# → "0019-broken-thing". Echoes empty if no recognised prefix.
+rollback_branch_tail() {
+  local head="$1"
+  case "$head" in
+    feat/*) echo "${head#feat/}" ;;
+    eng/*)  echo "${head#eng/}" ;;
+    *)      echo "" ;;
+  esac
+}
+
+# Pick the most-recent agent-merged PR from a `gh pr list --json ...` JSON
+# array. We split on `},{` (with optional whitespace) boundaries — safe
+# because gh's JSON never nests braces inside string values without
+# escaping AND we already have `mergeCommit` as the only nested object,
+# which closes with `}` BEFORE the comma that starts the next top-level
+# key. Picking the FIRST object yields the most recent merge because
+# `gh pr list` returns mergedAt-desc by default.
+rollback_first_pr_json() {
+  local list_json="$1"
+  # Normalize whitespace, strip the outer `[...]`, then replace `},{`
+  # (with any inter-object whitespace) with a sentinel we can split on.
+  printf '%s' "$list_json" \
+    | tr -d '\n' \
+    | sed -E 's/^[[:space:]]*\[[[:space:]]*//; s/[[:space:]]*\][[:space:]]*$//; s/\}[[:space:]]*,[[:space:]]*\{/}@@PRSPLIT@@{/g' \
+    | awk 'BEGIN{RS="@@PRSPLIT@@"} NR==1 { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }'
+}
+
+rollback() {
+  shift  # drop the leading "rollback"
+  local slug_arg="" want_yes=0 want_dry=0 pr_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y)   want_yes=1; shift ;;
+      --dry-run)  want_dry=1; shift ;;
+      --pr)       pr_override="${2:-}"; shift 2 ;;
+      --pr=*)     pr_override="${1#--pr=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet rollback — revert the last agent-shipped commit on a project.
+
+Usage:
+  fleet rollback <slug>             interactive: pick the latest agent PR, prompt, revert
+  fleet rollback <slug> --yes       skip the [y/N] prompt
+  fleet rollback <slug> --dry-run   print metadata + planned commands; do nothing
+  fleet rollback <slug> --pr <N>    revert the specific PR number (skips auto-pick)
+
+Identifies the most recent merged PR whose head matches \`feat/\` or \`eng/\`
+on \`main\`, opens a revert PR on branch \`revert/<id>-<slug>\`, and arms
+\`gh pr merge --auto --squash\` so the standard gating CI checks decide if
+the revert lands.
+USAGE
+        exit 0 ;;
+      --) shift ;;
+      -*) echo "fleet rollback: unknown flag '$1'" >&2; exit 2 ;;
+      *)
+        if [ -z "$slug_arg" ]; then slug_arg="$1"; shift
+        else echo "fleet rollback: unexpected extra argument '$1'" >&2; exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$slug_arg" ]; then
+    echo "fleet rollback: missing <slug>" >&2
+    echo "usage: fleet rollback <slug> [--yes|--dry-run|--pr <N>]" >&2
+    exit 2
+  fi
+
+  # Resolve slug → manifest → REPO_URL → owner/name + CACHE_DIR.
+  local manifest
+  manifest="$(rollback_resolve_manifest "$slug_arg")"
+  if [ -z "$manifest" ]; then
+    echo "fleet rollback: no project with SLUG=$slug_arg found" >&2
+    exit 2
+  fi
+  local slug repo_url repo cache_dir
+  # shellcheck disable=SC1090  # discovered at runtime
+  eval "$(
+    source "$manifest"
+    echo "slug='${SLUG:-}'"
+    echo "repo_url='${REPO_URL:-}'"
+  )"
+  repo="$(echo "$repo_url" | sed -E 's#https?://github.com/##; s#\.git$##')"
+  cache_dir="$HOME/.cache/${slug}-agent"
+
+  # Pick the target PR JSON.
+  local target_json=""
+  if [ -n "$pr_override" ]; then
+    target_json="$(gh pr view "$pr_override" \
+                     --repo "$repo" \
+                     --json number,title,mergeCommit,headRefName,mergedAt,mergeMethod \
+                     2>/dev/null || true)"
+    if [ -z "$target_json" ] || [ "$target_json" = "{}" ]; then
+      echo "fleet rollback: gh pr view $pr_override returned nothing" >&2
+      exit 1
+    fi
+  else
+    local list_json
+    list_json="$(gh pr list \
+                   --repo "$repo" \
+                   --state merged \
+                   --base main \
+                   --limit 20 \
+                   --search "head:feat/ OR head:eng/" \
+                   --json number,title,mergeCommit,headRefName,mergedAt \
+                   2>/dev/null || true)"
+    if [ -z "$list_json" ] || [ "$list_json" = "[]" ]; then
+      echo "no agent-merged feature PR found in the last 20 merges" >&2
+      exit 1
+    fi
+    target_json="$(rollback_first_pr_json "$list_json")"
+    if [ -z "$target_json" ]; then
+      echo "no agent-merged feature PR found in the last 20 merges" >&2
+      exit 1
+    fi
+  fi
+
+  # Parse the target. mergeMethod only comes from `gh pr view`; when we got
+  # the target from `gh pr list`, fetch it separately so the squash/merge
+  # branch detection is always correct (AC#9).
+  local pr_number title merge_oid head_ref merged_at merge_method
+  pr_number="$(rollback_json_number "$target_json" "number")"
+  title="$(rollback_json_string "$target_json" "title")"
+  merge_oid="$(rollback_json_merge_oid "$target_json")"
+  head_ref="$(rollback_json_string "$target_json" "headRefName")"
+  merged_at="$(rollback_json_string "$target_json" "mergedAt")"
+  merge_method="$(rollback_json_string "$target_json" "mergeMethod")"
+
+  if [ -z "$merge_method" ]; then
+    local view_json
+    view_json="$(gh pr view "$pr_number" \
+                   --repo "$repo" \
+                   --json mergeMethod \
+                   2>/dev/null || true)"
+    merge_method="$(rollback_json_string "$view_json" "mergeMethod")"
+  fi
+  # Default: assume squash (the kit's standard merge style).
+  [ -z "$merge_method" ] && merge_method="SQUASH"
+
+  local branch_tail revert_branch
+  branch_tail="$(rollback_branch_tail "$head_ref")"
+  if [ -z "$branch_tail" ]; then
+    echo "fleet rollback: PR #$pr_number head '$head_ref' is not an agent prefix (feat/, eng/)" >&2
+    exit 1
+  fi
+  revert_branch="revert/${branch_tail}"
+
+  # Pick the revert command form based on mergeMethod.
+  local revert_cmd
+  case "$merge_method" in
+    SQUASH|REBASE) revert_cmd="git revert --no-edit $merge_oid" ;;
+    MERGE)         revert_cmd="git revert -m 1 $merge_oid" ;;
+    *)             revert_cmd="git revert --no-edit $merge_oid" ;;
+  esac
+
+  # Print target metadata. Same shape as the user-story callout in the ticket.
+  echo "Last agent merge to main: $merged_at"
+  echo "  commit:   $merge_oid"
+  echo "  PR:       #$pr_number $head_ref"
+  echo "  title:    $title"
+  echo "  mergeMethod: $merge_method"
+
+  local checkout="$cache_dir/rollback-checkout"
+  local pr_body="Reverts #${pr_number}. Issued by fleet rollback ${slug}."
+  local clone_cmd="git clone --depth 50 $repo_url $checkout"
+  local create_cmd="gh pr create --fill --base main --head $revert_branch --body \"$pr_body\" --repo $repo"
+  local merge_cmd="gh pr merge --auto --squash --repo $repo"
+
+  if [ "$want_dry" = "1" ]; then
+    echo
+    echo "Planned (dry-run; nothing executed):"
+    echo "  $clone_cmd"
+    echo "  cd $checkout"
+    echo "  git checkout -b $revert_branch"
+    echo "  $revert_cmd"
+    echo "  git push -u origin $revert_branch"
+    echo "  $create_cmd"
+    echo "  $merge_cmd"
+    exit 0
+  fi
+
+  # Confirmation prompt (unless --yes).
+  if [ "$want_yes" != "1" ]; then
+    local reply=""
+    # `read -r -p` writes the prompt to stderr in some shells; explicit echo
+    # to stdout keeps the test's `grep <<< OUT` happy.
+    echo -n "proceed with revert? [y/N] "
+    read -r reply || reply=""
+    case "$reply" in
+      y|Y|yes|YES) : ;;
+      *)
+        echo "rollback cancelled."
+        exit 0 ;;
+    esac
+  fi
+
+  # --- Execute. ----------------------------------------------------------
+  echo
+  echo "Opening revert PR on branch $revert_branch..."
+
+  # Fresh, isolated checkout under $CACHE_DIR/rollback-checkout. We do NOT
+  # share state with the ship/groom/review checkouts so an in-flight ship
+  # cannot race with the revert. Always start from a clean slate.
+  rm -rf "$checkout"
+  mkdir -p "$cache_dir"
+  git clone --depth 50 "$repo_url" "$checkout" >/dev/null 2>&1 || {
+    echo "fleet rollback: git clone failed" >&2
+    exit 1
+  }
+  cd "$checkout" || { echo "fleet rollback: cd $checkout failed" >&2; exit 1; }
+  git checkout -b "$revert_branch" >/dev/null 2>&1 || {
+    echo "fleet rollback: git checkout -b $revert_branch failed" >&2
+    exit 1
+  }
+  # shellcheck disable=SC2086  # revert_cmd intentionally word-splits the form
+  $revert_cmd >/dev/null 2>&1 || {
+    echo "fleet rollback: $revert_cmd failed (merge conflict? try --dry-run + manual revert)" >&2
+    exit 1
+  }
+  git push -u origin "$revert_branch" >/dev/null 2>&1 || {
+    echo "fleet rollback: git push failed" >&2
+    exit 1
+  }
+
+  # Open the PR. Capture the URL → parse the new PR number from the trailing
+  # /pull/<N> path component.
+  local create_out new_pr_number=""
+  create_out="$(gh pr create \
+                  --fill \
+                  --base main \
+                  --head "$revert_branch" \
+                  --body "$pr_body" \
+                  --repo "$repo" \
+                  2>&1 || true)"
+  echo "$create_out"
+  new_pr_number="$(echo "$create_out" | sed -nE 's#.*/pull/([0-9]+).*#\1#p' | head -1)"
+  if [ -z "$new_pr_number" ]; then
+    echo "fleet rollback: could not parse new PR number from 'gh pr create' output" >&2
+    # Still arm auto-merge below if at all possible? No — without a PR number
+    # we can't, and we'd skip the event emission too. Hard fail is right.
+    exit 1
+  fi
+
+  gh pr merge "$new_pr_number" --auto --squash --repo "$repo" >/dev/null 2>&1 || true
+  echo "Auto-merge armed for PR #$new_pr_number; waiting for CI green."
+
+  # Emit telemetry. Initialize the cache dir + FLEET_PHASE so fleet_emit_event
+  # routes the event to the right channel and tags it sensibly. We source
+  # lib/common.sh from the repo this script lives in.
+  local kit_root; kit_root="$( cd "$( dirname "$0" )/.." && pwd )"
+  if [ -f "$kit_root/lib/common.sh" ]; then
+    # shellcheck disable=SC1091
+    (
+      export SLUG="$slug"
+      export CACHE_DIR="$cache_dir"
+      export FLEET_PHASE="rollback"
+      # shellcheck disable=SC1090
+      source "$kit_root/lib/common.sh" >/dev/null 2>&1
+      fleet_emit_event rollback_opened \
+        "pr=$new_pr_number" \
+        "reverts=$pr_number" \
+        "merge_commit=$merge_oid"
+    ) || true
+  fi
+
+  exit 0
+}
+
+if [ "$CMD" = "rollback" ]; then
+  rollback "$@"
+fi
+
 if [ "$CMD" = "list" ]; then
   echo "${c_bld}fleet projects under $ROOT${c_rst}"
   while read -r m; do
