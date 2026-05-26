@@ -1,7 +1,7 @@
 ---
 id: 0005
 title: Prompt-version pinning in agents.config.sh
-status: groomed
+status: shipped
 priority: P1
 area: governance
 created: 2026-05-26
@@ -37,23 +37,23 @@ autonomous-agent kit, not a weekend hack.
 
 ## Acceptance criteria
 
-- [ ] `bin/fleet prompts-sha` prints the SHA256 of
+- [x] `bin/fleet prompts-sha` prints the SHA256 of
       `find prompts -type f -name '*.md' | sort | xargs cat`. Deterministic.
-- [ ] `agents.config.sh` gains an optional `PROMPTS_SHA` variable. When
+- [x] `agents.config.sh` gains an optional `PROMPTS_SHA` variable. When
       unset, runners assume current and don't warn.
-- [ ] When `PROMPTS_SHA` is set and doesn't match the current `prompts/`
+- [x] When `PROMPTS_SHA` is set and doesn't match the current `prompts/`
       SHA, `common.sh` emits a single `prompts_drift` event per run
       (`fleet_emit_event prompts_drift pinned=$pin actual=$cur`) and prints
       a warning to the log, but continues. Not a fatal abort.
-- [ ] `fleet doctor` adds a `prompts_pinned` check per project: PASS if
+- [x] `fleet doctor` adds a `prompts_pinned` check per project: PASS if
       `PROMPTS_SHA` is set and matches, WARN if unset, FAIL if mismatched.
-- [ ] `lib/install.sh` writes the current `PROMPTS_SHA` into the copied
+- [x] `lib/install.sh` writes the current `PROMPTS_SHA` into the copied
       manifest under `$CFG_DIR/agents.config.sh` (NOT the source manifest —
       the source is owned by the operator). Adds a line:
       `# PROMPTS_SHA pinned at install time: <sha>`
-- [ ] `tests/prompts-sha.sh` validates `bin/fleet prompts-sha` is stable
+- [x] `tests/prompts-sha.sh` validates `bin/fleet prompts-sha` is stable
       across two invocations.
-- [ ] Documented in `AGENTS.md` § Telemetry as the `prompts_drift` event.
+- [x] Documented in `AGENTS.md` § Telemetry as the `prompts_drift` event.
 
 ## Out of scope
 
@@ -73,4 +73,21 @@ autonomous-agent kit, not a weekend hack.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: picked up, opened
+  `feat/0005-prompt-version-pinning`. Plan: add `bin/fleet prompts-sha`
+  helper, a `_fleet_prompts_sha` function in `lib/common.sh` that compares
+  the optional `PROMPTS_SHA` from the manifest against the current
+  `prompts/` SHA and emits one `prompts_drift` event per run, a new
+  `prompts_pinned` doctor check, and install.sh stamping the copied
+  manifest with `# PROMPTS_SHA pinned at install time: <sha>`
+  (strip-and-reappend for idempotency). Tests in `tests/prompts-sha.sh`
+  + extensions to `tests/doctor.sh` cover each acceptance box.
+- 2026-05-26 — implementation-dev: shipped. Install.sh writes TWO lines into
+  the copied manifest — the `# PROMPTS_SHA pinned at install time: <sha>`
+  audit comment (per ticket spec) AND a real `PROMPTS_SHA="<sha>"`
+  assignment so sourcing the manifest in `fleet_load_manifest` sets the
+  variable the drift check reads. The strip-then-append handles both lines
+  so idempotency is preserved. Drift emission is once-per-process, guarded
+  by `FLEET_PROMPTS_DRIFT_EMITTED`. `fleet_prompts_sha` was hoisted above
+  the doctor block because bash requires functions to be defined before
+  their call site.

@@ -8,8 +8,10 @@
 #   - --slug NAME restricts to one project
 #   - exit code is 0 with no FAIL and 1 with any FAIL
 #   - the named checks (config, self_cancel, agents_md, backlog, launchd,
-#     installed_lib_sha, gh_auth) appear in the JSON, with the missing-AGENTS.md
-#     project FAILing the agents_md check
+#     installed_lib_sha, gh_auth, prompts_pinned) appear in the JSON, with the
+#     missing-AGENTS.md project FAILing the agents_md check
+#   - the prompts_pinned check (ticket 0005) WARNs when PROMPTS_SHA is unset
+#     and FAILs when the pin mismatches the current prompts/ SHA
 #
 # Self-contained: stubs $HOME, points FLEET_DISCOVERY_ROOT at the fixture,
 # stubs `launchctl` and `gh` to deterministic exit codes so the test never
@@ -49,13 +51,17 @@ mkdir -p "$FIXTURE/healthy/docs/backlog" "$FIXTURE/healthy/scripts"
 echo "# Backlog" > "$FIXTURE/healthy/docs/backlog/README.md"
 echo "// stub" > "$FIXTURE/healthy/scripts/check-backlog.mjs"
 
-# broken: manifest is fine but AGENTS.md is missing and backlog is absent
+# broken: manifest is fine but AGENTS.md is missing and backlog is absent. We
+# also pin PROMPTS_SHA to an obviously wrong value so the doctor's
+# prompts_pinned check (ticket 0005) lights up FAIL alongside the agents_md
+# FAIL — same project covers two acceptance criteria.
 cat > "$FIXTURE/broken/agents.config.sh" <<'CFG'
 PROJECT_NAME="Broken"
 SLUG="broken"
 NAMESPACE="com.broken"
 REPO_URL="https://github.com/example/broken"
 SELF_CANCEL="20990101"
+PROMPTS_SHA="0000000000000000000000000000000000000000000000000000000000000000"
 CFG
 
 # --- stub launchctl + gh so the test is deterministic --------------------
@@ -113,6 +119,7 @@ node -e '
   const required = [
     "config", "self_cancel", "agents_md", "backlog",
     "launchd_loaded", "installed_lib_sha", "gh_auth",
+    "prompts_pinned",
   ];
   for (const p of j.projects) {
     if (!Array.isArray(p.checks)) {
@@ -148,6 +155,18 @@ node -e '
   const hAgents = healthy.checks.find(c => c.name === "agents_md");
   if (hAgents.status !== "PASS") {
     console.error("FAIL: healthy.agents_md should be PASS, got " + hAgents.status);
+    process.exit(1);
+  }
+  // ticket 0005: prompts_pinned — healthy has no pin → WARN; broken has a
+  // bad pin → FAIL.
+  const hPin = healthy.checks.find(c => c.name === "prompts_pinned");
+  if (hPin.status !== "WARN") {
+    console.error("FAIL: healthy.prompts_pinned should be WARN (no pin), got " + hPin.status);
+    process.exit(1);
+  }
+  const bPin = broken.checks.find(c => c.name === "prompts_pinned");
+  if (bPin.status !== "FAIL") {
+    console.error("FAIL: broken.prompts_pinned should be FAIL (bad pin), got " + bPin.status);
     process.exit(1);
   }
   console.log("ok: json shape + per-project checks valid");

@@ -41,6 +41,7 @@ UNREVIEWED=$(gh pr list --repo "$REPO" --state open --base main \
 
 fleet_log_init review
 fleet_emit_event run_started "pid=$$" || true
+fleet_check_prompts_sha || true
 echo "reviewer: $ME"
 echo "PRs to review:"; echo "$UNREVIEWED" | sed 's/^/  #/'; echo
 
