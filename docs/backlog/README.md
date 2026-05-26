@@ -22,7 +22,7 @@ ones, `review` grades them.
 | 0001 | Per-slug flock prevents overlapping launchd runs | P0 | shipped | safety |
 | 0002 | Structured events.jsonl telemetry channel | P0 | shipped | telemetry |
 | 0003 | fleet doctor subcommand for fleet health | P1 | shipped | observability |
-| 0004 | Per-slug daily $ budget caps | P1 | in-progress | governance |
+| 0004 | Per-slug daily $ budget caps | P1 | shipped | governance |
 | 0005 | Prompt-version pinning in agents.config.sh | P1 | groomed | governance |
 | 0006 | Auto-pause ship after N consecutive send-backs | P1 | groomed | safety |
 | 0007 | Adaptive groom cadence when backlog is empty | P2 | groomed | engine |
