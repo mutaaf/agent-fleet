@@ -35,36 +35,44 @@ demonstrating.
 
 ## Acceptance criteria
 
-- [ ] `lib/ship.sh` checks before PHASE 2 (shipping a new ticket): query the
-      last 5 merged-or-closed PRs from agent branch prefixes that received
-      a `REQUEST_CHANGES` review and were never resolved before close. If
-      3 or more of those happened in the last 24h, abort PHASE 2.
-- [ ] On abort, emit `fleet_emit_event ship_paused reason=sendback_streak
-      count=<n>` and post (or update if it exists) a GitHub Issue titled
-      `[FLEET] ship paused after N send-backs` containing the PR numbers.
-- [ ] `launchctl disable gui/$UID/$NAMESPACE.agent-ship` is invoked so the
-      pause persists across runner invocations. Resume is the operator's
-      explicit `launchctl enable` or the fleet-control "Resume" action.
-- [ ] PHASE 1 (heal the in-flight PR) is NOT disabled by the pause — only
-      shipping new tickets is. An in-flight PR can still heal.
-- [ ] `tests/sendback-pause.sh` stubs `gh` with canned responses and asserts
-      the pause path triggers when 3+ recent send-backs are present and
-      does NOT trigger when fewer.
+Each box maps 1:1 to a test scenario in `tests/sendback-pause.sh`.
+
+- [ ] Given `gh pr list` returns 3+ closed agent PRs in the last 24h whose
+      last review was `CHANGES_REQUESTED` and that closed without becoming
+      `MERGED`, `lib/ship.sh` exits 0 before PHASE 2 (no new ticket is
+      picked) and prints `ship paused: sendback streak N` to the log.
+- [ ] Same precondition: `fleet_emit_event ship_paused reason=sendback_streak
+      count=<n> prs=<comma-list>` lands in `$CACHE_DIR/events.jsonl`.
+- [ ] Same precondition: an open GitHub Issue with the exact title
+      `[FLEET] ship paused after N send-backs` exists; if one already exists
+      it is updated (commented), not duplicated.
+- [ ] Same precondition: `launchctl disable gui/$UID/$NAMESPACE.agent-ship`
+      was invoked so the pause persists across launchd fires. The test
+      stubs `launchctl` and asserts the exact call.
+- [ ] Given the same streak BUT an open in-flight `feat/` PR exists, PHASE 1
+      (heal) still runs to completion; only PHASE 2 (new ticket) is blocked.
+- [ ] Given fewer than 3 send-backs in the last 24h, ship proceeds normally
+      and neither the event nor the issue is emitted.
+- [ ] Given a stale streak (3+ send-backs but >24h ago), ship proceeds
+      normally — the window is sliding, not cumulative.
 
 ## Out of scope
 
 - Pausing the groom phase (groom doesn't have send-backs in the same way).
 - Auto-resume after some time window. Manual resume only.
+- Re-enabling via the kit. Resume is the operator's explicit
+  `launchctl enable gui/$UID/$NAMESPACE.agent-ship` or fleet-control's
+  "Resume" action.
 
 ## Engineering notes
 
 - `lib/ship.sh` — add a `_check_sendback_streak` function before PHASE 2
-  invokes the dev subagent.
-- The `gh` query: `gh pr list --state closed --search "review:changes-requested" --json number,closedAt,headRefName` (filter to agent prefixes from AGENTS.md is HARD here since ship.sh runs before the claude agent reads AGENTS.md; for v1, hardcode the prefix list `feat/ eng/ chore/gtm-` — these are fleet-standard).
-- Issue title is idempotent: search for an open issue with the exact title
-  before creating a new one.
-- Blocked-by: 0002 (events channel).
+  invokes the dev subagent. PHASE 1 (heal) runs unconditionally.
+- The `gh` query: `gh pr list --state closed --search "review:changes-requested" --json number,closedAt,headRefName,reviews,state` filtered to fleet-standard prefixes `feat/ eng/ chore/gtm-` (hardcoded — ship.sh runs before the agent reads AGENTS.md).
+- Issue idempotency: `gh issue list --search "[FLEET] ship paused" --state open --json number,title` before `gh issue create`.
+- `tests/sendback-pause.sh` — stub `gh` and `launchctl` on PATH via a tmpdir; assert exit code, event contents, and stubbed calls.
 - Public API: additive.
+- Reinstall: all projects.
 
 ## Implementation log
 
