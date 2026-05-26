@@ -27,7 +27,7 @@ ones, `review` grades them.
 | 0014 | Trainee mode requires operator approval for the first N PRs | P1 | shipped | safety |
 | 0006 | Auto-pause ship after N consecutive send-backs | P1 | shipped | safety |
 | 0011 | fleet onboard bootstraps a new project in one command | P1 | shipped | engine |
-| 0008 | Secret-scan pre-push hook in agent checkouts | P1 | groomed | safety |
+| 0008 | Secret-scan pre-push hook in agent checkouts | P1 | in-progress | safety |
 | 0012 | fleet digest one-line daily summary per project | P2 | groomed | observability |
 | 0007 | Adaptive groom cadence when backlog is empty | P2 | groomed | engine |
 | 0009 | Cross-project LESSONS aggregation | P2 | groomed | engine |

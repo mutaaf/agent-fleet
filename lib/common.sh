@@ -500,6 +500,94 @@ fleet_checkout() {
   git clean -fdq
   git config user.email "$GIT_AUTHOR_EMAIL"
   git config user.name "$GIT_AUTHOR_NAME"
+  fleet_install_prepush_hook "$workdir"
+}
+
+# --- pre-push secret scan (ticket 0008) ----------------------------------
+# fleet_install_prepush_hook <checkout_dir>  — write an executable
+# .git/hooks/pre-push into the given checkout that blocks the push if the
+# staged/about-to-be-pushed diff contains anything that looks like a secret.
+#
+# The hook is self-contained (≤60 lines of body, no `jq` dependency) and:
+#   1. Delegates to `gitleaks detect --no-banner --redact --staged` when
+#      `gitleaks` is on PATH, propagating its exit code.
+#   2. Otherwise greps the diff against six fallback patterns: anthropic,
+#      github_pat, github_oauth, aws_access_key, openai, generic_kv.
+#   3. On a match, exits 1 with `secret detected: <pattern>` on stderr AND
+#      appends a `push_blocked reason=secret_match pattern=<name>` event to
+#      $CACHE_DIR/events.jsonl by re-sourcing this lib/common.sh (path is
+#      baked into the hook at install time).
+#
+# Diff source: when stdin carries pre-push refs (`<lref> <lsha> <rref>
+# <rsha>`), the hook scans `git log -p $lsha ^$rsha`. When stdin is empty
+# (the direct-invocation path used by tests), it falls back to `git diff
+# --cached`, so the hook is unit-testable without a configured remote.
+fleet_install_prepush_hook() {
+  local checkout_dir="${1:?fleet_install_prepush_hook: checkout_dir required}"
+  local hooks_dir="$checkout_dir/.git/hooks"
+  [ -d "$hooks_dir" ] || return 0  # not a git checkout — nothing to install
+  local hook="$hooks_dir/pre-push"
+  # Bake the absolute path to this lib so the hook can re-source it for
+  # fleet_emit_event regardless of where the agent's checkout lives. SLUG
+  # and CACHE_DIR are also baked so the event lands in the right channel
+  # even when the hook runs outside the runner's process.
+  local lib_path="$FLEET_LIB/common.sh"
+  local slug="${SLUG:-unknown}"
+  local cache_dir="${CACHE_DIR:-$HOME/.cache/${slug}-agent}"
+  cat > "$hook" <<HOOK_EOF
+#!/bin/bash
+# Auto-installed by fleet_install_prepush_hook (ticket 0008). DO NOT EDIT —
+# any change is overwritten on the next fleet_checkout. See lib/common.sh.
+set -uo pipefail
+FLEET_LIB_PATH="$lib_path"
+export SLUG="$slug" CACHE_DIR="$cache_dir" FLEET_PHASE="\${FLEET_PHASE:-ship}"
+_emit() {
+  if [ -f "\$FLEET_LIB_PATH" ]; then
+    # shellcheck disable=SC1090
+    ( source "\$FLEET_LIB_PATH" >/dev/null 2>&1 && \
+      fleet_emit_event push_blocked "reason=secret_match" "pattern=\$1" ) || true
+  fi
+}
+# Pick the diff source. Stdin has pre-push refs in production; empty under
+# direct test invocation, in which case we fall back to the staged diff.
+DIFF=""
+if [ ! -t 0 ]; then
+  while read -r _LREF LSHA _RREF RSHA; do
+    [ -z "\$LSHA" ] && continue
+    if [ "\$RSHA" = "0000000000000000000000000000000000000000" ] || [ -z "\$RSHA" ]; then
+      DIFF+="\$(git log -p "\$LSHA" 2>/dev/null)"
+    else
+      DIFF+="\$(git log -p "\$LSHA" "^\$RSHA" 2>/dev/null)"
+    fi
+  done
+fi
+[ -z "\$DIFF" ] && DIFF="\$(git diff --cached 2>/dev/null)"
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks detect --no-banner --redact --staged >&2; then
+    _emit gitleaks
+    echo "secret detected: gitleaks reported a finding" >&2
+    exit 1
+  fi
+  exit 0
+fi
+# Fallback regex set. Pattern name → ERE; order matters only for reporting.
+scan() {
+  local name="\$1" regex="\$2"
+  if printf '%s' "\$DIFF" | grep -E -q "\$regex"; then
+    echo "secret detected: \$name (pre-push blocked)" >&2
+    _emit "\$name"
+    exit 1
+  fi
+}
+scan anthropic       'sk-ant-[A-Za-z0-9_-]{30,}'
+scan github_pat      'ghp_[A-Za-z0-9]{36}'
+scan github_oauth    'gho_[A-Za-z0-9]{36}'
+scan aws_access_key  'AKIA[0-9A-Z]{16}'
+scan openai          'sk-[A-Za-z0-9]{20,}'
+scan generic_kv      '([Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]|[Bb][Ee][Aa][Rr][Ee][Rr])[[:space:]]*[:=][[:space:]]*"?[A-Za-z0-9_/+=-]{20,}'
+exit 0
+HOOK_EOF
+  chmod +x "$hook"
 }
 
 # --- claude with structured capture ---------------------------------------
