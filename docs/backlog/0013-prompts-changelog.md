@@ -1,7 +1,7 @@
 ---
 id: 0013
 title: prompts/CHANGELOG.md + fleet prompts-diff explain drift
-status: proposed
+status: groomed
 priority: P2
 area: governance
 created: 2026-05-26
@@ -101,9 +101,12 @@ Each box maps 1:1 to a test scenario in `tests/prompts-changelog.sh`.
 - Public API: additive (`bin/fleet prompts-diff`). No `lib/` changes.
 - Reinstall: required (the new CHANGELOG must be copied to
   `~/.local/share/agent-fleet/` by `install.sh`).
-- Status `proposed`, not `groomed`: the new validator script's interaction
-  with the existing `validate` CI job needs the ship agent to confirm the
-  GitHub Actions workflow shape before committing to the exact wiring.
+- CI wiring confirmed: `.github/workflows/ci.yml` already runs
+  `node scripts/check-backlog.mjs` as a step inside the `validate` job
+  (after `bash -n` and before `prompts present`). The new validator
+  `scripts/check-prompts-changelog.mjs` plugs in as a sibling step in the
+  same job — no workflow restructuring required. Promoted from `proposed`
+  to `groomed` 2026-05-26.
 
 ## Implementation log
 
