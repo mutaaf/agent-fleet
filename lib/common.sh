@@ -194,6 +194,212 @@ fleet_check_budget() {
   return 1
 }
 
+# --- send-back streak auto-pause (ticket 0006) ---------------------------
+# fleet_check_sendback_streak — soft-abort gate that pauses PHASE 2 of `ship`
+# when the loop has been visibly failing to make progress.
+#
+# The signal: the last few agent-branch PRs were closed after a
+# REQUEST_CHANGES review without resolution. If 3 or more of those happened
+# in the last 24h, the loop is almost certainly stuck on a problem it can't
+# fix without an operator, and continuing to ship new tickets just burns
+# tokens. So we:
+#   1. emit `ship_paused reason=sendback_streak count=<n>` on events.jsonl,
+#   2. post (or update if it already exists) a meta-issue titled
+#      `[FLEET] ship paused after N send-backs` carrying the PR numbers,
+#   3. invoke `launchctl disable gui/$UID/$NAMESPACE.agent-ship` so the pause
+#      persists across runner invocations (resume = explicit `launchctl
+#      enable` by the operator or fleet-control's "Resume" action),
+#   4. export FLEET_SHIP_PAUSED=1 and return 1, so `lib/ship.sh` can do
+#      `fleet_check_sendback_streak || exit 0` AFTER `fleet_checkout` and
+#      BEFORE handing off to the dev subagent.
+#
+# PHASE 1 (heal the in-flight PR) is intentionally NOT disabled here. The
+# heal path runs inside the same claude invocation as ship, but it's gated
+# inside the ship.prompt.md by the agent itself; if the agent sees a stuck
+# in-flight PR and the env var FLEET_SHIP_PAUSED=1, it heals and stops
+# without picking up a new ticket. We surface the decision through an env
+# var rather than a separate code path so PHASE 1 and PHASE 2 share one
+# source of truth.
+#
+# Agent-branch prefixes: hard-coded `feat/`, `eng/`, `chore/gtm-` per the
+# ticket's engineering notes. These are fleet-wide conventions enforced by
+# AGENTS.md § Agent parameters. Anything else (human cleanup branches,
+# release branches) is excluded from the streak count.
+#
+# The window is the last 24h, measured from "now" (UTC). A PR's `closedAt`
+# timestamp drives inclusion. The function tolerates a missing `reviews`
+# array (treats it as "no reviews → not a send-back, skip the PR"). The
+# `gh` JSON is parsed with `jq` when available and a portable awk fallback
+# otherwise — same convention as fleet_check_budget.
+#
+# All `gh` and `launchctl` work is best-effort: a failure to post the issue
+# or disable the launchd label still pauses the run (event is emitted,
+# function returns 1) so we don't accidentally un-pause on a network blip.
+FLEET_SENDBACK_THRESHOLD="${FLEET_SENDBACK_THRESHOLD:-3}"
+FLEET_SENDBACK_WINDOW_SECONDS="${FLEET_SENDBACK_WINDOW_SECONDS:-86400}"
+
+_fleet_is_agent_branch() {
+  case "$1" in
+    feat/*|eng/*|chore/gtm-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Echo the ISO8601 UTC timestamp for `now - $1` seconds. Cross-platform:
+# BSD `date -u -v-Ns` on macOS, GNU `date -u -d "@$(( now - N ))"` on Linux.
+# We compare in the ISO8601 string space rather than parsing each PR's
+# closedAt to an epoch, because ISO8601 UTC strings are lexicographically
+# sortable AND BSD `date -j -f` is wonky about parsing the `Z` suffix.
+_fleet_cutoff_iso() {
+  local seconds="${1:?_fleet_cutoff_iso: seconds arg required}"
+  date -u -v-"${seconds}"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@$(( $(date -u +%s) - seconds ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || echo "1970-01-01T00:00:00Z"
+}
+
+fleet_check_sendback_streak() {
+  # Need `gh` to make any decision. If it's not on PATH, conservatively
+  # return 0 (proceed) — we'd rather risk a wasted ship than pause the
+  # whole fleet on a missing dependency. Operator's `fleet doctor` will
+  # call this out separately.
+  if ! command -v gh >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local threshold="$FLEET_SENDBACK_THRESHOLD"
+  local window="$FLEET_SENDBACK_WINDOW_SECONDS"
+  local cutoff_iso
+  cutoff_iso="$(_fleet_cutoff_iso "$window")"
+
+  # Query the last 5 closed PRs that had a changes-requested review. We
+  # include the reviews array so we can confirm a CHANGES_REQUESTED state
+  # actually fired (gh's search operator is fuzzy enough that a defensive
+  # check is cheap insurance).
+  local raw
+  raw="$(gh pr list \
+            --state closed \
+            --search 'review:changes-requested' \
+            --json number,closedAt,headRefName,reviews \
+            --limit 5 \
+            ${REPO:+--repo "$REPO"} \
+         2>/dev/null || true)"
+  [ -z "$raw" ] && return 0
+  # `gh` sometimes prints `[]` on an empty result; treat that as "no recent
+  # send-backs" and proceed.
+  [ "$raw" = "[]" ] && return 0
+
+  # Parse: collect PR numbers whose head branch is an agent prefix AND whose
+  # closedAt is within the window AND whose reviews include CHANGES_REQUESTED.
+  local prs=""
+  local count=0
+
+  if command -v jq >/dev/null 2>&1; then
+    # One line per PR: `<number>\t<closedAt>\t<headRefName>\t<has_changes>`
+    local number closed_at branch has_changes
+    while IFS=$'\t' read -r number closed_at branch has_changes; do
+      [ -z "$number" ] && continue
+      [ "$has_changes" = "true" ] || continue
+      _fleet_is_agent_branch "$branch" || continue
+      # ISO8601 UTC strings are lexicographically ordered. closedAt >= cutoff
+      # means "closed within the window".
+      [ -n "$closed_at" ] || continue
+      [ "$closed_at" \> "$cutoff_iso" ] || [ "$closed_at" = "$cutoff_iso" ] || continue
+      prs="${prs:+$prs }#$number"
+      count=$((count + 1))
+    done < <(printf '%s' "$raw" | jq -r '
+      .[] | [
+        (.number // empty),
+        (.closedAt // ""),
+        (.headRefName // ""),
+        ((.reviews // []) | any(.state == "CHANGES_REQUESTED"))
+      ] | @tsv')
+  else
+    # awk fallback: scrape `number`, `closedAt`, `headRefName`, and a
+    # CHANGES_REQUESTED occurrence per PR object. The kit's typical host has
+    # jq installed, but we keep this branch so a stripped-down environment
+    # still gets correct behavior.
+    #
+    # Split the JSON into one object per line by inserting newlines between
+    # top-level `},{` boundaries — works because gh's --json output never
+    # embeds those tokens inside string values without escaping.
+    local objs row
+    objs="$(printf '%s' "$raw" | tr -d '\n' | sed -e 's/^\[//' -e 's/\]$//' -e 's/},{/}\n{/g')"
+    while IFS= read -r row; do
+      [ -z "$row" ] && continue
+      local number closed_at branch
+      number="$(printf '%s' "$row" | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+      closed_at="$(printf '%s' "$row" | sed -n 's/.*"closedAt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      branch="$(printf '%s' "$row" | sed -n 's/.*"headRefName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      [ -z "$number" ] && continue
+      printf '%s' "$row" | grep -q 'CHANGES_REQUESTED' || continue
+      _fleet_is_agent_branch "$branch" || continue
+      [ -n "$closed_at" ] || continue
+      [ "$closed_at" \> "$cutoff_iso" ] || [ "$closed_at" = "$cutoff_iso" ] || continue
+      prs="${prs:+$prs }#$number"
+      count=$((count + 1))
+    done <<< "$objs"
+  fi
+
+  if [ "$count" -lt "$threshold" ]; then
+    return 0
+  fi
+
+  # --- Trip path -----------------------------------------------------------
+  fleet_emit_event ship_paused "reason=sendback_streak" "count=$count" "prs=$prs" || true
+  echo "${SLUG} ship_paused — $count send-backs in last $((window/3600))h (prs: $prs)"
+
+  # Post or update the meta-issue. Idempotency: search for an open issue
+  # whose title starts with `[FLEET] ship paused after` before creating one.
+  local issue_title="[FLEET] ship paused after $count send-backs"
+  local issue_body
+  issue_body="$(printf 'Auto-paused by lib/common.sh: %d send-backs in the last %dh.\n\nPRs: %s\n\nResume: launchctl enable gui/%s/%s.agent-ship\n' \
+                  "$count" "$((window/3600))" "$prs" "${UID:-$(id -u)}" "${NAMESPACE:-com.fleet.$SLUG}")"
+
+  local existing_number=""
+  local issue_raw
+  issue_raw="$(gh issue list \
+                  --state open \
+                  --search '[FLEET] ship paused after in:title' \
+                  --json number,title \
+                  --limit 5 \
+                  ${REPO:+--repo "$REPO"} \
+               2>/dev/null || true)"
+  if [ -n "$issue_raw" ] && [ "$issue_raw" != "[]" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      existing_number="$(printf '%s' "$issue_raw" \
+        | jq -r '[.[] | select((.title // "") | startswith("[FLEET] ship paused after"))] | .[0].number // empty')"
+    else
+      existing_number="$(printf '%s' "$issue_raw" \
+        | tr -d '\n' \
+        | sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        | head -n1)"
+    fi
+  fi
+
+  if [ -n "$existing_number" ]; then
+    gh issue comment "$existing_number" \
+      --body "$issue_body" \
+      ${REPO:+--repo "$REPO"} \
+      >/dev/null 2>&1 || true
+  else
+    gh issue create \
+      --title "$issue_title" \
+      --body "$issue_body" \
+      ${REPO:+--repo "$REPO"} \
+      >/dev/null 2>&1 || true
+  fi
+
+  # Persistent pause via launchd. `launchctl disable` survives reboots; the
+  # only way out is an explicit `launchctl enable`.
+  local namespace="${NAMESPACE:-com.fleet.$SLUG}"
+  local uid="${UID:-$(id -u)}"
+  launchctl disable "gui/$uid/$namespace.agent-ship" >/dev/null 2>&1 || true
+
+  FLEET_SHIP_PAUSED=1
+  export FLEET_SHIP_PAUSED
+  return 1
+}
+
 # --- logging --------------------------------------------------------------
 # $1 = phase (ship/groom/review/eng). Redirects all output to a timestamped log.
 fleet_log_init() {

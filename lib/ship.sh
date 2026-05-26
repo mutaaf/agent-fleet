@@ -19,6 +19,17 @@ fleet_acquire_lock ship || exit 0
 trap 'fleet_release_lock ship' EXIT
 fleet_checkout checkout
 
+# Ticket 0006 — auto-pause PHASE 2 (shipping a new ticket) if the last 24h
+# show 3+ unresolved REQUEST_CHANGES on agent-branch PRs. On trip the gate
+# (a) emits a `ship_paused` event, (b) opens/updates a meta-issue, and
+# (c) runs `launchctl disable` so this label stops firing until the operator
+# explicitly re-enables it. PHASE 1 (heal the in-flight PR) is NOT disabled
+# — we still hand off to claude so an in-flight PR can heal, but the prompt
+# reads $FLEET_SHIP_PAUSED and refuses to pick up a new ticket.
+#
+# Returns non-zero ONLY on trip; we deliberately do NOT `|| exit 0` here.
+fleet_check_sendback_streak || true
+
 fleet_run_claude ship < "$FLEET_PROMPTS/ship.prompt.md"
 EXIT=$?
 

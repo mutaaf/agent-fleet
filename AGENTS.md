@@ -110,6 +110,16 @@ postcard.
     `bin/fleet prompts-sha` to see the new value, re-run `install.sh` to
     bump the pin, or revert the prompt change. Unset `PROMPTS_SHA` = no
     event (current behavior preserved).
+  - `ship_paused {reason, count, prs}` — emitted by
+    `fleet_check_sendback_streak` (ticket 0006) when 3+ agent-branch PRs
+    in the last 24h received `REQUEST_CHANGES` and closed without
+    resolution. PHASE 2 (shipping a new ticket) is then forbidden for
+    this run; PHASE 1 (heal) still runs. The function also opens or
+    comments on a `[FLEET] ship paused after N send-backs` GitHub Issue
+    and invokes `launchctl disable gui/$UID/$NAMESPACE.agent-ship` so the
+    pause persists across runner invocations. Resume = explicit
+    `launchctl enable gui/$UID/$NAMESPACE.agent-ship` (or fleet-control's
+    "Resume" action).
 
 Add new event types in the same file; consumers MUST tolerate unknown types
 gracefully. Do not rename or repurpose an existing type — the contract is the
