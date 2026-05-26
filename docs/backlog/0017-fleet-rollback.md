@@ -1,7 +1,7 @@
 ---
 id: 0017
 title: fleet rollback reverts the last agent-shipped commit
-status: groomed
+status: in-progress
 priority: P1
 area: safety
 created: 2026-05-26
@@ -143,4 +143,10 @@ Each box maps 1:1 to a test scenario in `tests/rollback.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev picked up the ticket; branched
+  `feat/0017-fleet-rollback`; status flipped to `in-progress`. Plan:
+  failing tests in `tests/rollback.sh` (one per AC box) with `gh` and
+  `git` stubbed via mktemp + PATH; then `bin/fleet rollback` dispatch
+  function (named `rollback`, not a coreutils collision per LESSONS
+  2026-05-26); AGENTS.md gains `revert/` branch prefix +
+  `rollback_opened` event-type; README "Daily ops" gets the callout.
