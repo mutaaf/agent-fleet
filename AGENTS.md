@@ -60,6 +60,7 @@ the contract, not suggestions.
 - Never modify `lib/install.sh` to skip `launchctl bootstrap`/`bootout` without
   preserving idempotency — every installed project re-runs install.sh.
 - Never commit values that look like API keys, tokens, or `gh` PATs.
+  Enforced locally by the pre-push hook installed by `fleet_install_prepush_hook` — see ticket 0008.
 
 ## How the loop runs on this repo
 
