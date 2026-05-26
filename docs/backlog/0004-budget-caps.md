@@ -1,7 +1,7 @@
 ---
 id: 0004
 title: Per-slug daily $ budget caps
-status: in-progress
+status: shipped
 priority: P1
 area: governance
 created: 2026-05-26
@@ -83,3 +83,5 @@ for anyone running autonomous agents on their own dime.
   via `jq` if available, otherwise a portable `awk` regex fallback. Cap
   comparison is float-safe via `awk`. Emits `budget_block` event when
   blocking.
+- 2026-05-26 — implementation-dev: shipped via PR #4. CI gates
+  (`shellcheck`, `validate`) green; auto-merged to main.
