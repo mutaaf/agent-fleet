@@ -28,6 +28,12 @@ FLEET_ROOT="$( cd "$FLEET_LIB/.." && pwd )"
 # shellcheck disable=SC2034  # used by sourced runners (ship/groom/eng) via "$FLEET_PROMPTS/..."
 FLEET_PROMPTS="$FLEET_ROOT/prompts"
 
+# Ticket 0009: cross-project LESSONS aggregation. The file is produced by
+# `bin/fleet lessons-sync` (invoked at the tail of lib/install.sh) and lives
+# under the TCC-safe install root so it survives working-tree deletion.
+# Prompts running inside a fresh checkout resolve it via this exported var.
+export FLEET_CROSS_LESSONS="$HOME/.local/share/agent-fleet/CROSS_LESSONS.md"
+
 # --- manifest -------------------------------------------------------------
 # $1 = absolute path to the dir holding agents.config.sh.
 fleet_load_manifest() {

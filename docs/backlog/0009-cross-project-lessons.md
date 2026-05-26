@@ -1,7 +1,7 @@
 ---
 id: 0009
 title: Cross-project LESSONS aggregation
-status: groomed
+status: in-progress
 priority: P2
 area: engine
 created: 2026-05-26
@@ -81,4 +81,11 @@ Each box maps 1:1 to a test scenario in `tests/lessons-sync.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev picked up on branch
+  `feat/0009-cross-project-lessons`. Tests-first plan: add
+  `tests/lessons-sync.sh` with one block per AC checkbox, then add
+  `bin/fleet lessons-sync` subcommand, the `FLEET_CROSS_LESSONS` export in
+  `lib/common.sh`, the PHASE 0 references in `prompts/ship.prompt.md` +
+  `prompts/groom.prompt.md`, and the install-time invocation at the tail
+  of `lib/install.sh`. Same branch also corrects ticket 0007 (shipped via
+  PR #14 but the GTM index update overwrote the status row).

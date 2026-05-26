@@ -1,7 +1,7 @@
 ---
 id: 0007
 title: Adaptive groom cadence when backlog is empty
-status: in-progress
+status: shipped
 priority: P2
 area: engine
 created: 2026-05-26

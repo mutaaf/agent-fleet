@@ -1800,6 +1800,335 @@ if [ "$CMD" = "rollback" ]; then
   rollback "$@"
 fi
 
+# --- lessons-sync ---------------------------------------------------------
+# Ticket 0009. `fleet lessons-sync` walks every discovered project, reads
+# its docs/LESSONS.md, and writes one merged file at
+# $HOME/.local/share/agent-fleet/CROSS_LESSONS.md so the ship/groom prompts
+# (and any human running `less`) can see what every project in the fleet
+# has learned.
+#
+# Discovery reuses the same two-root pattern as `doctor`/`tail`/`rollback`:
+#   1. $FLEET_DISCOVERY_ROOT (default ~/Desktop/projects)
+#   2. ~/.local/share/agent-fleet/projects
+# De-duped by SLUG, working-tree manifests winning over installed copies
+# (so a project that's currently on a feature branch is read from the
+# source tree, not the stale install).
+#
+# Output format:
+#   # CROSS_LESSONS
+#   <intro paragraph>
+#
+#   ## <slug-A>
+#
+#   <body of <slug-A>'s docs/LESSONS.md verbatim, MINUS its leading `# ...`
+#    title and the introductory paragraph immediately after it — those are
+#    boilerplate that would duplicate across every section. Subsection
+#    headings (`## ...`) are demoted to `### ...` so the project heading
+#    stays at the top of its block.>
+#
+#   ## <slug-B>
+#   ...
+#
+# De-dup (AC#B): a paragraph (`\n\n`-separated block) whose body is
+# byte-identical to one already emitted under another slug is dropped on
+# the second appearance AND replaced with a single
+# `> Already seen under ## <other-slug>` reference line under the current
+# slug's heading. The lesson LINE inside that paragraph also picks up an
+# `(also seen in <other-slug>)` annotation when first emitted, so an
+# operator skimming the file sees the cross-project signal without having
+# to grep.
+#
+# Idempotency (AC#C): we compute the proposed output in memory and only
+# overwrite the destination when its sha differs. mtime stays put when
+# bytes are unchanged — matters because consumers (fleet-control, the
+# launchd label that triggers `tail -F`) may treat mtime as freshness.
+#
+# AC#G: a project without docs/LESSONS.md is silently skipped — no
+# heading, no error, no entry in the merged file. The ticket calls this
+# out explicitly.
+
+lessons_sync_discover() {
+  local discovery_root="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local installed_root="$HOME/.local/share/agent-fleet/projects"
+  local _seen="" m slug dir
+  { find "$discovery_root" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$installed_root" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    dir="$(dirname "$m")"
+    printf '%s\t%s\n' "$slug" "$dir"
+  done
+}
+
+# Strip the leading `# Title\n\n<intro paragraph>\n\n` boilerplate from a
+# LESSONS.md body. The intro is everything before the FIRST `## ` heading
+# (or the whole file if there are no `## ` headings — in that case we
+# keep the body unchanged so a sparse LESSONS.md still surfaces).
+lessons_sync_strip_intro() {
+  awk '
+    BEGIN { skipping = 1 }
+    {
+      if (skipping && $0 ~ /^## /) skipping = 0
+      if (!skipping) print
+    }
+  '
+}
+
+# Demote `## X` → `### X` so each projects subsection sits under its own
+# project heading without colliding with another `##` block.
+lessons_sync_demote() {
+  sed -E 's/^## /### /'
+}
+
+lessons_sync() {
+  shift  # drop the leading "lessons-sync"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<USAGE
+fleet lessons-sync — merge every project's docs/LESSONS.md into one file.
+
+Usage:
+  fleet lessons-sync
+
+Writes \$HOME/.local/share/agent-fleet/CROSS_LESSONS.md. Idempotent: the
+file is only rewritten when content would change. Projects without a
+docs/LESSONS.md are skipped silently.
+
+Discovers projects via FLEET_DISCOVERY_ROOT (default ~/Desktop/projects)
+AND ~/.local/share/agent-fleet/projects, de-duped by SLUG.
+USAGE
+        exit 0 ;;
+      *) echo "fleet lessons-sync: unknown flag '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  local dest_dir="$HOME/.local/share/agent-fleet"
+  local dest="$dest_dir/CROSS_LESSONS.md"
+  mkdir -p "$dest_dir"
+
+  # Phase 1: collect (slug, lessons_path) rows for every project that has a
+  # docs/LESSONS.md. Skip projects without one (AC#G).
+  local rows=""
+  while IFS=$'\t' read -r slug dir; do
+    [ -z "$slug" ] && continue
+    local lessons_file="$dir/docs/LESSONS.md"
+    [ -f "$lessons_file" ] || continue
+    rows="${rows}${slug}"$'\t'"${lessons_file}"$'\n'
+  done < <(lessons_sync_discover)
+
+  # Phase 2: render the merged document into a tmpfile, then atomically
+  # compare against the existing file's sha. The rendering uses a small
+  # python pass because the cross-slug dedup needs paragraph-level state
+  # that awk handles badly across multiple files. python3 ships with
+  # macOS via the Command Line Tools; if it's missing we fall back to a
+  # shell-only implementation that omits the dedup annotation (still
+  # passes AC#A, but logs a warning).
+  local tmp; tmp="$(mktemp -t fleet-lessons.XXXXXX)"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$tmp" <<'PY' "$rows"
+import hashlib, os, re, sys
+out_path = sys.argv[1]
+raw_rows = sys.argv[2] if len(sys.argv) > 2 else ""
+rows = []
+for line in raw_rows.splitlines():
+    if not line.strip():
+        continue
+    parts = line.split("\t")
+    if len(parts) < 2:
+        continue
+    rows.append((parts[0], parts[1]))
+
+def strip_intro(text):
+    """Drop everything before the first '## ' heading. If there is none,
+    keep the body unchanged (sparse LESSONS.md still surfaces). The
+    project-level `# Title` line + any intro paragraph are dropped.
+    """
+    lines = text.splitlines()
+    out = []
+    started = False
+    for ln in lines:
+        if not started and ln.startswith("## "):
+            started = True
+        if started:
+            out.append(ln)
+    return "\n".join(out) if started else text
+
+def demote(text):
+    return re.sub(r"(?m)^## ", "### ", text)
+
+def split_paragraphs(text):
+    # Paragraphs are blank-line separated blocks. We keep each block's
+    # leading whitespace stripped for dedup hashing but emit the raw
+    # block verbatim. Headings (### ...) start a new paragraph; we treat
+    # the heading line as a paragraph of its own so two identical body
+    # paragraphs under different headings still dedup correctly.
+    paras = []
+    cur = []
+    for ln in text.splitlines():
+        if ln.strip() == "":
+            if cur:
+                paras.append("\n".join(cur))
+                cur = []
+        else:
+            cur.append(ln)
+    if cur:
+        paras.append("\n".join(cur))
+    return paras
+
+# Body-hash → slug-of-first-appearance. We dedup on the paragraph body
+# minus a trailing `(also seen in ...)` annotation so re-runs are stable.
+seen = {}
+# Per-slug list of (kind, payload). kind is "para" (verbatim emit), or
+# "ref" (emit a `> Already seen under ## <slug>` line).
+per_slug = []
+
+for slug, path in rows:
+    try:
+        body = open(path, encoding="utf-8").read()
+    except OSError:
+        continue
+    body = strip_intro(body)
+    body = demote(body)
+    paras = split_paragraphs(body)
+    emitted = []
+    for p in paras:
+        # Hash ignores any existing `(also seen in ...)` tag so reruns
+        # don't keep adding nesting layers.
+        key = re.sub(r"\s*\(also seen in [^)]+\)", "", p).strip()
+        if not key:
+            continue
+        if key in seen and seen[key] != slug:
+            emitted.append(("ref", seen[key]))
+        else:
+            if key not in seen:
+                seen[key] = slug
+                # Annotate the lesson line with "(also seen in ...)" if
+                # we discover later that another project shares it. We
+                # do that in a second pass below; for now stash the
+                # paragraph verbatim.
+                emitted.append(("para", p))
+            else:
+                # Same slug repeats the same paragraph (rare; keep once)
+                pass
+    per_slug.append((slug, emitted))
+
+# Second pass: for every paragraph body that's referenced by a OTHER
+# slug, collect the referrer slugs keyed by the paragraph body's hash.
+# `seen[key]` is the FIRST emitter slug for that body; any other slug
+# that hit the body emitted a ("ref", first_emitter) row, so the set of
+# referrers is "every slug that emitted a ref pointing at the body's
+# first emitter AND whose own body matches key".
+para_referrers = {}  # body_key -> set(referrer_slugs)
+# We need to know which body key each ref corresponds to. Rebuild the
+# per_slug walk to capture that: any "ref" was preceded by a body that
+# matched an already-seen key — store the key alongside the ref.
+per_slug_v2 = []
+seen_v2 = {}
+for slug, path in rows:
+    try:
+        body = open(path, encoding="utf-8").read()
+    except OSError:
+        continue
+    body = strip_intro(body)
+    body = demote(body)
+    paras = split_paragraphs(body)
+    emitted = []
+    for p in paras:
+        key = re.sub(r"\s*\(also seen in [^)]+\)", "", p).strip()
+        if not key:
+            continue
+        if key in seen_v2 and seen_v2[key] != slug:
+            emitted.append(("ref", seen_v2[key], key))
+            para_referrers.setdefault(key, set()).add(slug)
+        elif key not in seen_v2:
+            seen_v2[key] = slug
+            emitted.append(("para", p, key))
+    per_slug_v2.append((slug, emitted))
+
+per_slug = per_slug_v2
+seen = seen_v2
+
+# Re-render per slug:
+chunks = ["# CROSS_LESSONS",
+          "",
+          "Auto-generated by `fleet lessons-sync`. Do not edit by hand —",
+          "your edits will be overwritten on the next sync. The source of",
+          "truth is each project's `docs/LESSONS.md`.",
+          ""]
+for slug, emitted in per_slug:
+    if not emitted:
+        continue
+    chunks.append(f"## {slug}")
+    chunks.append("")
+    for row in emitted:
+        kind = row[0]
+        if kind == "para":
+            payload = row[1]
+            key = row[2]
+            # If THIS paragraph body is referenced by other slugs, annotate
+            # its first non-heading content line with `(also seen in ...)`.
+            others = sorted(para_referrers.get(key, set()) - {slug})
+            if others:
+                lines = payload.splitlines()
+                for i, ln in enumerate(lines):
+                    if ln.startswith("###") or ln.strip() == "":
+                        continue
+                    if "(also seen in" in ln:
+                        break
+                    lines[i] = ln.rstrip() + f" (also seen in {', '.join(others)})"
+                    break
+                payload = "\n".join(lines)
+            chunks.append(payload)
+            chunks.append("")
+        elif kind == "ref":
+            target_slug = row[1]
+            chunks.append(f"> Already seen under ## {target_slug}")
+            chunks.append("")
+
+text = "\n".join(chunks).rstrip() + "\n"
+open(out_path, "w", encoding="utf-8").write(text)
+PY
+  else
+    # Shell-only fallback. AC#A still passes; AC#B's annotation does not.
+    {
+      printf '# CROSS_LESSONS\n\n'
+      printf 'Auto-generated by `fleet lessons-sync`. Do not edit by hand —\n'
+      printf 'your edits will be overwritten on the next sync. The source of\n'
+      printf "truth is each project's \`docs/LESSONS.md\`.\n\n"
+      while IFS=$'\t' read -r slug path; do
+        [ -z "$slug" ] && continue
+        printf '## %s\n\n' "$slug"
+        lessons_sync_strip_intro < "$path" | lessons_sync_demote
+        printf '\n'
+      done <<<"$rows"
+    } > "$tmp"
+    echo "fleet lessons-sync: python3 not found — dedup annotation skipped" >&2
+  fi
+
+  # Idempotency: write only when content differs (AC#C).
+  if [ -f "$dest" ]; then
+    local old_sha new_sha
+    old_sha=$(shasum "$dest" 2>/dev/null | awk '{print $1}')
+    new_sha=$(shasum "$tmp"  2>/dev/null | awk '{print $1}')
+    if [ "$old_sha" = "$new_sha" ]; then
+      rm -f "$tmp"
+      exit 0
+    fi
+  fi
+  mv -f "$tmp" "$dest"
+  exit 0
+}
+
+if [ "$CMD" = "lessons-sync" ]; then
+  lessons_sync "$@"
+fi
+
 if [ "$CMD" = "list" ]; then
   echo "${c_bld}fleet projects under $ROOT${c_rst}"
   while read -r m; do

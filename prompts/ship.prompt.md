@@ -10,6 +10,11 @@ PHASE 0 — Load the contract and the memory.
   COMMAND, and the hard NOs. Use those values everywhere below — do not assume.
   `docs/LESSONS.md` is the loop's operational memory: obey it, and append to it
   when you learn something novel (PHASE 3).
+  Also read `$FLEET_CROSS_LESSONS` if it exists (cross-project lessons file
+  produced by `fleet lessons-sync`, ticket 0009). A failure pattern another
+  project in the fleet already learned MUST inform this run; obey those lessons
+  even though they live outside this repo. Skip silently when the var is
+  unset or the file is absent (early adopters won't have it yet).
 
 PHASE 1 — Tend the in-flight PR (self-healing). A single stuck PR must never
 freeze the loop.
