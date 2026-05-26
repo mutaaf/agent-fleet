@@ -1,7 +1,7 @@
 ---
 id: 0010
 title: AGENT_DRY_RUN end-to-end mode
-status: in-progress
+status: shipped
 priority: P2
 area: safety
 created: 2026-05-26
@@ -93,3 +93,8 @@ Each box maps 1:1 to a test scenario in `tests/dry-run.sh`.
       `launchctl setenv AGENT_DRY_RUN 1` only when `--dry-run` is set;
   (4) document the env var + flag under README "Daily ops" so
       `grep AGENT_DRY_RUN README.md` matches.
+- 2026-05-26 — implementation-dev: shipped via PR #21 (merged). All 7 ACs
+  green on `shellcheck` + `validate`. Novel operational lesson surfaced and
+  appended to `docs/LESSONS.md`: test stubs that need to be PATH-resolvable
+  by code that sources `lib/common.sh` must live under `$HOME/.local/bin`
+  because `common.sh` resets PATH at source time.

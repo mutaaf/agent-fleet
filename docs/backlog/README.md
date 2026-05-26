@@ -33,7 +33,7 @@ ones, `review` grades them.
 | 0015 | fleet tail streams live events for one or all projects | P1 | shipped | observability |
 | 0017 | fleet rollback reverts the last agent-shipped commit | P1 | shipped | safety |
 | 0009 | Cross-project LESSONS aggregation | P2 | shipped | engine |
-| 0010 | AGENT_DRY_RUN end-to-end mode | P2 | in-progress | safety |
+| 0010 | AGENT_DRY_RUN end-to-end mode | P2 | shipped | safety |
 | 0013 | prompts/CHANGELOG.md + fleet prompts-diff explain drift | P2 | groomed | governance |
 | 0016 | events.jsonl size-based rotation with retained archives | P2 | groomed | telemetry |
 | 0018 | prompts/PRINCIPLES.md codifies the loop's unwritten behavioral doctrine | P2 | groomed | governance |
