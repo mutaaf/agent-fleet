@@ -1,7 +1,7 @@
 ---
 id: 0012
 title: fleet digest one-line daily summary per project
-status: groomed
+status: shipped
 priority: P2
 area: observability
 created: 2026-05-26
@@ -101,4 +101,15 @@ Each box maps 1:1 to a test scenario in `tests/digest.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branched feat/0012-fleet-digest,
+  flipped status to in-progress.
+- 2026-05-26 — implementation-dev: implemented `bin/fleet digest` with
+  `--slug`, `--since Nh|Nd`, `--json`, and `--emoji` (reserved) flags.
+  Reads `~/.cache/<slug>-agent/{events,runs}.jsonl` via awk regex so
+  there's no jq dependency. State derivation matches AC#4 priority order
+  (EXPIRED > OVER-BUDGET > PAUSED > THROTTLED > STUCK > OK). STUCK is
+  gated behind a `$CACHE_DIR/stuck-pr` marker for v1 — adding a `gh`
+  poll path was deferred to keep the digest network-free by default.
+  Tests in `tests/digest.sh` cover every acceptance-criteria box with a
+  three-project tmpdir fixture (alpha=OK, bravo=OVER-BUDGET,
+  charlie=EXPIRED). No `lib/` changes → no reinstall required.
