@@ -437,6 +437,21 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet status courtiq    # just one
 ```
 
+### Daily ops
+
+```bash
+~/code/agent-fleet/bin/fleet doctor                  # PASS/WARN/FAIL across every installed project
+~/code/agent-fleet/bin/fleet doctor --slug courtiq   # one project
+~/code/agent-fleet/bin/fleet doctor --json           # machine-readable, for fleet-control
+```
+
+Run `doctor` after upgrading the kit (`bash lib/install.sh ...`) or before a
+long break. It validates each project's manifest, the AGENTS.md contract
+section, the backlog scaffolding, launchd label load state, the installed-vs-
+repo lib SHA, and `gh auth status` in one pass. Exit 0 = all green; exit 1 =
+at least one FAIL across the fleet. Set `FLEET_DISCOVERY_ROOT` to override the
+scan root (defaults to `~/Desktop/projects`).
+
 Discovery scans two roots:
 - `~/Desktop/projects/*/agents.config.sh` (active working trees)
 - `~/.local/share/agent-fleet/projects/*/agents.config.sh` (installed manifests)

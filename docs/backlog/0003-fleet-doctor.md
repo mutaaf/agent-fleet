@@ -1,7 +1,7 @@
 ---
 id: 0003
 title: fleet doctor subcommand for fleet health
-status: groomed
+status: shipped
 priority: P1
 area: observability
 created: 2026-05-26
@@ -78,4 +78,18 @@ demo-worthy. Compare to setting up CI from scratch with no doctor.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev — opened `feat/0003-fleet-doctor`. Plan: add a
+  `doctor()` function plus the top-level `doctor` case branch to `bin/fleet`,
+  introduce `FLEET_DISCOVERY_ROOT` as the test-friendly override for the
+  scanned roots, ship `--json` + `--slug NAME` flags, and back it with a
+  fixture-based `tests/doctor.sh`.
+- 2026-05-26 — implementation-dev — shipped. Added `doctor()` to `bin/fleet`
+  with seven checks (config, self_cancel, agents_md, backlog, launchd_loaded,
+  installed_lib_sha, gh_auth), `--json` + `--slug NAME` flags, and the
+  `FLEET_SKIP_INSTALLED_LIB_SHA` env override so test hosts without an install
+  WARN rather than misleadingly PASS. Wrote `tests/doctor.sh` with a two-project
+  tmpdir fixture (one healthy, one missing AGENTS.md), stubbing `launchctl` and
+  `gh` on PATH so the test is host-independent. Added a "Daily ops" subsection
+  to the README's `bin/fleet` dashboard section. Local gate green:
+  `shellcheck -S warning lib/*.sh bin/fleet && bash -n lib/*.sh bin/fleet &&
+  node scripts/check-backlog.mjs && bash tests/{doctor,lock,events}.sh`.

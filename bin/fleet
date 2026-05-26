@@ -3,13 +3,23 @@
 # fleet — one-glance status across every project running fleet agents.
 #
 # Usage:
-#   fleet status         survey all projects (default)
-#   fleet status <slug>  just one
-#   fleet list           list discovered projects and their manifests
+#   fleet status              survey all projects (default)
+#   fleet status <slug>       just one
+#   fleet list                list discovered projects and their manifests
+#   fleet doctor              diagnose every installed project (PASS/WARN/FAIL)
+#   fleet doctor --json       machine-readable summary for fleet-control
+#   fleet doctor --slug NAME  restrict to one project
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
 # it is not subject to the launchd TCC restriction the agents are.
+#
+# The doctor subcommand honours FLEET_DISCOVERY_ROOT (default ~/Desktop/projects)
+# as the single scan root. This is what tests/doctor.sh uses to point at a
+# fixture instead of the host's real ~/Desktop tree. Set
+# FLEET_SKIP_INSTALLED_LIB_SHA=1 to skip the installed-vs-repo lib SHA check
+# (it WARNs anyway when ~/.local/share/agent-fleet/lib is absent — the env
+# override is mostly for test hosts that intentionally have no install).
 
 set -uo pipefail
 
@@ -57,6 +67,279 @@ newest_log_epoch() {  # $1 = log dir → mtime of newest *.log, or empty
   local f; f=$(ls -t "$d"/*.log 2>/dev/null | head -1) || return
   [ -n "$f" ] && stat -f %m "$f" 2>/dev/null
 }
+
+# --- doctor ---------------------------------------------------------------
+# `fleet doctor` scans FLEET_DISCOVERY_ROOT (default ~/Desktop/projects) for
+# */agents.config.sh, then runs seven named checks per project. Output is
+# either one block per project (default) or a single JSON document keyed by
+# {"projects":[{"slug":..,"checks":[{"name":..,"status":..,"reason":..}]}]}.
+# Exit 0 if no FAIL across any project; exit 1 if any check is FAIL. WARN
+# never fails the exit code — it's an "ok but look at me" signal.
+#
+# Checks (run in this order, names are the JSON-stable contract):
+#   config             agents.config.sh parseable; SLUG/REPO_URL/SELF_CANCEL set
+#   self_cancel        SELF_CANCEL not in the past (FAIL), >3 days out (PASS)
+#   agents_md          AGENTS.md present + "## Agent parameters" section
+#   backlog            docs/backlog/README.md + scripts/check-backlog.mjs exist
+#   launchd_loaded     com.<slug>.agent-{ship,groom,review} are loaded
+#                      (+ eng if ENG_ENABLED=1)
+#   installed_lib_sha  ~/.local/share/agent-fleet/lib SHA matches the repo's
+#                      lib/ SHA (WARN when either side is absent)
+#   gh_auth            `gh auth status` exits 0
+
+DOCTOR_ROOT="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+
+# Repo lib/ dir — relative to this script (bin/fleet → ../lib).
+doctor_repo_lib() {
+  local self; self="$( cd "$( dirname "$0" )" && pwd )"
+  echo "$self/../lib"
+}
+
+# Sum of `shasum` over every *.sh under a lib dir, sorted, joined. Stable
+# across machines because we sort the filenames first. Echoes empty string if
+# the dir is missing or contains no shell files.
+doctor_lib_sha() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+  (cd "$dir" && find . -type f -name '*.sh' | sort | xargs shasum 2>/dev/null) | shasum | awk '{print $1}'
+}
+
+# Hand-rolled JSON string escape — same intent as common.sh _json_escape but
+# bin/fleet doesn't source common.sh. Keep this in sync if either grows.
+doctor_json_escape() {
+  local s="${1-}" out="" i ch code
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *) printf -v code '%d' "'$ch"
+         if [ "$code" -lt 32 ]; then printf -v out '%s\\u%04x' "$out" "$code"
+         else out+="$ch"; fi ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# Run all seven checks for one manifest. Echoes one "name|status|reason" line
+# per check on stdout. Caller renders or JSON-encodes.
+doctor_run_checks() {
+  local manifest="$1"
+  local proj_dir; proj_dir="$(dirname "$manifest")"
+  local slug="" ns="" sc="" eng="0" repo_url=""
+
+  # check: config -- subshell so vars don't leak across projects
+  local cfg_status="PASS" cfg_reason=""
+  local probe
+  probe=$(
+    # shellcheck disable=SC1090  # discovered at runtime
+    ( source "$manifest" 2>/dev/null
+      echo "SLUG=${SLUG:-}"
+      echo "NAMESPACE=${NAMESPACE:-com.fleet.${SLUG:-x}}"
+      echo "SELF_CANCEL=${SELF_CANCEL:-}"
+      echo "ENG_ENABLED=${ENG_ENABLED:-0}"
+      echo "REPO_URL=${REPO_URL:-}"
+    ) 2>/dev/null
+  ) || true
+  slug="$(echo "$probe" | sed -n 's/^SLUG=//p')"
+  ns="$(echo "$probe" | sed -n 's/^NAMESPACE=//p')"
+  sc="$(echo "$probe" | sed -n 's/^SELF_CANCEL=//p')"
+  eng="$(echo "$probe" | sed -n 's/^ENG_ENABLED=//p')"
+  repo_url="$(echo "$probe" | sed -n 's/^REPO_URL=//p')"
+  if [ -z "$slug" ] || [ -z "$repo_url" ] || [ -z "$sc" ]; then
+    cfg_status="FAIL"
+    cfg_reason="manifest missing required vars (SLUG/REPO_URL/SELF_CANCEL)"
+  fi
+  echo "config|$cfg_status|$cfg_reason"
+  # Tell the caller which slug we resolved so it can name the block.
+  echo "__SLUG__|$slug|"
+
+  # check: self_cancel
+  local sc_status="PASS" sc_reason="" days=""
+  if [ -z "$sc" ]; then
+    sc_status="FAIL"; sc_reason="SELF_CANCEL not set"
+  else
+    days=$(days_until "$sc")
+    if [ "$days" -lt 0 ]; then
+      sc_status="FAIL"; sc_reason="SELF_CANCEL expired ${days}d ago ($sc)"
+    elif [ "$days" -le 3 ]; then
+      sc_status="WARN"; sc_reason="SELF_CANCEL within ${days}d ($sc)"
+    fi
+  fi
+  echo "self_cancel|$sc_status|$sc_reason"
+
+  # check: agents_md — file present + "## Agent parameters" section
+  local am="$proj_dir/AGENTS.md"
+  local am_status="PASS" am_reason=""
+  if [ ! -f "$am" ]; then
+    am_status="FAIL"; am_reason="AGENTS.md not found at $am"
+  elif ! grep -q '^##[[:space:]]\+Agent parameters' "$am"; then
+    am_status="FAIL"; am_reason="AGENTS.md missing '## Agent parameters' section"
+  fi
+  echo "agents_md|$am_status|$am_reason"
+
+  # check: backlog — README.md and check-backlog.mjs
+  local bl_status="PASS" bl_reason="" missing=""
+  [ -f "$proj_dir/docs/backlog/README.md" ] || missing="$missing docs/backlog/README.md"
+  [ -f "$proj_dir/scripts/check-backlog.mjs" ] || missing="$missing scripts/check-backlog.mjs"
+  if [ -n "$missing" ]; then
+    bl_status="FAIL"; bl_reason="missing:${missing}"
+  fi
+  echo "backlog|$bl_status|$bl_reason"
+
+  # check: launchd_loaded -- ship/groom/review always expected; eng iff ENG_ENABLED
+  local ld_status="PASS" ld_reason=""
+  local jobs="ship groom review"
+  [ "$eng" = "1" ] && jobs="$jobs eng"
+  local missing_jobs=""
+  for j in $jobs; do
+    if ! launchctl print "$DOMAIN/$ns.agent-$j" >/dev/null 2>&1; then
+      missing_jobs="$missing_jobs $j"
+    fi
+  done
+  if [ -n "$missing_jobs" ]; then
+    ld_status="FAIL"; ld_reason="launchd jobs not loaded:${missing_jobs}"
+  fi
+  echo "launchd_loaded|$ld_status|$ld_reason"
+
+  # check: installed_lib_sha
+  local ls_status="PASS" ls_reason=""
+  if [ -n "${FLEET_SKIP_INSTALLED_LIB_SHA:-}" ]; then
+    ls_status="WARN"; ls_reason="skipped via FLEET_SKIP_INSTALLED_LIB_SHA"
+  else
+    local installed_dir="$HOME/.local/share/agent-fleet/lib"
+    local repo_dir; repo_dir="$(doctor_repo_lib)"
+    if [ ! -d "$installed_dir" ]; then
+      ls_status="WARN"; ls_reason="$installed_dir not present — run install.sh"
+    elif [ ! -d "$repo_dir" ]; then
+      ls_status="WARN"; ls_reason="repo lib/ not resolvable from $0"
+    else
+      local installed_sha repo_sha
+      installed_sha="$(doctor_lib_sha "$installed_dir")"
+      repo_sha="$(doctor_lib_sha "$repo_dir")"
+      if [ -z "$installed_sha" ] || [ -z "$repo_sha" ]; then
+        ls_status="WARN"; ls_reason="could not compute one of the lib SHAs"
+      elif [ "$installed_sha" != "$repo_sha" ]; then
+        ls_status="WARN"
+        ls_reason="installed lib SHA differs from repo lib SHA — reinstall kit"
+      fi
+    fi
+  fi
+  echo "installed_lib_sha|$ls_status|$ls_reason"
+
+  # check: gh_auth
+  local gh_status="PASS" gh_reason=""
+  if ! command -v gh >/dev/null 2>&1; then
+    gh_status="FAIL"; gh_reason="gh CLI not installed"
+  elif ! gh auth status >/dev/null 2>&1; then
+    gh_status="FAIL"; gh_reason="gh auth status failed — run gh auth login"
+  fi
+  echo "gh_auth|$gh_status|$gh_reason"
+}
+
+# Build the per-project block (human form). Reads check rows on stdin, decides
+# the project status (FAIL > WARN > PASS), and prints one block.
+doctor_render_human() {
+  local slug="$1"
+  local rows="$2"   # newline-joined name|status|reason lines
+  local worst="PASS"
+  while IFS='|' read -r name status reason; do
+    [ -z "$name" ] && continue
+    [ "$name" = "__SLUG__" ] && continue
+    if [ "$status" = "FAIL" ]; then worst="FAIL"
+    elif [ "$status" = "WARN" ] && [ "$worst" != "FAIL" ]; then worst="WARN"
+    fi
+  done <<<"$rows"
+
+  local color="$c_grn"
+  [ "$worst" = "WARN" ] && color="$c_ylw"
+  [ "$worst" = "FAIL" ] && color="$c_red"
+  printf '%b[%s]%b %s\n' "$color" "$worst" "$c_rst" "$slug"
+  while IFS='|' read -r name status reason; do
+    [ -z "$name" ] && continue
+    [ "$name" = "__SLUG__" ] && continue
+    if [ "$status" != "PASS" ]; then
+      printf '  %-18s %s  %s\n' "$name" "$status" "$reason"
+    else
+      printf '  %-18s %s\n' "$name" "$status"
+    fi
+  done <<<"$rows"
+  echo
+}
+
+doctor() {
+  local want_json=0 slug_filter=""
+  shift  # drop the leading "doctor"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      --slug) slug_filter="${2:-}"; shift 2 ;;
+      --slug=*) slug_filter="${1#--slug=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet doctor — diagnose every installed project (PASS/WARN/FAIL)
+
+Usage:
+  fleet doctor               survey FLEET_DISCOVERY_ROOT (default ~/Desktop/projects)
+  fleet doctor --json        machine-readable summary
+  fleet doctor --slug NAME   restrict to one project
+USAGE
+        exit 0 ;;
+      *) echo "fleet doctor: unknown flag '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  local manifests=()
+  while IFS= read -r m; do
+    [ -n "$m" ] && manifests+=("$m")
+  done < <(find "$DOCTOR_ROOT" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort)
+
+  local any_fail=0
+  local json_projects=""
+  for m in "${manifests[@]:-}"; do
+    [ -z "$m" ] && continue
+    local rows; rows="$(doctor_run_checks "$m")"
+    local slug; slug="$(echo "$rows" | sed -n 's/^__SLUG__|\(.*\)|.*/\1/p' | head -1)"
+    [ -n "$slug_filter" ] && [ "$slug" != "$slug_filter" ] && continue
+
+    # Track project-level status for exit code.
+    if echo "$rows" | grep -q '|FAIL|'; then any_fail=1; fi
+
+    if [ "$want_json" = "1" ]; then
+      local checks_json=""
+      while IFS='|' read -r name status reason; do
+        [ -z "$name" ] && continue
+        [ "$name" = "__SLUG__" ] && continue
+        local esc_name esc_status esc_reason
+        esc_name="$(doctor_json_escape "$name")"
+        esc_status="$(doctor_json_escape "$status")"
+        esc_reason="$(doctor_json_escape "$reason")"
+        [ -n "$checks_json" ] && checks_json+=","
+        checks_json+="{\"name\":\"$esc_name\",\"status\":\"$esc_status\",\"reason\":\"$esc_reason\"}"
+      done <<<"$rows"
+      [ -n "$json_projects" ] && json_projects+=","
+      json_projects+="{\"slug\":\"$(doctor_json_escape "$slug")\",\"checks\":[$checks_json]}"
+    else
+      doctor_render_human "$slug" "$rows"
+    fi
+  done
+
+  if [ "$want_json" = "1" ]; then
+    printf '{"projects":[%s]}\n' "$json_projects"
+  fi
+
+  [ "$any_fail" = "1" ] && exit 1
+  exit 0
+}
+
+if [ "$CMD" = "doctor" ]; then
+  doctor "$@"
+fi
 
 if [ "$CMD" = "list" ]; then
   echo "${c_bld}fleet projects under $ROOT${c_rst}"
