@@ -1,7 +1,7 @@
 ---
 id: 0011
 title: fleet onboard bootstraps a new project in one command
-status: groomed
+status: in-progress
 priority: P1
 area: engine
 created: 2026-05-26
@@ -112,3 +112,10 @@ Each box maps 1:1 to a test scenario in `tests/onboard.sh`.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+- 2026-05-26 — branch `feat/0011-fleet-onboard` opened. Plan: add three
+  `templates/claude-agents/*.md` subagent files (voice mirrors this repo's
+  local `.claude/agents/`), then the `bin/fleet onboard` subcommand and
+  `tests/onboard.sh`. Default behavior calls `bash $KIT_ROOT/lib/install.sh`
+  at the end; `--skip-install`, `--dry-run`, and `--force` modify it. Tests
+  stub `install.sh` and `launchctl` on PATH.
