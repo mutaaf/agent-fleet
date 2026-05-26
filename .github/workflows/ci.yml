@@ -31,6 +31,8 @@ jobs:
         run: bash -n lib/*.sh bin/fleet
       - name: backlog integrity
         run: node scripts/check-backlog.mjs
+      - name: prompts changelog
+        run: node scripts/check-prompts-changelog.mjs
       - name: prompts present
         run: |
           test -f prompts/ship.prompt.md
