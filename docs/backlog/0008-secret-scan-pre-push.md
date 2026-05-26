@@ -1,7 +1,7 @@
 ---
 id: 0008
 title: Secret-scan pre-push hook in agent checkouts
-status: in-progress
+status: shipped
 priority: P1
 area: safety
 created: 2026-05-26
@@ -102,3 +102,6 @@ Each box maps 1:1 to a test scenario in `tests/secret-scan.sh`.
     `git push`) and use obvious fake fixtures (e.g. `sk-ant-api03-`
     followed by `A`*30, `ghp_` followed by `0`*36) so the test file
     itself does not self-trip when committed.
+- 2026-05-26 — shipped via PR #11. Both gating checks (`shellcheck`,
+  `validate`) green; auto-merge squashed to main as `568dca2`. Status
+  flipped to `shipped` in this follow-up commit.
