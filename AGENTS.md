@@ -144,6 +144,28 @@ Add new event types in the same file; consumers MUST tolerate unknown types
 gracefully. Do not rename or repurpose an existing type — the contract is the
 moat.
 
+## Prompts changelog
+
+Operator-curated record of behavioral changes to `prompts/` lives in
+[`prompts/CHANGELOG.md`](prompts/CHANGELOG.md). Every PR that touches
+any file under `prompts/` MUST also add a new
+`## YYYY-MM-DD — <one-line title>` entry — the `validate` CI gate runs
+`node scripts/check-prompts-changelog.mjs` and fails when the two move
+out of step. The CHANGELOG is part of the prompts SHA input (the
+`find prompts -type f -name '*.md'` glob covers it), so any entry here
+surfaces as drift in `fleet doctor`'s `prompts_pinned` check — that
+is intentional. When the operator sees `prompts_drift`, the recovery
+path is one command:
+
+```
+bin/fleet prompts-diff             # unified diff installed vs current
+bin/fleet prompts-diff --changelog # entries newer than the pin
+bin/fleet prompts-diff --since SHA # diff against a specific old pin
+```
+
+`prompts-diff` exits 1 on any difference (so `&&` composition works
+in shell scripts) and 0 when the installed tree matches the kit.
+
 ## Local development (humans)
 
 ```

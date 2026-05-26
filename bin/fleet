@@ -151,6 +151,253 @@ if [ "$CMD" = "prompts-sha" ]; then
   exit $?
 fi
 
+# --- prompts-diff ---------------------------------------------------------
+# Ticket 0013. `fleet prompts-diff` explains the WHY behind a
+# `prompts_drift` warning (ticket 0005). Three modes:
+#
+#   fleet prompts-diff
+#     Unified diff of every *.md under the installed prompts tree
+#     (~/.local/share/agent-fleet/prompts) against the kit's current
+#     prompts/. Exit 1 if any file differs; 0 otherwise. The operator
+#     reads this in tandem with `fleet doctor` to see what changed.
+#
+#   fleet prompts-diff --since <SHA>
+#     Walk `git log -- prompts/` to find the commit whose subtree SHA
+#     matches the operator's old pin, then `git diff <commit>..HEAD
+#     -- prompts/`. Used after an install.sh re-pin to see what the
+#     bump actually changed.
+#
+#   fleet prompts-diff --changelog
+#     Print all prompts/CHANGELOG.md entries verbatim that are NEWER
+#     than the installed-prompts SHA. "Newer" is decided by walking
+#     the CHANGELOG top-down (newest entries first by convention) and
+#     stopping at the entry whose body cites the installed SHA — when
+#     no installed-SHA stamp exists, every entry is surfaced.
+#
+# Naming (LESSONS 2026-05-26): the dispatch function is named
+# `prompts_diff_cmd` rather than `prompts_diff` so it never shadows the
+# system `diff` binary (we shell out to `diff -u` from inside this very
+# function). Same trap that bit `tail()` in ticket 0015.
+#
+# Resolution: KIT_ROOT is derived from this script's location
+# (bin/fleet → ..). $FLEET_KIT_ROOT overrides it for tests.
+
+prompts_diff_kit_root() {
+  local self
+  self="$( cd "$( dirname "$0" )" && pwd )"
+  echo "${FLEET_KIT_ROOT:-$(cd "$self/.." && pwd)}"
+}
+
+# Print prompts/CHANGELOG.md, optionally filtered to entries newer than
+# the operator's pinned SHA. Filtering logic:
+#
+#   * Discover the operator's pin by reading
+#     `~/.local/share/agent-fleet/projects/*/agents.config.sh` and grabbing
+#     the first `PROMPTS_SHA="..."` value (install.sh stamps every
+#     installed manifest with the same pin — same kit, same SHA).
+#   * If no pin is discoverable OR the pin equals the kit's current
+#     prompts SHA → print the full CHANGELOG (no cutoff to apply).
+#   * Otherwise, walk `git log -- prompts/CHANGELOG.md` to find the
+#     commit whose CHANGELOG-version corresponds to the operator's pin
+#     era. We use a simple heuristic: take the FIRST heading present in
+#     the historical CHANGELOG at that commit and treat it as the
+#     cutoff — everything above that heading in the kit CHANGELOG is
+#     "newer than the operator's install."
+#
+# When git history isn't queryable (test fixture without a .git dir) we
+# fall through to printing the full CHANGELOG, which matches the
+# "surface everything" semantics callers expect when no pin info exists.
+prompts_diff_changelog() {
+  local kit_root="$1"
+  local kit_chg="$kit_root/prompts/CHANGELOG.md"
+  if [ ! -f "$kit_chg" ]; then
+    echo "fleet prompts-diff --changelog: no CHANGELOG at $kit_chg" >&2
+    return 1
+  fi
+
+  # Discover the operator's pin. Empty when no installed manifest yet.
+  local pin=""
+  local installed_root="$HOME/.local/share/agent-fleet/projects"
+  if [ -d "$installed_root" ]; then
+    local m
+    for m in "$installed_root"/*/agents.config.sh; do
+      [ -f "$m" ] || continue
+      pin="$(sed -nE 's/^PROMPTS_SHA="?([0-9a-f]+)"?.*/\1/p' "$m" | head -1)"
+      [ -n "$pin" ] && break
+    done
+  fi
+
+  # Compute kit SHA. When it matches the pin OR no pin exists → surface
+  # the full CHANGELOG. The point of --changelog is to be informational;
+  # silence is the wrong default.
+  local kit_sha=""
+  kit_sha="$( ( cd "$kit_root" && find prompts -type f -name '*.md' | sort | xargs cat ) \
+                | shasum -a 256 | awk '{print $1}' )"
+  if [ -z "$pin" ] || [ "$pin" = "$kit_sha" ]; then
+    cat "$kit_chg"
+    return 0
+  fi
+
+  # Pin differs from the kit. Try git to find the historical CHANGELOG
+  # at the pinned era; if git isn't usable, fall back to the full file.
+  if ! ( cd "$kit_root" && git rev-parse HEAD >/dev/null 2>&1 ); then
+    cat "$kit_chg"
+    return 0
+  fi
+  local match=""
+  while IFS= read -r commit; do
+    [ -z "$commit" ] && continue
+    local sha
+    sha="$( cd "$kit_root" \
+            && git ls-tree -r --name-only "$commit" -- prompts 2>/dev/null \
+                 | sort \
+                 | while read -r f; do
+                     git show "$commit:$f" 2>/dev/null
+                   done \
+                 | shasum -a 256 | awk '{print $1}' )"
+    if [ "$sha" = "$pin" ]; then
+      match="$commit"
+      break
+    fi
+  done < <(cd "$kit_root" && git log -200 --format=%H -- prompts 2>/dev/null)
+
+  if [ -z "$match" ]; then
+    cat "$kit_chg"
+    return 0
+  fi
+
+  # Use the FIRST heading from the historical CHANGELOG as cutoff.
+  local cutoff
+  cutoff="$( cd "$kit_root" && git show "$match:prompts/CHANGELOG.md" 2>/dev/null \
+              | awk '/^## [0-9]{4}-[0-9]{2}-[0-9]{2}/ { print; exit }' )"
+  if [ -z "$cutoff" ]; then
+    cat "$kit_chg"
+    return 0
+  fi
+  awk -v cutoff="$cutoff" '
+    BEGIN { surf = 1 }
+    {
+      if ($0 == cutoff) { surf = 0 }
+      if (surf) print
+    }
+  ' "$kit_chg"
+}
+
+# Compare two prompt trees via `diff -u`. Echoes the unified diff to
+# stdout. Returns 0 when identical, 1 on any difference, 2 on error.
+prompts_diff_trees() {
+  local installed="$1" kit_prompts="$2"
+  if [ ! -d "$kit_prompts" ]; then
+    echo "fleet prompts-diff: no kit prompts dir at $kit_prompts" >&2
+    return 2
+  fi
+  if [ ! -d "$installed" ]; then
+    echo "fleet prompts-diff: no installed prompts dir at $installed" >&2
+    echo "(re-run install.sh from any project to populate it)" >&2
+    return 2
+  fi
+  # `diff -ruN` walks both directories, prints unified diffs per file,
+  # treats missing files on either side as empty. Exit 0 = identical,
+  # 1 = different, 2 = error.
+  diff -ruN "$installed" "$kit_prompts"
+  return $?
+}
+
+# Walk `git log -- prompts/` for a commit whose prompts/ tree-SHA matches
+# the operator's old pin, then diff that commit's prompts/ against HEAD's.
+# The pin is the SHA produced by `bin/fleet prompts-sha`, NOT a git SHA —
+# we compute the kit's formula at each ancestor commit until we find a
+# match (bounded to the last 200 commits to avoid runaway scans).
+prompts_diff_since() {
+  local kit_root="$1" pin="$2"
+  if [ -z "$pin" ]; then
+    echo "fleet prompts-diff --since: missing <SHA> argument" >&2
+    return 2
+  fi
+  if ! ( cd "$kit_root" && git rev-parse HEAD >/dev/null 2>&1 ); then
+    echo "fleet prompts-diff --since: $kit_root is not a git checkout" >&2
+    return 2
+  fi
+  local match=""
+  while IFS= read -r commit; do
+    [ -z "$commit" ] && continue
+    local sha
+    sha="$( cd "$kit_root" \
+            && git show "$commit:prompts" >/dev/null 2>&1 \
+            && git ls-tree -r --name-only "$commit" -- prompts \
+                 | sort \
+                 | while read -r f; do
+                     git show "$commit:$f" 2>/dev/null
+                   done \
+                 | shasum -a 256 | awk '{print $1}' )"
+    if [ "$sha" = "$pin" ]; then
+      match="$commit"
+      break
+    fi
+  done < <(cd "$kit_root" && git log -200 --format=%H -- prompts)
+  if [ -z "$match" ]; then
+    echo "fleet prompts-diff --since: no commit in the last 200 matched pin $pin" >&2
+    return 1
+  fi
+  ( cd "$kit_root" && git diff "$match"..HEAD -- prompts )
+  return $?
+}
+
+prompts_diff_cmd() {
+  shift  # drop the leading "prompts-diff"
+  local mode="tree" since_sha=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --changelog) mode="changelog"; shift ;;
+      --since)     mode="since"; since_sha="${2:-}"; shift 2 ;;
+      --since=*)   mode="since"; since_sha="${1#--since=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet prompts-diff — explain WHAT changed in the kit's prompts since install.
+
+Usage:
+  fleet prompts-diff                       unified diff installed vs kit
+  fleet prompts-diff --since <SHA>         diff against a historical pin
+  fleet prompts-diff --changelog           CHANGELOG entries newer than pin
+
+Exit 1 on any difference (so it composes with \`&&\` for scripts); 0
+when the installed prompts match the kit's current tree.
+
+The kit root resolves to this script's parent (bin/fleet -> ..) unless
+\$FLEET_KIT_ROOT overrides it. Installed prompts live at
+~/.local/share/agent-fleet/prompts (populated by lib/install.sh).
+USAGE
+        exit 0 ;;
+      --) shift ;;
+      -*) echo "fleet prompts-diff: unknown flag '$1'" >&2; exit 2 ;;
+      *)  echo "fleet prompts-diff: unexpected argument '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  local kit_root; kit_root="$(prompts_diff_kit_root)"
+  local kit_prompts="$kit_root/prompts"
+  local installed="$HOME/.local/share/agent-fleet/prompts"
+
+  case "$mode" in
+    changelog)
+      prompts_diff_changelog "$kit_root"
+      exit $?
+      ;;
+    since)
+      prompts_diff_since "$kit_root" "$since_sha"
+      exit $?
+      ;;
+    tree|*)
+      prompts_diff_trees "$installed" "$kit_prompts"
+      exit $?
+      ;;
+  esac
+}
+
+if [ "$CMD" = "prompts-diff" ]; then
+  prompts_diff_cmd "$@"
+fi
+
 # --- onboard --------------------------------------------------------------
 # Ticket 0011. `fleet onboard <project-path>` scaffolds a fresh project with
 # the full kit contract — manifest, AGENTS.md, docs/LESSONS.md stub, the
