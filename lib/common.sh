@@ -62,6 +62,82 @@ fleet_self_cancel() {
   return 0
 }
 
+# --- budget cap -----------------------------------------------------------
+# fleet_check_budget — soft-abort gate. Ticket 0004.
+#
+# Sums today's (UTC) `total_cost_usd` from $CACHE_DIR/runs.jsonl for this slug
+# and compares against the optional MAX_DAILY_USD cap from agents.config.sh.
+#   - returns 0 (proceed) when MAX_DAILY_USD is unset/empty (no cap).
+#   - returns 0 when today's spend < cap.
+#   - returns 1 when today's spend >= cap, AND emits a `budget_block` event
+#     with reason=daily_cap so fleet-control can see WHY we no-op'd.
+#
+# Tolerates a missing runs.jsonl (treats spend as 0) and a record with a
+# missing `total_cost_usd` field (treats that record as 0). Uses `jq` when
+# available (fast, exact); falls back to a portable awk regex sum so the
+# kit keeps working on minimal hosts. Comparison is float-safe via awk.
+#
+# Caller convention mirrors fleet_self_cancel: `fleet_check_budget || exit 0`.
+fleet_check_budget() {
+  local cap="${MAX_DAILY_USD:-}"
+  [ -z "$cap" ] && return 0    # no cap configured = current behavior
+
+  local runs="$CACHE_DIR/runs.jsonl"
+  local today; today=$(date -u +%Y-%m-%d)
+  local spent="0"
+
+  if [ -f "$runs" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      # jq path: filter by ts_start prefix == today and by slug, coerce
+      # missing total_cost_usd to 0, sum. Best-effort: a malformed line
+      # collapses the whole sum to 0, which is the safe direction (don't
+      # block on a parse glitch).
+      spent="$(jq -rs --arg day "$today" --arg slug "$SLUG" '
+        [ .[]
+          | select((.ts_start // "") | startswith($day))
+          | select((.slug // "") == $slug)
+          | (.total_cost_usd // 0)
+        ] | add // 0
+      ' "$runs" 2>/dev/null || echo 0)"
+    else
+      # awk fallback: regex out ts_start, slug, and total_cost_usd. The kit's
+      # runs.jsonl is single-line JSON (one record per line, no embedded
+      # newlines), so a per-line regex is sufficient. Missing field → 0.
+      spent="$(awk -v day="$today" -v slug="$SLUG" '
+        {
+          ts=""; sl=""; cost=0
+          if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+            ts=substr($0, RSTART, RLENGTH)
+            sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts)
+            sub(/".*/, "", ts)
+          }
+          if (match($0, /"slug"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+            sl=substr($0, RSTART, RLENGTH)
+            sub(/.*"slug"[[:space:]]*:[[:space:]]*"/, "", sl)
+            sub(/".*/, "", sl)
+          }
+          if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+            c=substr($0, RSTART, RLENGTH)
+            sub(/.*:[[:space:]]*/, "", c)
+            cost=c+0
+          }
+          if (index(ts, day)==1 && sl==slug) sum+=cost
+        }
+        END { printf("%.6f", sum+0) }
+      ' "$runs" 2>/dev/null || echo 0)"
+    fi
+  fi
+
+  # Float-safe comparison. Exit 0 if spent < cap, 1 otherwise.
+  if awk -v s="$spent" -v c="$cap" 'BEGIN { exit !(s+0 < c+0) }'; then
+    return 0
+  fi
+
+  fleet_emit_event budget_block "reason=daily_cap" "spent=$spent" "cap=$cap" || true
+  echo "${SLUG} budget_block — spent=\$${spent} >= cap=\$${cap} (UTC ${today})"
+  return 1
+}
+
 # --- logging --------------------------------------------------------------
 # $1 = phase (ship/groom/review/eng). Redirects all output to a timestamped log.
 fleet_log_init() {
