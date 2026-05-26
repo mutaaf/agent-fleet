@@ -102,6 +102,14 @@ postcard.
   - `budget_block {reason, spent, cap}` — emitted by `fleet_check_budget` when
     today's UTC spend for this slug has reached the manifest's `MAX_DAILY_USD`
     cap; all runners soft-abort (exit 0) immediately after.
+  - `prompts_drift {pinned, actual}` — emitted by `fleet_check_prompts_sha`
+    (ticket 0005) when the manifest's optional `PROMPTS_SHA` pin doesn't
+    match the kit's current `prompts/` SHA. Fires AT MOST ONCE per process
+    (guarded by `FLEET_PROMPTS_DRIFT_EMITTED`). The runner logs a warning
+    and continues — drift is a signal, not an abort. Operator response: run
+    `bin/fleet prompts-sha` to see the new value, re-run `install.sh` to
+    bump the pin, or revert the prompt change. Unset `PROMPTS_SHA` = no
+    event (current behavior preserved).
 
 Add new event types in the same file; consumers MUST tolerate unknown types
 gracefully. Do not rename or repurpose an existing type — the contract is the

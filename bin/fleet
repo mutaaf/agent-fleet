@@ -9,6 +9,8 @@
 #   fleet doctor              diagnose every installed project (PASS/WARN/FAIL)
 #   fleet doctor --json       machine-readable summary for fleet-control
 #   fleet doctor --slug NAME  restrict to one project
+#   fleet prompts-sha         print the SHA256 of the kit's prompts/ tree
+#                             (ticket 0005 — for PROMPTS_SHA pinning)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -86,6 +88,9 @@ newest_log_epoch() {  # $1 = log dir → mtime of newest *.log, or empty
 #   installed_lib_sha  ~/.local/share/agent-fleet/lib SHA matches the repo's
 #                      lib/ SHA (WARN when either side is absent)
 #   gh_auth            `gh auth status` exits 0
+#   prompts_pinned     manifest's PROMPTS_SHA matches the kit's current
+#                      prompts/ SHA (ticket 0005). PASS if set + matches,
+#                      WARN if unset, FAIL if mismatched.
 
 DOCTOR_ROOT="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
 
@@ -103,6 +108,48 @@ doctor_lib_sha() {
   [ -d "$dir" ] || return 0
   (cd "$dir" && find . -type f -name '*.sh' | sort | xargs shasum 2>/dev/null) | shasum | awk '{print $1}'
 }
+
+# --- prompts-sha ----------------------------------------------------------
+# Ticket 0005. Prints the SHA256 of the concatenation of every *.md under the
+# kit's prompts/ dir, with filenames sorted for cross-machine determinism.
+# This is the value an operator pins via `PROMPTS_SHA=...` in their manifest
+# so a future prompt edit surfaces as a `prompts_drift` warning in the runner.
+#
+# Defined above the doctor block because doctor's prompts_pinned check calls
+# it directly — bash needs the function defined before it's referenced.
+#
+# Resolution order:
+#   1. $FLEET_KIT_ROOT/prompts (escape hatch for fleet-control / tests)
+#   2. The repo this script lives in: bin/fleet → ../prompts
+#   3. The installed kit at ~/.local/share/agent-fleet/prompts
+# First hit wins. Falls through with exit 1 + a stderr message if none exist
+# so `PROMPTS_SHA=$(fleet prompts-sha)` doesn't silently bake in an empty pin.
+fleet_prompts_sha() {
+  local self prompts_dir=""
+  self="$( cd "$( dirname "$0" )" && pwd )"
+  for cand in \
+    "${FLEET_KIT_ROOT:-}/prompts" \
+    "$self/../prompts" \
+    "$HOME/.local/share/agent-fleet/prompts"; do
+    if [ -n "$cand" ] && [ -d "$cand" ]; then
+      prompts_dir="$cand"
+      break
+    fi
+  done
+  if [ -z "$prompts_dir" ]; then
+    echo "fleet prompts-sha: no prompts/ dir found (looked in FLEET_KIT_ROOT, $self/../prompts, ~/.local/share/agent-fleet/prompts)" >&2
+    return 1
+  fi
+  # The ticket's formula verbatim. `find | sort` makes the order stable;
+  # `xargs cat` concatenates contents; `shasum -a 256` is on every macOS.
+  ( cd "$prompts_dir/.." && find prompts -type f -name '*.md' | sort | xargs cat ) \
+    | shasum -a 256 | awk '{print $1}'
+}
+
+if [ "$CMD" = "prompts-sha" ]; then
+  fleet_prompts_sha
+  exit $?
+fi
 
 # Hand-rolled JSON string escape — same intent as common.sh _json_escape but
 # bin/fleet doesn't source common.sh. Keep this in sync if either grows.
@@ -144,6 +191,7 @@ doctor_run_checks() {
       echo "SELF_CANCEL=${SELF_CANCEL:-}"
       echo "ENG_ENABLED=${ENG_ENABLED:-0}"
       echo "REPO_URL=${REPO_URL:-}"
+      echo "PROMPTS_SHA=${PROMPTS_SHA:-}"
     ) 2>/dev/null
   ) || true
   slug="$(echo "$probe" | sed -n 's/^SLUG=//p')"
@@ -151,6 +199,7 @@ doctor_run_checks() {
   sc="$(echo "$probe" | sed -n 's/^SELF_CANCEL=//p')"
   eng="$(echo "$probe" | sed -n 's/^ENG_ENABLED=//p')"
   repo_url="$(echo "$probe" | sed -n 's/^REPO_URL=//p')"
+  local pinned_sha; pinned_sha="$(echo "$probe" | sed -n 's/^PROMPTS_SHA=//p')"
   if [ -z "$slug" ] || [ -z "$repo_url" ] || [ -z "$sc" ]; then
     cfg_status="FAIL"
     cfg_reason="manifest missing required vars (SLUG/REPO_URL/SELF_CANCEL)"
@@ -240,6 +289,23 @@ doctor_run_checks() {
     gh_status="FAIL"; gh_reason="gh auth status failed — run gh auth login"
   fi
   echo "gh_auth|$gh_status|$gh_reason"
+
+  # check: prompts_pinned (ticket 0005)
+  # Compare the manifest's PROMPTS_SHA against the kit's current prompts/ SHA.
+  # PASS = matches, WARN = unset (operator hasn't pinned yet — non-fatal),
+  # FAIL = mismatch (a reinstall has drifted behavior; operator needs to
+  # acknowledge by bumping the pin, or revert).
+  local pp_status="PASS" pp_reason="" current_sha=""
+  current_sha="$(fleet_prompts_sha 2>/dev/null || echo "")"
+  if [ -z "$current_sha" ]; then
+    pp_status="WARN"; pp_reason="could not compute current prompts SHA"
+  elif [ -z "$pinned_sha" ]; then
+    pp_status="WARN"; pp_reason="PROMPTS_SHA unset — re-run install.sh to stamp"
+  elif [ "$pinned_sha" != "$current_sha" ]; then
+    pp_status="FAIL"
+    pp_reason="pinned=$pinned_sha actual=$current_sha — reinstall kit to bump"
+  fi
+  echo "prompts_pinned|$pp_status|$pp_reason"
 }
 
 # Build the per-project block (human form). Reads check rows on stdin, decides

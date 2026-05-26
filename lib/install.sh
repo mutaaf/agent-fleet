@@ -47,6 +47,36 @@ if ! [ "$PROJECT_DIR/agents.config.sh" -ef "$CFG_DIR/agents.config.sh" ]; then
 fi
 chmod +x "$INSTALL_ROOT/lib/"*.sh
 
+# --- prompt-version pin (ticket 0005) -------------------------------------
+# Stamp the COPIED manifest with the current prompts/ SHA so the runner can
+# tell, at every fire, whether the kit has drifted since this install. The
+# operator's SOURCE manifest is left untouched — they own it. Idempotent:
+# strip any prior pin lines before re-appending so re-running install.sh
+# never accumulates duplicate stamps.
+#
+# We write two lines: a `# PROMPTS_SHA pinned at install time: <sha>` audit
+# comment (per ticket spec — visible at a glance to humans grepping the
+# manifest) AND a real `PROMPTS_SHA="<sha>"` assignment so that sourcing
+# the manifest in lib/common.sh actually sets the variable the drift check
+# reads. The two lines move together; the strip pattern catches both.
+PROMPTS_DIR_FOR_PIN="$INSTALL_ROOT/prompts"
+if [ -d "$PROMPTS_DIR_FOR_PIN" ]; then
+  PIN_SHA=$( (cd "$PROMPTS_DIR_FOR_PIN/.." && find prompts -type f -name '*.md' | sort | xargs cat) \
+              | shasum -a 256 | awk '{print $1}' )
+  if [ -n "$PIN_SHA" ]; then
+    # macOS sed needs the empty `-i ''` arg. Strip any old stamp (both lines),
+    # then append the fresh pair.
+    /usr/bin/sed -i '' \
+      -e '/^# PROMPTS_SHA pinned at install time:/d' \
+      -e '/^PROMPTS_SHA=/d' \
+      "$CFG_DIR/agents.config.sh"
+    {
+      printf '# PROMPTS_SHA pinned at install time: %s\n' "$PIN_SHA"
+      printf 'PROMPTS_SHA="%s"\n' "$PIN_SHA"
+    } >> "$CFG_DIR/agents.config.sh"
+  fi
+fi
+
 # Emit a <key>StartCalendarInterval</key> block from a list of hours at one minute.
 calendar_array() {  # $1 = "0 6 12 18", $2 = minute
   echo "  <key>StartCalendarInterval</key>"; echo "  <array>"

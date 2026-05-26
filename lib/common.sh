@@ -50,6 +50,62 @@ fleet_load_manifest() {
   mkdir -p "$LOG_DIR"
 }
 
+# --- prompt-version pinning ----------------------------------------------
+# Ticket 0005. The optional `PROMPTS_SHA` manifest var pins the SHA256 of the
+# kit's prompts/ tree that the operator last reinstalled against. If a future
+# kit update changes any prompts/ file, the live runner notices the drift and
+# warns — without aborting — so the operator sees the change before behavior
+# silently shifts.
+#
+# Formula (must match `bin/fleet prompts-sha`):
+#   find prompts -type f -name '*.md' | sort | xargs cat | shasum -a 256
+#
+# Resolution of the kit's prompts dir:
+#   1. $FLEET_PROMPTS (set by this file at source time → the canonical path).
+#   2. $FLEET_KIT_ROOT/prompts (escape hatch for tests / fleet-control).
+#
+# Behavior:
+#   - PROMPTS_SHA unset  → no-op (return 0), no warn, no event.
+#   - matches            → return 0, no event.
+#   - mismatch           → log a warning, emit ONE `prompts_drift` event per
+#                          run (guarded by FLEET_PROMPTS_DRIFT_EMITTED), and
+#                          STILL return 0. This is a signal, not an abort —
+#                          a fatal abort would block every project after a
+#                          benign prompt edit.
+#
+# Public name: `fleet_check_prompts_sha` (peer of `fleet_check_budget`).
+_fleet_compute_prompts_sha() {
+  local dir="${FLEET_PROMPTS:-${FLEET_KIT_ROOT:-}/prompts}"
+  [ -d "$dir" ] || return 1
+  ( cd "$dir/.." && find prompts -type f -name '*.md' | sort | xargs cat ) \
+    | shasum -a 256 | awk '{print $1}'
+}
+
+fleet_check_prompts_sha() {
+  local pin="${PROMPTS_SHA:-}"
+  [ -z "$pin" ] && return 0   # unset = current; no warn (per acceptance #2)
+
+  local cur
+  cur="$(_fleet_compute_prompts_sha 2>/dev/null || echo "")"
+  if [ -z "$cur" ]; then
+    # Can't compute → can't decide. Don't warn (would be noise across hosts
+    # that vendor prompts elsewhere); return 0 quietly.
+    return 0
+  fi
+
+  [ "$pin" = "$cur" ] && return 0   # matches → silent PASS
+
+  # Mismatch. Emit one event per run; the FLEET_PROMPTS_DRIFT_EMITTED guard
+  # makes a second call in the same process a silent no-op.
+  if [ -z "${FLEET_PROMPTS_DRIFT_EMITTED:-}" ]; then
+    echo "${SLUG:-?} prompts_drift — pinned=$pin actual=$cur (reinstall to bump or revert)"
+    fleet_emit_event prompts_drift "pinned=$pin" "actual=$cur" || true
+    FLEET_PROMPTS_DRIFT_EMITTED=1
+    export FLEET_PROMPTS_DRIFT_EMITTED
+  fi
+  return 0
+}
+
 # --- self-cancel ----------------------------------------------------------
 # Bound autonomous spend. Return 1 (caller does `|| exit 0`) once expired.
 fleet_self_cancel() {
