@@ -24,6 +24,12 @@ GIT_AUTHOR_EMAIL="noreply@anthropic.com"
 # `fleet status` warns when this is within 3 days.
 SELF_CANCEL="20260628"
 
+# Optional per-slug daily cap in USD. When set, every runner sums today's UTC
+# `total_cost_usd` from runs.jsonl before spawning claude; once spend >= cap
+# all runners soft-abort (exit 0) and emit a `budget_block` telemetry event.
+# Unset (the default) = no cap, current behavior. Ticket 0004.
+# MAX_DAILY_USD=5
+
 # --- cadence --------------------------------------------------------------
 SHIP_MINUTE=41              # ship fires every hour at this minute
 GROOM_HOURS="0 6 12 18"     # groom fires at GROOM_MINUTE on these hours (local)

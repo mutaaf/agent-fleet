@@ -99,7 +99,9 @@ postcard.
   - `pr_opened {number, branch}` — fired by the dev agent after `gh pr create`
   - `self_cancel_trip {}` — fired when `SELF_CANCEL` has expired
   - `lock_blocked {phase, holder_pid}` — fired when `fleet_acquire_lock` loses
-  - `budget_block {reason}` — placeholder until the per-slug budget ticket lands
+  - `budget_block {reason, spent, cap}` — emitted by `fleet_check_budget` when
+    today's UTC spend for this slug has reached the manifest's `MAX_DAILY_USD`
+    cap; all runners soft-abort (exit 0) immediately after.
 
 Add new event types in the same file; consumers MUST tolerate unknown types
 gracefully. Do not rename or repurpose an existing type — the contract is the

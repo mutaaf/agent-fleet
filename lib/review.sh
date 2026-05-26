@@ -15,6 +15,10 @@ source "$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )/common.sh"
 
 fleet_load_manifest "${1:-}"
 fleet_self_cancel >/dev/null || exit 0   # quiet on expiry — this is a frequent poller
+# Budget gate before any work. Tag the event with phase=review even though
+# fleet_log_init hasn't run yet, so consumers can attribute the block.
+FLEET_PHASE="review"; export FLEET_PHASE
+fleet_check_budget >/dev/null || exit 0
 
 ME=$(gh api user --jq .login 2>/dev/null || echo "")
 if [ -z "$ME" ]; then

@@ -13,6 +13,7 @@ fleet_load_manifest "${1:-}"
 fleet_log_init ship
 fleet_emit_event run_started "pid=$$" || true
 fleet_self_cancel || exit 0
+fleet_check_budget || exit 0
 fleet_acquire_lock ship || exit 0
 trap 'fleet_release_lock ship' EXIT
 fleet_checkout checkout
