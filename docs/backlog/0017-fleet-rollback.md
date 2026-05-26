@@ -1,7 +1,7 @@
 ---
 id: 0017
 title: fleet rollback reverts the last agent-shipped commit
-status: in-progress
+status: shipped
 priority: P1
 area: safety
 created: 2026-05-26
@@ -150,3 +150,6 @@ Each box maps 1:1 to a test scenario in `tests/rollback.sh`.
   function (named `rollback`, not a coreutils collision per LESSONS
   2026-05-26); AGENTS.md gains `revert/` branch prefix +
   `rollback_opened` event-type; README "Daily ops" gets the callout.
+- 2026-05-26 — shipped via PR #17 (squash-merged). All 10 acceptance
+  criteria green; tests/rollback.sh + every other tests/*.sh pass; CI
+  shellcheck + validate gating checks green.
