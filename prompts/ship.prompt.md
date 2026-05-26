@@ -61,6 +61,15 @@ freeze the loop.
         Print "PR #N healthy, auto-merge armed — waiting" and exit.
 
 PHASE 2 — Ship the next ticket (only when no agent PR is left to tend).
+  AUTO-PAUSE CHECK: if the env var `FLEET_SHIP_PAUSED=1` is set, the shell
+  gate (`fleet_check_sendback_streak` in lib/common.sh, ticket 0006) has
+  detected 3+ unresolved send-backs in the last 24h and opened a meta-issue.
+  PHASE 2 is forbidden this run — do NOT pick up a new ticket. Print
+  "ship paused — meta-issue posted" and exit. PHASE 1 was free to run; if it
+  did nothing, that's WAIT. The persistent pause is held by
+  `launchctl disable gui/$UID/$NAMESPACE.agent-ship`; the operator resumes
+  with the matching `launchctl enable`.
+
   The README index gives priority ORDER but can lag the ticket files (ship
   updates files while groom rewrites the index). The ticket FILE frontmatter is
   the source of truth for status.

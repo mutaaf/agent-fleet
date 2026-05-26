@@ -25,7 +25,7 @@ ones, `review` grades them.
 | 0004 | Per-slug daily $ budget caps | P1 | shipped | governance |
 | 0005 | Prompt-version pinning in agents.config.sh | P1 | shipped | governance |
 | 0014 | Trainee mode requires operator approval for the first N PRs | P1 | groomed | safety |
-| 0006 | Auto-pause ship after N consecutive send-backs | P1 | groomed | safety |
+| 0006 | Auto-pause ship after N consecutive send-backs | P1 | in-progress | safety |
 | 0011 | fleet onboard bootstraps a new project in one command | P1 | groomed | engine |
 | 0008 | Secret-scan pre-push hook in agent checkouts | P1 | groomed | safety |
 | 0012 | fleet digest one-line daily summary per project | P2 | groomed | observability |

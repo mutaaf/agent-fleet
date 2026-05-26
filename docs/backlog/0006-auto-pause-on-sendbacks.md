@@ -1,7 +1,7 @@
 ---
 id: 0006
 title: Auto-pause ship after N consecutive send-backs
-status: groomed
+status: in-progress
 priority: P1
 area: safety
 created: 2026-05-26
@@ -76,4 +76,25 @@ Each box maps 1:1 to a test scenario in `tests/sendback-pause.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — picked up by implementation-dev. Branch
+  `feat/0006-auto-pause-on-sendbacks`. Plan: add a
+  `fleet_check_sendback_streak` gate to `lib/common.sh` (peer of
+  `fleet_check_budget`) that queries the last 5 closed agent-branch PRs via
+  `gh pr list --state closed --search "review:changes-requested"
+  --json number,closedAt,headRefName,reviews`, counts those that had
+  `REQUEST_CHANGES` in the last 24h with no subsequent resolving review, and
+  if `>= 3` (a) emits `ship_paused reason=sendback_streak count=<n>` via
+  `fleet_emit_event`, (b) creates or updates a `[FLEET] ship paused after N
+  send-backs` GitHub Issue with the PR numbers in the body, (c) runs
+  `launchctl disable gui/$UID/$NAMESPACE.agent-ship` so the pause persists.
+  `lib/ship.sh` calls this gate ONLY in PHASE 2 — PHASE 1 (heal) is
+  implemented inside the ship.prompt.md by the claude agent itself, so the
+  shell-level gate sits between `fleet_checkout` and `fleet_run_claude`,
+  guarded by an env var the prompt can clear when it's healing. Simplest
+  contract: the gate runs unconditionally before `fleet_run_claude ship`,
+  and the ship prompt is told (via an exported `FLEET_SHIP_PAUSED=1` env
+  var on trip) that PHASE 2 is forbidden this run. PHASE 1 reads the same
+  channel and proceeds. Test: `tests/sendback-pause.sh` stubs `gh`,
+  `launchctl`, and `date` to assert both the trip path (3+ recent
+  send-backs → exit 0, event emitted, issue posted, launchctl disable run)
+  and the no-trip path (2 recent + 1 old → no pause).
