@@ -1,7 +1,7 @@
 ---
 id: 0013
 title: prompts/CHANGELOG.md + fleet prompts-diff explain drift
-status: groomed
+status: in-progress
 priority: P2
 area: governance
 created: 2026-05-26
@@ -110,4 +110,11 @@ Each box maps 1:1 to a test scenario in `tests/prompts-changelog.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26: implementation-dev started on feat/0013-prompts-changelog.
+  Plan: write tests/prompts-changelog.sh covering clean+drift+--changelog,
+  add `prompts/CHANGELOG.md` with the bootstrap entry at SHA
+  `2633dbfc560139067e606dbbd0d86f6e4561c7c5a8f27d914494bc483109250a`,
+  implement `bin/fleet prompts-diff` (dispatch as `prompts_diff_cmd` to
+  avoid the diff-shadowing trap), add
+  `scripts/check-prompts-changelog.mjs` + wire into `validate` job, add
+  AGENTS.md `## Prompts changelog` section.
