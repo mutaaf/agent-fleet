@@ -12,6 +12,8 @@ source "$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )/common.sh"
 fleet_load_manifest "${1:-}"
 fleet_log_init ship
 fleet_self_cancel || exit 0
+fleet_acquire_lock ship || exit 0
+trap 'fleet_release_lock ship' EXIT
 fleet_checkout checkout
 
 fleet_run_claude ship < "$FLEET_PROMPTS/ship.prompt.md"

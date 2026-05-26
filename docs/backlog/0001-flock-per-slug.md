@@ -1,7 +1,7 @@
 ---
 id: 0001
 title: Per-slug flock prevents overlapping launchd runs
-status: groomed
+status: shipped
 priority: P0
 area: safety
 created: 2026-05-26
@@ -81,4 +81,21 @@ for before committing.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — picked up by implementation-dev. Branch
+  `feat/0001-flock-per-slug`. Plan: add `fleet_acquire_lock` /
+  `fleet_release_lock` to `lib/common.sh` using `mkdir`-as-mutex at
+  `$CACHE_DIR/lock`; wire into ship/groom/review/eng around
+  `fleet_run_claude` with `trap` for release; treat lock dirs older than
+  6 hours as stale. Write `tests/lock.sh` first to exercise contention
+  with two background stub runners and a shared output file.
+- 2026-05-26 — shipped. `fleet_acquire_lock` + `fleet_release_lock`
+  added (mkdir-mutex at `$CACHE_DIR/lock/<phase>`, 6h stale window via
+  `FLEET_LOCK_STALE_SECONDS`, pid-guarded release). Wired into
+  `ship.sh` / `groom.sh` / `review.sh` / `eng.sh` with
+  `fleet_acquire_lock <phase> || exit 0` and `trap fleet_release_lock EXIT`.
+  `tests/lock.sh` covers the contention case, lock-dir location, stale
+  reclaim, and clean release. Local gate green. Public API additive — no
+  `BREAKING:` line. `lib/install.sh` untouched. Worth a LESSONS entry:
+  macOS BSD `touch -t` interprets its timestamp as LOCAL time, so any
+  test that backdates with `date -u -v-7H` will measure only `7h - tz`
+  hours of age — drop `-u` from the BSD branch.
