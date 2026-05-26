@@ -104,8 +104,10 @@ fi
 # --- assertion 3: stale lock (>6h old) is reclaimed ---------------------
 mkdir -p "$EXPECTED_LOCK_PARENT/ship"
 echo "99999" > "$EXPECTED_LOCK_PARENT/ship/pid"
-# Backdate the lock dir 7 hours.
-touch -t "$(date -u -v-7H +%Y%m%d%H%M.%S 2>/dev/null || date -u -d '7 hours ago' +%Y%m%d%H%M.%S)" \
+# Backdate the lock dir 7 hours. `touch -t` reads its arg as LOCAL time on macOS
+# (BSD touch) and as UTC on GNU coreutils — so drop -u from the local BSD date
+# and add -u to the GNU date to keep both branches consistent.
+touch -t "$(date -v-7H +%Y%m%d%H%M.%S 2>/dev/null || date -u -d '7 hours ago' +%Y%m%d%H%M.%S)" \
   "$EXPECTED_LOCK_PARENT/ship"
 
 STALE_LOG="$TMP/stale-runner.log"

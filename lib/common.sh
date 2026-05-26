@@ -123,3 +123,70 @@ fleet_run_claude() {
   rm -f "$tmp"
   return $exit
 }
+
+# --- per-slug lock --------------------------------------------------------
+# Prevents two launchd invocations of the same slug+phase from racing each
+# other on the same checkout. macOS ships without flock(1), so we use
+# `mkdir`-as-mutex: mkdir is atomic on HFS+/APFS, so the first invocation wins
+# and the second's `mkdir` fails with EEXIST. Lock dir lives at
+# $CACHE_DIR/lock/<phase> (per-slug because $CACHE_DIR is per-slug; cross-slug
+# locking is intentionally out of scope — see ticket 0001 § Out of scope).
+#
+# A lock older than 6 hours is treated as stale (the holder crashed without
+# releasing) and reclaimed. Six hours is well past any sane ship/groom cycle
+# but short enough that a wedged runner self-heals before the next business day.
+FLEET_LOCK_STALE_SECONDS="${FLEET_LOCK_STALE_SECONDS:-21600}"  # 6h
+
+# fleet_acquire_lock <phase>  — returns 0 on success, 1 if another runner holds
+# the lock (caller does `|| exit 0`). On success, exports FLEET_LOCK_DIR so
+# fleet_release_lock knows what to remove.
+fleet_acquire_lock() {
+  local phase="${1:?fleet_acquire_lock: phase required}"
+  local lock_parent="$CACHE_DIR/lock"
+  local lock_dir="$lock_parent/$phase"
+  mkdir -p "$lock_parent"
+
+  if mkdir "$lock_dir" 2>/dev/null; then
+    echo "$$" > "$lock_dir/pid"
+    export FLEET_LOCK_DIR="$lock_dir"
+    return 0
+  fi
+
+  # Lock dir exists. Is it stale?
+  local now mtime age
+  now=$(date -u +%s)
+  # macOS stat -f %m; GNU stat -c %Y. Try BSD first (this kit runs on macOS).
+  mtime=$(stat -f %m "$lock_dir" 2>/dev/null || stat -c %Y "$lock_dir" 2>/dev/null || echo "$now")
+  age=$(( now - mtime ))
+  if [ "$age" -gt "$FLEET_LOCK_STALE_SECONDS" ]; then
+    echo "stale lock: claiming (age=${age}s > ${FLEET_LOCK_STALE_SECONDS}s, $lock_dir)"
+    rm -rf "$lock_dir"
+    if mkdir "$lock_dir" 2>/dev/null; then
+      echo "$$" > "$lock_dir/pid"
+      export FLEET_LOCK_DIR="$lock_dir"
+      return 0
+    fi
+  fi
+
+  local holder="unknown"
+  [ -f "$lock_dir/pid" ] && holder="$(cat "$lock_dir/pid" 2>/dev/null || echo unknown)"
+  # Ticket 0001: until events.jsonl (0002) ships, this skip is a plain log line.
+  echo "${SLUG}-${phase} skipped — locked by ${holder}"
+  return 1
+}
+
+# fleet_release_lock [phase]  — idempotent. Uses FLEET_LOCK_DIR if set
+# (the common case via trap); otherwise derives the path from $1.
+fleet_release_lock() {
+  local target="${FLEET_LOCK_DIR:-}"
+  if [ -z "$target" ] && [ -n "${1:-}" ]; then
+    target="$CACHE_DIR/lock/$1"
+  fi
+  [ -n "$target" ] || return 0
+  # Only remove if we own it. Cheap guard against blowing away another
+  # runner's lock when the trap fires after our acquire failed.
+  if [ -f "$target/pid" ] && [ "$(cat "$target/pid" 2>/dev/null || echo)" = "$$" ]; then
+    rm -rf "$target"
+  fi
+  unset FLEET_LOCK_DIR
+}

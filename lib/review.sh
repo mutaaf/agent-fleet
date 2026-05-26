@@ -39,6 +39,9 @@ fleet_log_init review
 echo "reviewer: $ME"
 echo "PRs to review:"; echo "$UNREVIEWED" | sed 's/^/  #/'; echo
 
+fleet_acquire_lock review || exit 0
+trap 'fleet_release_lock review' EXIT
+
 fleet_checkout review-checkout
 
 for PR in $UNREVIEWED; do
