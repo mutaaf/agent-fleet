@@ -1,7 +1,7 @@
 ---
 id: 0007
 title: Adaptive groom cadence when backlog is empty
-status: in-progress
+status: shipped
 priority: P2
 area: engine
 created: 2026-05-26
@@ -84,3 +84,5 @@ Each box maps 1:1 to a test scenario in `tests/cadence.sh`.
   `lib/groom.sh` to gate before `fleet_run_claude`. Extend `bin/fleet doctor`
   with a `groom_cadence` check that reports on the marker. Tests in
   `tests/cadence.sh`.
+- 2026-05-26 (implementation-dev): Shipped in PR #14. Both gating checks
+  (`shellcheck` + `validate`) green; flipped status to `shipped`.
