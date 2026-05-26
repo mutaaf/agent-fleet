@@ -142,3 +142,19 @@ echo "Manifest:  $CFG_DIR/agents.config.sh"
 echo "Logs:      $LOG_DIR/"
 echo "Run now:   launchctl kickstart -k $DOMAIN/$NAMESPACE.agent-ship"
 echo "Uninstall: bash $KIT_ROOT/lib/uninstall.sh $PROJECT_DIR"
+
+# --- cross-project LESSONS aggregation (ticket 0009) ---------------------
+# Re-merge every installed project's docs/LESSONS.md into
+# ~/.local/share/agent-fleet/CROSS_LESSONS.md so prompts running inside any
+# project's fresh checkout can see what the rest of the fleet has learned.
+# Idempotent: fleet lessons-sync only rewrites the file when content
+# changes, so re-running install.sh stays a no-op for the merged file's
+# mtime when no new lessons exist. Best-effort: a failure here MUST NOT
+# undo the launchctl bootstrap above (the install is still successful).
+#
+# Test seam: FLEET_LESSONS_SYNC_CMD lets tests/lessons-sync.sh point at a
+# stub binary without shadowing `fleet` on PATH.
+LESSONS_SYNC_CMD="${FLEET_LESSONS_SYNC_CMD:-$KIT_ROOT/bin/fleet}"
+if [ -x "$LESSONS_SYNC_CMD" ]; then
+  "$LESSONS_SYNC_CMD" lessons-sync >/dev/null 2>&1 || true
+fi
