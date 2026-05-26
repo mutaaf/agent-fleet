@@ -642,6 +642,29 @@ doctor_run_checks() {
       ;;
   esac
   echo "trainee_mode|$tm_status|$tm_reason"
+
+  # check: groom_cadence (ticket 0007)
+  # Surfaces whether `lib/groom.sh` has throttled itself because the
+  # backlog ran dry. The signal is the per-slug marker file
+  # `$CACHE_DIR/groom-slowed-since` written by fleet_check_groom_cadence.
+  # PASS = no marker, OR marker is stale (>=12h old → next groom will
+  # clear it and proceed). WARN = marker is fresh; the reason string
+  # carries the marker timestamp so operators see the throttle's age.
+  # We never FAIL here — throttling is by design, not an error.
+  local gc_status="PASS" gc_reason=""
+  local gc_marker="$HOME/.cache/${slug}-agent/groom-slowed-since"
+  if [ -f "$gc_marker" ]; then
+    local gc_now gc_mtime gc_age
+    gc_now=$(date -u +%s)
+    gc_mtime=$(stat -f %m "$gc_marker" 2>/dev/null || stat -c %Y "$gc_marker" 2>/dev/null || echo "$gc_now")
+    gc_age=$(( gc_now - gc_mtime ))
+    if [ "$gc_age" -lt 43200 ]; then
+      local gc_ts; gc_ts="$(cat "$gc_marker" 2>/dev/null || echo "?")"
+      gc_status="WARN"
+      gc_reason="groom throttled since $gc_ts (empty_backlog; ${gc_age}s of 12h floor)"
+    fi
+  fi
+  echo "groom_cadence|$gc_status|$gc_reason"
 }
 
 # Build the per-project block (human form). Reads check rows on stdin, decides
