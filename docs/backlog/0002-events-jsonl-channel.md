@@ -1,7 +1,7 @@
 ---
 id: 0002
 title: Structured events.jsonl telemetry channel
-status: groomed
+status: shipped
 priority: P0
 area: telemetry
 created: 2026-05-26
@@ -85,4 +85,21 @@ JSONL schema is small enough to fit on a postcard.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — picked up by `implementation-dev`. Branch
+  `feat/0002-events-jsonl-channel`. Plan: failing test first
+  (`tests/events.sh` calling `fleet_emit_event` with a value containing a
+  quote and a backslash, validated via `node -e "JSON.parse(...)"`), then
+  add `_json_escape` + `fleet_emit_event` to `lib/common.sh`, then wire
+  `run_started`/`run_completed` into `ship.sh`/`groom.sh`/`review.sh`/`eng.sh`,
+  then add the `pr_opened` instruction to `prompts/ship.prompt.md`, then
+  document the schema in `AGENTS.md` under a new `## Telemetry` section.
+- 2026-05-26 — shipped. `_json_escape` is a 17-line pure-bash escaper
+  (handles `"`, `\\`, `\b\f\n\r\t`, and `\u00xx` for the rest of the C0
+  control range). `fleet_emit_event` composes one line by hand and appends
+  to `$CACHE_DIR/events.jsonl`. Runners now set `FLEET_PHASE` in
+  `fleet_log_init` so emitted events carry the right phase; `ship.sh`,
+  `groom.sh`, `eng.sh`, and `review.sh` emit `run_started {pid}` after
+  `fleet_log_init` and `run_completed {exit, duration_ms}` before the
+  final `exit`. `tests/events.sh` covers the JSON.parse round-trip on a
+  value containing a quote AND a backslash, the four-key schema, extras
+  landing as JSON keys, and append-only semantics across two invocations.

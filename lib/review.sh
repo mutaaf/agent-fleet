@@ -36,6 +36,7 @@ UNREVIEWED=$(gh pr list --repo "$REPO" --state open --base main \
 [ -z "$UNREVIEWED" ] && exit 0   # quiet exit — most ticks have no work
 
 fleet_log_init review
+fleet_emit_event run_started "pid=$$" || true
 echo "reviewer: $ME"
 echo "PRs to review:"; echo "$UNREVIEWED" | sed 's/^/  #/'; echo
 
@@ -104,3 +105,4 @@ done
 
 git checkout main --quiet 2>/dev/null || true
 echo; echo "=== ${SLUG}-review complete $(date -u) ==="
+fleet_emit_event run_completed "exit=0" "duration_ms=$(( ( $(date -u +%s) - RUN_STARTED_EPOCH ) * 1000 ))" || true

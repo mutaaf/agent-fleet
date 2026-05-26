@@ -20,7 +20,7 @@ ones, `review` grades them.
 | id | title | priority | status | area |
 |----|-------|----------|--------|------|
 | 0001 | Per-slug flock prevents overlapping launchd runs | P0 | shipped | safety |
-| 0002 | Structured events.jsonl telemetry channel | P0 | groomed | telemetry |
+| 0002 | Structured events.jsonl telemetry channel | P0 | shipped | telemetry |
 | 0003 | fleet doctor subcommand for fleet health | P1 | groomed | observability |
 | 0004 | Per-slug daily $ budget caps | P1 | groomed | governance |
 | 0005 | Prompt-version pinning in agents.config.sh | P1 | groomed | governance |
