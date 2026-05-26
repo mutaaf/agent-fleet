@@ -1,7 +1,7 @@
 ---
 id: 0013
 title: prompts/CHANGELOG.md + fleet prompts-diff explain drift
-status: in-progress
+status: shipped
 priority: P2
 area: governance
 created: 2026-05-26
@@ -118,3 +118,6 @@ Each box maps 1:1 to a test scenario in `tests/prompts-changelog.sh`.
   avoid the diff-shadowing trap), add
   `scripts/check-prompts-changelog.mjs` + wire into `validate` job, add
   AGENTS.md `## Prompts changelog` section.
+- 2026-05-26: PR #25 merged green. Post-add prompts SHA is
+  `27be8027153851f1fadfa13f9dba3e70457da7e8930f00112e2a3871cd7dd3a0`;
+  bootstrap entry's text already calls out the pre/post asymmetry.
