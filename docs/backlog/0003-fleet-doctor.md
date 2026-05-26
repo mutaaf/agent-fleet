@@ -1,7 +1,7 @@
 ---
 id: 0003
 title: fleet doctor subcommand for fleet health
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-05-26
@@ -78,4 +78,8 @@ demo-worthy. Compare to setting up CI from scratch with no doctor.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev — opened `feat/0003-fleet-doctor`. Plan: add a
+  `doctor()` function plus the top-level `doctor` case branch to `bin/fleet`,
+  introduce `FLEET_DISCOVERY_ROOT` as the test-friendly override for the
+  scanned roots, ship `--json` + `--slug NAME` flags, and back it with a
+  fixture-based `tests/doctor.sh`.
