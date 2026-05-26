@@ -56,6 +56,21 @@ binary the same script also shells out to (`head`, `cat`, `sort`,
 `uniq`, etc.). When in doubt, prefix the dispatcher with `_cmd` or run
 the binary via `command tail …` to bypass the function.
 
+## 2026-05-26 — `lib/common.sh` resets PATH; stubs must live in `$HOME/.local/bin`
+
+`lib/common.sh` exports a hardcoded PATH (`$HOME/.local/bin:/opt/homebrew/bin:...`)
+on source so launchd-spawned runners (which get a minimal env) can still find
+`claude`, `gh`, `git`, etc. Side-effect for tests: a stub binary placed in a
+`$TMP/bin` dir prepended to PATH from the test harness gets WIPED OUT the
+moment `fleet_run_claude` runs `source lib/common.sh`. Symptom in
+`tests/dry-run.sh` (ticket 0010): the `claude` stub recorded ZERO calls and
+the assertion "argv contained `--allowedTools none`" failed even though the
+implementation was correct — `claude` resolved to exit 127. Fix: drop stubs
+under `$HOME/.local/bin` (the first entry in the reset PATH) and `export
+HOME="$TMP/home"` so the rest of the test still isolates from the host.
+`bin/fleet` stubs can sit anywhere because that script does NOT source
+common.sh — but using one stub dir for both keeps the test fixture simple.
+
 ## 2026-05-26 — GitHub Actions can silently stop firing for a PR
 
 While shipping ticket 0006, four consecutive pushes to
