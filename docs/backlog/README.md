@@ -24,7 +24,7 @@ ones, `review` grades them.
 | 0003 | fleet doctor subcommand for fleet health | P1 | shipped | observability |
 | 0004 | Per-slug daily $ budget caps | P1 | shipped | governance |
 | 0005 | Prompt-version pinning in agents.config.sh | P1 | shipped | governance |
-| 0006 | Auto-pause ship after N consecutive send-backs | P1 | groomed | safety |
+| 0006 | Auto-pause ship after N consecutive send-backs | P1 | in-progress | safety |
 | 0007 | Adaptive groom cadence when backlog is empty | P2 | groomed | engine |
 | 0008 | Secret-scan pre-push hook in agent checkouts | P1 | groomed | safety |
 | 0009 | Cross-project LESSONS aggregation | P2 | groomed | engine |
