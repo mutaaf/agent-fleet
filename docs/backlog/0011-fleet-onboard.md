@@ -1,7 +1,7 @@
 ---
 id: 0011
 title: fleet onboard bootstraps a new project in one command
-status: in-progress
+status: shipped
 priority: P1
 area: engine
 created: 2026-05-26
@@ -119,3 +119,16 @@ Each box maps 1:1 to a test scenario in `tests/onboard.sh`.
   `tests/onboard.sh`. Default behavior calls `bash $KIT_ROOT/lib/install.sh`
   at the end; `--skip-install`, `--dry-run`, and `--force` modify it. Tests
   stub `install.sh` and `launchctl` on PATH.
+- 2026-05-26 — `tests/onboard.sh` written first; covers happy path + the
+  derived manifest values (SLUG/NAMESPACE/REPO_URL/SELF_CANCEL), the
+  `## Agent parameters` + `## Hard NOs` sections in the generated
+  AGENTS.md, `--dry-run` (no writes), already-onboarded contract message,
+  `--force` overwrite with `[OK] reset` lines, `--skip-install`, and the
+  exact final-line `next:` contract string. Implementation lives in
+  `bin/fleet onboard()` plus `onboard_*` helpers. Install resolution is
+  pluggable via `$FLEET_INSTALL_CMD` so the test rig can stub install.sh
+  without shadowing the real `bash` interpreter on PATH.
+- 2026-05-26 — local gate green: `shellcheck -S warning`, `bash -n`,
+  `node scripts/check-backlog.mjs`, all 8 `tests/*.sh`. Flipping ticket +
+  README index to `shipped` in this same PR so the validate gate stays
+  in sync at merge time.

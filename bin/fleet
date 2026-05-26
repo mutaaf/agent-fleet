@@ -151,6 +151,296 @@ if [ "$CMD" = "prompts-sha" ]; then
   exit $?
 fi
 
+# --- onboard --------------------------------------------------------------
+# Ticket 0011. `fleet onboard <project-path>` scaffolds a fresh project with
+# the full kit contract — manifest, AGENTS.md, docs/LESSONS.md stub, the
+# backlog README+template, scripts/check-backlog.mjs, and the three Claude
+# subagent files under .claude/agents/. Then by default calls
+# `bash $KIT_ROOT/lib/install.sh <project-path>` so the operator gets a fully
+# installed loop in one shot. Flags:
+#   --dry-run        list files that would be written; create nothing; exit 0
+#   --force          overwrite existing contract files; emit `[OK] reset <file>`
+#   --skip-install   scaffold only; do not call install.sh
+# If `$FLEET_INSTALL_CMD` is set, that command is invoked instead of
+# `bash $KIT_ROOT/lib/install.sh` — the test rig uses this to stub install.
+#
+# Resolution: templates live next to this script (bin/fleet → ../templates).
+# A project is considered "already onboarded" if its agents.config.sh exists.
+
+onboard_kit_root() {
+  local self; self="$( cd "$( dirname "$0" )" && pwd )"
+  ( cd "$self/.." && pwd )
+}
+
+# All files the scaffolder writes, paired with how each is sourced. Each row
+# is `dest|kind|source` where:
+#   kind=template  — copy templates/<source> verbatim
+#   kind=manifest  — render the manifest from inline derivations (slug, etc.)
+#   kind=agents-md — render AGENTS.md by prepending a slug header to
+#                    templates/AGENTS.section.md
+#   kind=lessons   — write the empty docs/LESSONS.md stub inline
+onboard_file_list() {
+  cat <<'LIST'
+agents.config.sh|manifest|
+AGENTS.md|agents-md|AGENTS.section.md
+docs/LESSONS.md|lessons|
+docs/backlog/README.md|inline-backlog-readme|
+docs/backlog/_template.md|template|backlog/_template.md
+scripts/check-backlog.mjs|template|scripts/check-backlog.mjs
+.claude/agents/implementation-dev.md|template|claude-agents/implementation-dev.md
+.claude/agents/gtm-innovation.md|template|claude-agents/gtm-innovation.md
+.claude/agents/review.md|template|claude-agents/review.md
+LIST
+}
+
+# Render the manifest for a given project dir + slug. Mirrors
+# manifest.example.sh's structure but substitutes the derived values.
+onboard_render_manifest() {
+  local slug="$1" proj_dir="$2"
+  local repo_url self_cancel namespace
+  repo_url=$( (cd "$proj_dir" && git remote get-url origin 2>/dev/null) || echo "" )
+  # Today + 21 days UTC, YYYYMMDD. macOS BSD date uses -v; GNU date uses -d.
+  self_cancel=$(date -u -v+21d +%Y%m%d 2>/dev/null \
+                 || date -u -d "+21 days" +%Y%m%d)
+  namespace="com.$slug"
+  cat <<MANIFEST
+# agents.config.sh — per-project fleet manifest (PLUMBING ONLY).
+#
+# This file holds the values the SHELL needs (identity, schedule, spend
+# bound). Everything the AGENT needs at runtime (gating checks, branch
+# prefixes, the local gate command, voice, hard NOs) lives in this project's
+# AGENTS.md "## Agent parameters" section — NOT here.
+#
+# After editing, re-deploy: bash <kit>/lib/install.sh /abs/path/to/project
+
+# --- identity -------------------------------------------------------------
+PROJECT_NAME="$slug"
+SLUG="$slug"
+NAMESPACE="$namespace"
+REPO_URL="$repo_url"
+MODEL="claude-opus-4-7"
+
+# Commits the agents author under this identity.
+GIT_AUTHOR_NAME="$slug Agent"
+GIT_AUTHOR_EMAIL="noreply@anthropic.com"
+
+# --- spend bound ----------------------------------------------------------
+# YYYYMMDD UTC. After this date all agents no-op until you bump it + reinstall.
+SELF_CANCEL="$self_cancel"
+
+# Optional per-slug daily cap in USD. Unset = no cap.
+# MAX_DAILY_USD=5
+
+# Optional trainee-mode gate: first N feature PRs require manual merge.
+# TRAINEE_PR_COUNT=5
+
+# --- cadence --------------------------------------------------------------
+SHIP_MINUTE=41
+GROOM_HOURS="0 6 12 18"
+GROOM_MINUTE=17
+REVIEW_INTERVAL=300
+
+# --- engineering queue (optional second worker) ---------------------------
+ENG_ENABLED=0
+ENG_HOURS="3 9 15 21"
+ENG_MINUTE=23
+MANIFEST
+}
+
+# Render AGENTS.md by stitching a slug header onto templates/AGENTS.section.md
+# (which carries the canonical "## Agent parameters" + "## Hard NOs" content).
+onboard_render_agents_md() {
+  local slug="$1" kit_root="$2"
+  cat <<HEADER
+# AGENTS.md — $slug
+
+This file is the **contract** between the autonomous loop and this repo.
+The shared engine in \`lib/\` reads \`agents.config.sh\`; the \`claude\`
+agent that runs each ship/groom/review cycle reads **this file**, in a
+fresh checkout, every single time.
+
+> Replace every bracketed value below before the first run. The dev agent
+> takes "## Agent parameters" as ground truth — wrong values silently break
+> gating and branch handling.
+
+HEADER
+  # AGENTS.section.md already contains the "## Agent parameters" and
+  # "## Hard NOs" sections. Drop its leading HTML comment block (the
+  # "paste these two sections" instruction is for humans, not the project).
+  awk 'started || /^## /{started=1} started' "$kit_root/templates/AGENTS.section.md"
+}
+
+# Render the docs/backlog/README.md scaffold. Inline so we don't have to ship
+# another template file just for one paragraph + an empty table.
+onboard_render_backlog_readme() {
+  local slug="$1"
+  cat <<README
+# Backlog — $slug
+
+Tickets here ship via the kit: \`implementation-dev\` picks the top groomed
+row, \`gtm-innovation\` proposes new ones, \`review\` grades them.
+
+## Conventions
+
+- \`id\` is a 4-digit zero-padded integer; the filename is
+  \`NNNN-kebab-title.md\`.
+- \`status\` is one of: \`proposed\`, \`groomed\`, \`in-progress\`, \`shipped\`,
+  \`rejected\`, \`needs-discovery\`.
+- \`priority\` is \`P0\` (oncall-now), \`P1\` (this week), \`P2\` (next),
+  \`P3\` (later).
+- \`area\` is project-specific — set the allowed list in AGENTS.md
+  "## Agent parameters · Backlog areas".
+- The table below MUST stay in sync with the frontmatter of each ticket file.
+  CI gate \`validate\` runs \`node scripts/check-backlog.mjs\` and rejects drift.
+
+## Index
+
+| id | title | priority | status | area |
+|----|-------|----------|--------|------|
+README
+}
+
+# Write one scaffold file. Honours $force (overwrite-with-OK-line) and
+# $dry_run (print "would create" and skip the write).
+onboard_write_one() {
+  local dest_rel="$1" kind="$2" source_rel="$3"
+  local proj_dir="$4" slug="$5" kit_root="$6"
+  local force="$7" dry_run="$8"
+  local dest="$proj_dir/$dest_rel"
+
+  if [ "$dry_run" = "1" ]; then
+    echo "would create $dest_rel"
+    return 0
+  fi
+
+  if [ -e "$dest" ] && [ "$force" != "1" ]; then
+    # The top-level guard already caught agents.config.sh; for other files
+    # this is a quiet skip — the operator may have edited them. We do
+    # nothing rather than silently clobber.
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$dest")"
+  case "$kind" in
+    manifest)
+      onboard_render_manifest "$slug" "$proj_dir" > "$dest"
+      ;;
+    agents-md)
+      onboard_render_agents_md "$slug" "$kit_root" > "$dest"
+      ;;
+    lessons)
+      printf '# LESSONS\n\nOperational memory.\n' > "$dest"
+      ;;
+    inline-backlog-readme)
+      onboard_render_backlog_readme "$slug" > "$dest"
+      ;;
+    template)
+      /bin/cp -f "$kit_root/templates/$source_rel" "$dest"
+      ;;
+    *)
+      echo "fleet onboard: unknown render kind '$kind' for $dest_rel" >&2
+      return 1
+      ;;
+  esac
+
+  if [ "$force" = "1" ]; then
+    echo "[OK] reset $dest_rel"
+  fi
+}
+
+onboard() {
+  shift  # drop the leading "onboard"
+  local dry_run=0 force=0 skip_install=0 proj_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --force) force=1; shift ;;
+      --skip-install) skip_install=1; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet onboard — scaffold a fresh project with the kit contract.
+
+Usage:
+  fleet onboard <project-path>            scaffold + run install.sh
+  fleet onboard --dry-run <project-path>  print what would be written
+  fleet onboard --force <project-path>    overwrite existing contract files
+  fleet onboard --skip-install <path>     scaffold only; skip install.sh
+
+The project-path must already be a git repo with an 'origin' remote. The
+manifest pulls REPO_URL from \`git remote get-url origin\` and derives SLUG
+from the basename. Edit agents.config.sh and AGENTS.md after — the bracketed
+values (gating checks, local gate command, backlog areas) are project-specific.
+USAGE
+        exit 0 ;;
+      --) shift; proj_arg="${1:-}"; shift || true; break ;;
+      -*) echo "fleet onboard: unknown flag '$1'" >&2; exit 2 ;;
+      *)
+        if [ -z "$proj_arg" ]; then proj_arg="$1"; shift
+        else echo "fleet onboard: unexpected extra argument '$1'" >&2; exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$proj_arg" ]; then
+    echo "fleet onboard: missing <project-path>" >&2
+    echo "usage: fleet onboard [--dry-run|--force|--skip-install] <project-path>" >&2
+    exit 2
+  fi
+  if [ ! -d "$proj_arg" ]; then
+    echo "fleet onboard: $proj_arg is not a directory" >&2
+    exit 2
+  fi
+
+  local proj_dir; proj_dir="$( cd "$proj_arg" && pwd )"
+  local slug; slug="$(basename "$proj_dir")"
+  local kit_root; kit_root="$(onboard_kit_root)"
+
+  # Already-onboarded guard — exact wording per ticket 0011.
+  if [ -f "$proj_dir/agents.config.sh" ] && [ "$force" != "1" ] && [ "$dry_run" != "1" ]; then
+    echo "already onboarded — use 'fleet onboard --force' to overwrite" >&2
+    exit 1
+  fi
+
+  # Scaffold each file. On dry-run we just print the list and exit before
+  # any side-effects (including the install.sh call).
+  while IFS='|' read -r dest_rel kind source_rel; do
+    [ -z "$dest_rel" ] && continue
+    onboard_write_one "$dest_rel" "$kind" "$source_rel" \
+                      "$proj_dir" "$slug" "$kit_root" \
+                      "$force" "$dry_run"
+  done < <(onboard_file_list)
+
+  if [ "$dry_run" = "1" ]; then
+    exit 0
+  fi
+
+  # Install unless explicitly skipped. The test harness sets
+  # FLEET_INSTALL_CMD to point at a stub; production runs use the real
+  # lib/install.sh sitting alongside this script.
+  if [ "$skip_install" != "1" ]; then
+    local install_cmd="${FLEET_INSTALL_CMD:-}"
+    if [ -n "$install_cmd" ]; then
+      "$install_cmd" "$proj_dir" || {
+        echo "fleet onboard: install command failed: $install_cmd" >&2
+        exit 1
+      }
+    else
+      bash "$kit_root/lib/install.sh" "$proj_dir" || {
+        echo "fleet onboard: install.sh failed" >&2
+        exit 1
+      }
+    fi
+  fi
+
+  echo
+  echo "next: 'launchctl kickstart -k gui/\$UID/com.${slug}.agent-ship' to trigger the first run"
+  exit 0
+}
+
+if [ "$CMD" = "onboard" ]; then
+  onboard "$@"
+fi
+
 # Hand-rolled JSON string escape — same intent as common.sh _json_escape but
 # bin/fleet doesn't source common.sh. Keep this in sync if either grows.
 doctor_json_escape() {
