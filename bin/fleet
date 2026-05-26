@@ -1137,6 +1137,328 @@ if [ "$CMD" = "digest" ]; then
   digest "$@"
 fi
 
+# --- tail -----------------------------------------------------------------
+# Ticket 0015. `fleet tail` streams events.jsonl entries live, formatted for
+# human eyes. With no arg it follows every discovered project concurrently;
+# with a positional slug it restricts to one. Flags:
+#   --since Ns|Nm|Nh|Nd   pre-roll events from the cutoff window before
+#                         following live (per AGENTS.md § Telemetry, `ts` is
+#                         ISO8601 UTC so the math is in UTC seconds).
+#   --json                emit raw events.jsonl lines instead of the formatted
+#                         "<HH:MM:SS>  <slug>/<phase>  <type>  <extras>" form.
+#                         Useful for `fleet tail --json | jq .`.
+#   --type a,b            comma-separated event-type allowlist. Lines whose
+#                         `type` is not in the list are dropped.
+#
+# Discovery reuses doctor's two-root pattern: $FLEET_DISCOVERY_ROOT first,
+# then ~/.local/share/agent-fleet/projects. Per slug we run one `tail -F`
+# (capital F: survives rotation, important once ticket 0016 ships) into a
+# small shell-only formatter — no `jq` dependency, consistent with the
+# events.jsonl producer side (`fleet_emit_event` is also shell-only).
+#
+# SIGINT/SIGTERM trap kills every background `tail -F` PID so the operator
+# can Ctrl-C without leaking processes. Per AGENTS.md § Telemetry, consumers
+# MUST tolerate unknown event types — we never special-case `type`, so any
+# new event lights up the tail output automatically.
+#
+# Test hook: $FLEET_TAIL_FAKE_NOW (epoch seconds) overrides the formatter's
+# "now" so `--since` replay is deterministic in tests/tail.sh.
+
+TAIL_ROOT="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+TAIL_INSTALLED="$HOME/.local/share/agent-fleet/projects"
+
+# Parse "Ns" / "Nm" / "Nh" / "Nd" to seconds. Echoes the integer + returns 0
+# on success; returns 1 + echoes nothing on bad input. Mirrors digest's unit
+# parser shape but adds the s/m units the ticket calls for.
+tail_parse_since() {
+  local s="$1" n unit
+  case "$s" in
+    *s) unit=s; n="${s%s}" ;;
+    *m) unit=m; n="${s%m}" ;;
+    *h) unit=h; n="${s%h}" ;;
+    *d) unit=d; n="${s%d}" ;;
+    *)  return 1 ;;
+  esac
+  case "$n" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$unit" in
+    s) echo "$n" ;;
+    m) echo $(( n * 60 )) ;;
+    h) echo $(( n * 3600 )) ;;
+    d) echo $(( n * 86400 )) ;;
+  esac
+}
+
+# Resolve discovered slug → events.jsonl path. Same union-by-SLUG pattern as
+# the top-level `discover()` helper but standalone (we need the file path,
+# not the manifest path) and tied to TAIL_ROOT so tests can override it.
+tail_discover_events() {
+  local _seen=""
+  { find "$TAIL_ROOT" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$TAIL_INSTALLED" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    local slug; slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf '%s\t%s\n' "$slug" "$HOME/.cache/${slug}-agent/events.jsonl"
+  done
+}
+
+# Format one events.jsonl line for human consumption. Stdin gets the raw
+# JSON line; stdout gets either the formatted "HH:MM:SS  slug/phase  type
+# extras" string or the JSON line unchanged (when $1 is "json"). No `jq`.
+# We pull the four required keys with a tiny awk; everything beyond becomes
+# k=v extras in stable JSON-source order.
+#
+# $1: "json" | "human"
+# $2: comma-separated type filter (empty = no filter)
+tail_format_stream() {
+  local mode="$1" type_filter="$2"
+  awk -v mode="$mode" -v filter="$type_filter" '
+    function strip_quotes(s) { gsub(/^"|"$/, "", s); return s }
+    function field(line, name,    re, start, end, raw) {
+      re = "\"" name "\"[[:space:]]*:[[:space:]]*"
+      start = match(line, re)
+      if (start == 0) return ""
+      raw = substr(line, start + RLENGTH)
+      if (substr(raw, 1, 1) == "\"") {
+        # string value — find next unescaped quote.
+        end = index(substr(raw, 2), "\"")
+        if (end == 0) return ""
+        return substr(raw, 2, end - 1)
+      }
+      # number/bool/null — read until comma or closing brace.
+      end = match(raw, /[,}]/)
+      if (end == 0) return raw
+      return substr(raw, 1, end - 1)
+    }
+    # iso2hms: extract HH:MM:SS from an ISO8601 ts. ts looks like
+    # "2026-05-26T14:37:09Z" or "...Z" with fractional seconds. We just
+    # find the T and grab the 8 chars after it.
+    function iso2hms(ts,    p) {
+      p = index(ts, "T")
+      if (p == 0) return ts
+      return substr(ts, p + 1, 8)
+    }
+    {
+      if ($0 ~ /^[[:space:]]*$/) next
+      # Skip control lines (like "waiting for ..." or the per-file headers
+      # the OSes tail emits with ==> file <== ) — they come from stdin
+      # already (the formatter is downstream of `tail -F`).
+      if ($0 ~ /^==>/) next
+      ty = field($0, "type")
+      if (filter != "") {
+        # Match against comma-separated list.
+        found = 0
+        n = split(filter, parts, ",")
+        for (i = 1; i <= n; i++) if (parts[i] == ty) { found = 1; break }
+        if (!found) next
+      }
+      if (mode == "json") { print $0; fflush(); next }
+      ts    = field($0, "ts")
+      slug  = field($0, "slug")
+      phase = field($0, "phase")
+      # Extras: every "key":"value" pair except the four required keys.
+      extras = ""
+      rest = $0
+      while (match(rest, /"[^"]+"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        seg = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RSTART + RLENGTH)
+        # Parse seg = "key":"value"
+        kq = index(seg, "\""); seg2 = substr(seg, kq + 1)
+        kq2 = index(seg2, "\""); k = substr(seg2, 1, kq2 - 1)
+        v_part = substr(seg2, kq2 + 1)
+        vq = index(v_part, "\""); v_part2 = substr(v_part, vq + 1)
+        vq2 = index(v_part2, "\""); v = substr(v_part2, 1, vq2 - 1)
+        if (k == "ts" || k == "slug" || k == "phase" || k == "type") continue
+        if (extras == "") extras = k "=" v
+        else              extras = extras " " k "=" v
+      }
+      hms = iso2hms(ts)
+      if (extras == "") printf("%s  %s/%s  %s\n", hms, slug, phase, ty)
+      else              printf("%s  %s/%s  %s  %s\n", hms, slug, phase, ty, extras)
+      fflush()
+    }
+  '
+}
+
+# Replay all events in $1 (events.jsonl) whose ts ≥ cutoff_epoch. Stdout is
+# raw JSON lines — caller pipes them through tail_format_stream. Tolerates
+# a missing file (echoes nothing).
+tail_replay_since() {
+  local events="$1" cutoff="$2"
+  [ -f "$events" ] || return 0
+  awk -v cutoff="$cutoff" '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    {
+      if ($0 ~ /^[[:space:]]*$/) next
+      ts = ""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (ts == "") next
+      if (iso2ep(ts) >= cutoff) print $0
+    }
+  ' "$events"
+}
+
+tail_cmd() {
+  shift  # drop the leading "tail"
+  local want_json=0 since="" type_filter="" slug_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      --since) since="${2:-}"; shift 2 ;;
+      --since=*) since="${1#--since=}"; shift ;;
+      --type) type_filter="${2:-}"; shift 2 ;;
+      --type=*) type_filter="${1#--type=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet tail — stream events.jsonl entries live, formatted for human eyes.
+
+Usage:
+  fleet tail                   follow every discovered project concurrently
+  fleet tail <slug>            restrict to one project
+  fleet tail --since 5m        replay last 5 minutes before following live
+  fleet tail --json            emit raw JSON lines (pipe into jq)
+  fleet tail --type a,b        filter to a comma-separated type allowlist
+
+Output (human form):
+  <HH:MM:SS>  <slug>/<phase>  <type>  <extras k=v ...>
+
+Exits 0 on SIGINT and cleans up background tail -F PIDs.
+USAGE
+        exit 0 ;;
+      --) shift ;;
+      -*) echo "fleet tail: unknown flag '$1'" >&2; exit 2 ;;
+      *)
+        if [ -z "$slug_arg" ]; then slug_arg="$1"; shift
+        else echo "fleet tail: unexpected extra argument '$1'" >&2; exit 2
+        fi ;;
+    esac
+  done
+
+  # Resolve --since to a cutoff epoch (0 = no replay).
+  local cutoff=0
+  if [ -n "$since" ]; then
+    local secs
+    if ! secs="$(tail_parse_since "$since")"; then
+      echo "fleet tail: --since must be Ns|Nm|Nh|Nd (got '$since')" >&2
+      exit 2
+    fi
+    local now
+    now="${FLEET_TAIL_FAKE_NOW:-$(date -u +%s)}"
+    cutoff=$(( now - secs ))
+  fi
+
+  # Pick the format mode for downstream pipes.
+  local mode="human"
+  [ "$want_json" = "1" ] && mode="json"
+
+  # Collect (slug, events_path) rows we plan to follow.
+  local rows
+  rows="$(tail_discover_events)"
+  if [ -n "$slug_arg" ]; then
+    rows="$(printf '%s\n' "$rows" | awk -F'\t' -v s="$slug_arg" '$1 == s')"
+    if [ -z "$rows" ]; then
+      echo "fleet tail: no project with SLUG=$slug_arg found under $TAIL_ROOT or $TAIL_INSTALLED" >&2
+      exit 2
+    fi
+  fi
+  if [ -z "$rows" ]; then
+    echo "fleet tail: no projects discovered under $TAIL_ROOT" >&2
+    exit 2
+  fi
+
+  # Background tail -F PIDs we'll need to clean up on SIGINT/SIGTERM.
+  local -a pids=()
+  cleanup() {
+    local p
+    for p in "${pids[@]:-}"; do
+      [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    # Best-effort: give them a beat, then SIGKILL the stragglers.
+    sleep 0.1 2>/dev/null || true
+    for p in "${pids[@]:-}"; do
+      [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
+    done
+    exit 0
+  }
+  trap cleanup INT TERM
+
+  # Replay phase: emit historical lines from every events.jsonl that exists,
+  # in file order per slug. Run BEFORE starting tail -F so the replay output
+  # lands before live lines on the formatter's stdin.
+  local fifo
+  fifo="$(mktemp -u -t fleet-tail.XXXXXX).fifo"
+  mkfifo "$fifo"
+  # Open the FIFO read end for the formatter. The formatter runs in the
+  # foreground so the trap can fire when the operator hits Ctrl-C.
+  tail_format_stream "$mode" "$type_filter" < "$fifo" &
+  local fmt_pid=$!
+  pids+=("$fmt_pid")
+
+  # Open the FIFO write end on fd 3 so producers can append without each one
+  # closing it (which would EOF the formatter prematurely).
+  exec 3>"$fifo"
+  # The FIFO file on disk is no longer needed once both ends are open.
+  rm -f "$fifo"
+
+  # Replay step (per slug, in discovery order). Skipped when cutoff == 0.
+  if [ "$cutoff" -gt 0 ]; then
+    while IFS=$'\t' read -r slug events; do
+      [ -z "$slug" ] && continue
+      [ -f "$events" ] || continue
+      tail_replay_since "$events" "$cutoff" >&3 || true
+    done <<<"$rows"
+  fi
+
+  # Live follow: one `tail -F` per slug, redirected to the formatter FIFO.
+  # If the events.jsonl is missing we surface the wait message (human mode
+  # only) and poll until it appears, then start the tailer.
+  while IFS=$'\t' read -r slug events; do
+    [ -z "$slug" ] && continue
+    if [ ! -f "$events" ]; then
+      [ "$mode" = "human" ] && echo "waiting for events.jsonl at $events..."
+      # Spawn a background poller that waits, then starts tail -F. We DON'T
+      # block here — multi-project mode must still follow projects whose
+      # file does exist.
+      (
+        while [ ! -f "$events" ]; do sleep 1; done
+        # Once the file appears, follow from offset 0 so we don't miss the
+        # first lines (the producer may have written several before the
+        # poller noticed).
+        exec tail -n +1 -F "$events" >&3
+      ) &
+      pids+=("$!")
+      continue
+    fi
+    # tail -n 0 -F: don't replay (we already did) — only the new lines.
+    tail -n 0 -F "$events" >&3 &
+    pids+=("$!")
+  done <<<"$rows"
+
+  # Wait for the formatter (the SIGINT trap kills children + exits 0).
+  wait "$fmt_pid" 2>/dev/null || true
+  cleanup
+}
+
+if [ "$CMD" = "tail" ]; then
+  tail_cmd "$@"
+fi
+
 if [ "$CMD" = "list" ]; then
   echo "${c_bld}fleet projects under $ROOT${c_rst}"
   while read -r m; do

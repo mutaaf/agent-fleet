@@ -443,6 +443,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet doctor                  # PASS/WARN/FAIL across every installed project
 ~/code/agent-fleet/bin/fleet doctor --slug courtiq   # one project
 ~/code/agent-fleet/bin/fleet doctor --json           # machine-readable, for fleet-control
+~/code/agent-fleet/bin/fleet tail                    # stream live events from every project (Ctrl-C to stop)
 ```
 
 Run `doctor` after upgrading the kit (`bash lib/install.sh ...`) or before a

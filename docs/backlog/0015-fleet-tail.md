@@ -1,7 +1,7 @@
 ---
 id: 0015
 title: fleet tail streams live events for one or all projects
-status: groomed
+status: shipped
 priority: P1
 area: observability
 created: 2026-05-26
@@ -123,3 +123,21 @@ Each box maps 1:1 to a test scenario in `tests/tail.sh`.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+- 2026-05-26 — implementation-dev picked up ticket. Plan: write
+  `tests/tail.sh` first with one assertion block per AC, then add a
+  `tail()` function to `bin/fleet` that discovers projects via the same
+  two-root pattern as `doctor`, runs `tail -F` per slug in the
+  background, and pipes lines through a small shell-only formatter.
+  `--since`, `--type`, and `--json` flags share the same per-line
+  filter+format path so the live stream and replay are identical.
+- 2026-05-26 — shipped. The shell function had to be named `tail_cmd`
+  (not `tail`) because a function named `tail` shadowed the system
+  `tail -F` binary the background watchers spawn. The SIGINT-cleanup
+  AC could not be exercised via `kill -INT` against a `&`-launched
+  bash script (POSIX: a signal set to SIG_IGN on entry cannot be
+  retrapped), so AC#6's test uses SIGTERM at runtime AND asserts via
+  grep that the source installs `trap <fn> INT TERM` — that pair
+  covers both the real-Ctrl-C path and the cleanup-of-children path.
+  Replay is pre-rolled into a FIFO before the live `tail -F` watchers
+  attach so historical lines stay in file order ahead of live lines.
