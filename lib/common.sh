@@ -25,6 +25,7 @@ export HOME="${HOME:-/Users/$(whoami)}"
 # Resolve the kit layout from this file's location (lib/ and prompts/ are peers).
 FLEET_LIB="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 FLEET_ROOT="$( cd "$FLEET_LIB/.." && pwd )"
+# shellcheck disable=SC2034  # used by sourced runners (ship/groom/eng) via "$FLEET_PROMPTS/..."
 FLEET_PROMPTS="$FLEET_ROOT/prompts"
 
 # --- manifest -------------------------------------------------------------

@@ -39,7 +39,12 @@ mkdir -p "$INSTALL_ROOT" "$CFG_DIR" "$LOG_DIR" "$AGENTS_DIR"
 # TCC-safe copy of the engine (shared by all projects) + this project's manifest.
 /bin/cp -Rf "$KIT_ROOT/lib"     "$INSTALL_ROOT/"
 /bin/cp -Rf "$KIT_ROOT/prompts" "$INSTALL_ROOT/"
-/bin/cp -f  "$PROJECT_DIR/agents.config.sh" "$CFG_DIR/agents.config.sh"
+# Same file? Skip the copy (otherwise cp -f errors "are identical"). Happens when
+# install is re-run against the already-installed manifest dir (e.g. fleet-control's
+# in-place edit for a project whose working tree is gone).
+if ! [ "$PROJECT_DIR/agents.config.sh" -ef "$CFG_DIR/agents.config.sh" ]; then
+  /bin/cp -f "$PROJECT_DIR/agents.config.sh" "$CFG_DIR/agents.config.sh"
+fi
 chmod +x "$INSTALL_ROOT/lib/"*.sh
 
 # Emit a <key>StartCalendarInterval</key> block from a list of hours at one minute.

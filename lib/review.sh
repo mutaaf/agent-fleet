@@ -95,7 +95,7 @@ Deliver exactly one verdict:
 Never --approve. End the session immediately after the gh pr review call.
 PROMPT
 
-  cd "$CACHE_DIR/review-checkout"
+  cd "$CACHE_DIR/review-checkout" || { echo "review-checkout missing"; continue; }
   git checkout main --quiet; git reset --hard origin/main --quiet
 done
 
