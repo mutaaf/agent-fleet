@@ -1,7 +1,7 @@
 ---
 id: 0009
 title: Cross-project LESSONS aggregation
-status: in-progress
+status: shipped
 priority: P2
 area: engine
 created: 2026-05-26
@@ -89,3 +89,6 @@ Each box maps 1:1 to a test scenario in `tests/lessons-sync.sh`.
   `prompts/groom.prompt.md`, and the install-time invocation at the tail
   of `lib/install.sh`. Same branch also corrects ticket 0007 (shipped via
   PR #14 but the GTM index update overwrote the status row).
+- 2026-05-26 — shipped via PR #19 (commit 6f4cfb7). All seven AC blocks in
+  `tests/lessons-sync.sh` green; full suite (14 tests) green; gating
+  checks `shellcheck` + `validate` green on the merge.
