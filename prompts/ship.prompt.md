@@ -82,6 +82,12 @@ PHASE 2 — Ship the next ticket (only when no agent PR is left to tend).
   --squash → gh pr checks --watch → on green: ticket+index → shipped; on red:
   leave open with a comment naming the failure (next run's PHASE 1 recovers it).
 
+  After `gh pr create` succeeds, emit the PR's identity into the typed event
+  channel so fleet-control can link the run to the PR without scraping the
+  transcript:
+    fleet_emit_event pr_opened number=$N branch=$B
+  (events.jsonl lives at $CACHE_DIR/events.jsonl; see AGENTS.md § Telemetry.)
+
 PHASE 3 — Learn. If you discovered a NOVEL operational lesson (failure mode +
   root cause + fix, or a healing action future runs should know) NOT already in
   docs/LESSONS.md, append one entry in the documented format on whatever branch

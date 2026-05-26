@@ -72,6 +72,39 @@ the contract, not suggestions.
   against this file via the `review` subagent and either signs off with
   `--comment` (auto-merge proceeds on CI-green) or `--request-changes`.
 
+## Telemetry
+
+Every runner appends typed events to a single JSONL file per slug so that
+fleet-control (and any future consumer) reads one source of truth instead of
+scraping `claude` transcripts. The contract is small enough to fit on a
+postcard.
+
+- **File**: `$CACHE_DIR/events.jsonl` (i.e. `~/.cache/<slug>-agent/events.jsonl`)
+- **Format**: one JSON object per line, append-only, never truncated. A future
+  ticket will cover GC if size becomes an issue — for now the channel grows.
+- **Writer**: `fleet_emit_event <type> [k=v ...]` in `lib/common.sh`. Shell-only,
+  no `jq` dependency for writing (JSON is hand-composed via `_json_escape`).
+  Readers may use `jq` freely.
+- **Schema** — every event carries these four keys:
+  - `ts` — ISO8601 UTC, e.g. `2026-05-26T14:37:09Z`
+  - `slug` — the project slug from `agents.config.sh`
+  - `phase` — `ship` | `groom` | `review` | `eng` (whatever
+    `fleet_log_init` was called with)
+  - `type` — the event type (see list below)
+  Any extra `k=v` arguments are added as JSON keys with string values.
+- **Event types** emitted by the kit today:
+  - `run_started {pid}` — fired right after `fleet_log_init`
+  - `run_completed {exit, duration_ms}` — fired right before final `exit`
+  - `gate_failed {check}` — best-effort, from the heal path
+  - `pr_opened {number, branch}` — fired by the dev agent after `gh pr create`
+  - `self_cancel_trip {}` — fired when `SELF_CANCEL` has expired
+  - `lock_blocked {phase, holder_pid}` — fired when `fleet_acquire_lock` loses
+  - `budget_block {reason}` — placeholder until the per-slug budget ticket lands
+
+Add new event types in the same file; consumers MUST tolerate unknown types
+gracefully. Do not rename or repurpose an existing type — the contract is the
+moat.
+
 ## Local development (humans)
 
 ```

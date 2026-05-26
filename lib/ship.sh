@@ -11,6 +11,7 @@ source "$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )/common.sh"
 
 fleet_load_manifest "${1:-}"
 fleet_log_init ship
+fleet_emit_event run_started "pid=$$" || true
 fleet_self_cancel || exit 0
 fleet_acquire_lock ship || exit 0
 trap 'fleet_release_lock ship' EXIT
@@ -21,4 +22,5 @@ EXIT=$?
 
 echo
 echo "=== ${SLUG}-ship complete $(date -u) — exit=$EXIT ==="
+fleet_emit_event run_completed "exit=$EXIT" "duration_ms=$(( ( $(date -u +%s) - RUN_STARTED_EPOCH ) * 1000 ))" || true
 exit $EXIT

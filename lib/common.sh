@@ -70,6 +70,11 @@ fleet_log_init() {
   FLEET_LOG="$LOG_DIR/${phase}-${ts}.log"
   exec >"$FLEET_LOG" 2>&1
   RUN_STARTED_UTC="$(date -u +%FT%TZ)"
+  # Epoch seconds for run_completed's duration_ms calc.
+  # shellcheck disable=SC2034  # consumed by sourced runners (ship/groom/eng/review)
+  RUN_STARTED_EPOCH=$(date -u +%s)
+  # Exported so fleet_emit_event tags events with this phase.
+  FLEET_PHASE="$phase"; export FLEET_PHASE
   echo "=== ${SLUG}-${phase} firing $(date -u) (local $(date)) ==="
   echo "project=$PROJECT_NAME  model=$MODEL  repo=$REPO"
   echo "claude=$(command -v claude || echo MISSING)"
@@ -189,4 +194,57 @@ fleet_release_lock() {
     rm -rf "$target"
   fi
   unset FLEET_LOCK_DIR
+}
+
+# --- structured events ----------------------------------------------------
+# events.jsonl is the kit's typed telemetry channel (ticket 0002). One line per
+# event, append-only, schema { ts, slug, phase, type, ...extras }. Shell-only —
+# no jq dependency for writing. Reading still uses jq where available.
+#
+# _json_escape <s>  — print the JSON-string body (NO surrounding quotes) of $1.
+# Escapes the two characters JSON forbids in a string ("\\" and "\"") plus the
+# control chars JSON forbids unescaped (\b \f \n \r \t and the rest as \u00XX).
+_json_escape() {
+  local s="${1-}" out="" i ch code
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *) printf -v code '%d' "'$ch"
+         if [ "$code" -lt 32 ]; then printf -v out '%s\\u%04x' "$out" "$code"
+         else out+="$ch"; fi ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# fleet_emit_event <type> [k=v ...]  — append one JSON line to events.jsonl.
+# Every event carries ts (ISO8601 UTC), slug, phase, type. Extras are taken
+# verbatim as k=v pairs and rendered as JSON keys. Best-effort: failures here
+# never break the runner (caller usually invokes with `|| true`).
+fleet_emit_event() {
+  local type="${1:?fleet_emit_event: type required}"; shift || true
+  local ts slug phase line kv k v esc_v
+  ts="$(date -u +%FT%TZ)"
+  slug="${SLUG:-unknown}"
+  phase="${FLEET_PHASE:-unknown}"
+  line="{\"ts\":\"$ts\",\"slug\":\"$(_json_escape "$slug")\""
+  line+=",\"phase\":\"$(_json_escape "$phase")\""
+  line+=",\"type\":\"$(_json_escape "$type")\""
+  for kv in "$@"; do
+    k="${kv%%=*}"
+    if [ "$k" = "$kv" ]; then v=""; else v="${kv#*=}"; fi
+    [ -z "$k" ] && continue
+    esc_v="$(_json_escape "$v")"
+    line+=",\"$(_json_escape "$k")\":\"$esc_v\""
+  done
+  line+="}"
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  printf '%s\n' "$line" >> "$CACHE_DIR/events.jsonl"
 }
