@@ -1,7 +1,7 @@
 ---
 id: 0012
 title: fleet digest one-line daily summary per project
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-05-26
@@ -101,4 +101,5 @@ Each box maps 1:1 to a test scenario in `tests/digest.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branched feat/0012-fleet-digest,
+  flipped status to in-progress.
