@@ -35,5 +35,10 @@ EXIT=$?
 
 echo
 echo "=== ${SLUG}-ship complete $(date -u) — exit=$EXIT ==="
-fleet_emit_event run_completed "exit=$EXIT" "duration_ms=$(( ( $(date -u +%s) - RUN_STARTED_EPOCH ) * 1000 ))" || true
+# Ticket 0010: in dry-run mode, fleet_run_claude already emitted run_dry_run
+# (carrying the plan_head). run_completed is REPLACED, not paired — so skip
+# the usual emission when FLEET_DRY_RUN_EMITTED is set.
+if [ -z "${FLEET_DRY_RUN_EMITTED:-}" ]; then
+  fleet_emit_event run_completed "exit=$EXIT" "duration_ms=$(( ( $(date -u +%s) - RUN_STARTED_EPOCH ) * 1000 ))" || true
+fi
 exit $EXIT

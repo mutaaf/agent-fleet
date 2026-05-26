@@ -714,13 +714,32 @@ HOOK_EOF
 # AND appends a structured record to ~/.cache/<slug>-agent/runs.jsonl for the
 # fleet-control cost engine (measured total_cost_usd + usage). Best-effort: if jq
 # or the JSON is missing, it still prints output and the run proceeds.
+#
+# Dry-run (ticket 0010): when `${AGENT_DRY_RUN:-}` is set, the claude argv
+# gains `--allowedTools none` so claude refuses every tool call (the prompt
+# still runs end-to-end — only side-effects are blocked). The post-run
+# telemetry swap: instead of the usual `run_completed exit=… duration_ms=…`
+# event, we emit `run_dry_run plan_head=<first-200-chars-of-result>` so
+# downstream consumers can tell the two apart without scraping the log. The
+# runs.jsonl append is unchanged — a dry-run is still a real, billable claude
+# call worth measuring.
 fleet_run_claude() {
   local phase="$1"
   local tmp; tmp="$(mktemp)"
-  claude --print --output-format json --dangerously-skip-permissions --model "$MODEL" >"$tmp" 2>/dev/null
+  # Build the claude argv. Dry-run mode tool-locks via `--allowedTools none`.
+  local -a argv=( --print --output-format json --dangerously-skip-permissions --model "$MODEL" )
+  if [ -n "${AGENT_DRY_RUN:-}" ]; then
+    argv+=( --allowedTools none )
+  fi
+  claude "${argv[@]}" >"$tmp" 2>/dev/null
   local exit=$?
+  local result_text=""
   if command -v jq >/dev/null 2>&1 && jq -e . "$tmp" >/dev/null 2>&1; then
-    jq -r '.result // empty' "$tmp"
+    result_text="$(jq -r '.result // empty' "$tmp")"
+    printf '%s' "$result_text"
+    # Preserve the trailing newline jq -r normally appends so log parsers
+    # downstream see the same line-shape as before.
+    [ -n "$result_text" ] && printf '\n'
     local rec
     rec="$(jq -c \
       --arg slug "$SLUG" --arg phase "$phase" --arg exit "$exit" \
@@ -731,7 +750,22 @@ fleet_run_claude() {
       "$tmp" 2>/dev/null)"
     [ -n "$rec" ] && printf '%s\n' "$rec" >> "$CACHE_DIR/runs.jsonl"
   else
-    cat "$tmp"   # fallback: claude didn't emit JSON
+    # Fallback: claude didn't emit JSON. We can still echo its raw output and
+    # — for dry-run telemetry — grab the first 200 chars as the plan_head.
+    result_text="$(cat "$tmp")"
+    printf '%s' "$result_text"
+  fi
+  # Dry-run telemetry swap. Note this REPLACES the runner's usual
+  # `run_completed` emission — the lib/ship.sh / lib/groom.sh callers emit
+  # that one right before final exit, and they continue to do so on a
+  # non-dry-run path. Inside the dry-run branch we emit run_dry_run here
+  # AND export FLEET_DRY_RUN_EMITTED so the caller can short-circuit its
+  # own run_completed emission (see lib/ship.sh / lib/groom.sh).
+  if [ -n "${AGENT_DRY_RUN:-}" ]; then
+    local plan_head="${result_text:0:200}"
+    fleet_emit_event run_dry_run "plan_head=$plan_head" || true
+    FLEET_DRY_RUN_EMITTED=1
+    export FLEET_DRY_RUN_EMITTED
   fi
   rm -f "$tmp"
   return $exit
