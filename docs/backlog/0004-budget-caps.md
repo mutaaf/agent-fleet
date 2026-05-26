@@ -1,7 +1,7 @@
 ---
 id: 0004
 title: Per-slug daily $ budget caps
-status: groomed
+status: in-progress
 priority: P1
 area: governance
 created: 2026-05-26
@@ -75,4 +75,11 @@ for anyone running autonomous agents on their own dime.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: started. Branch `feat/0004-budget-caps`.
+  Interpretation: `fleet_check_budget` reads today's UTC `total_cost_usd` from
+  `$CACHE_DIR/runs.jsonl` filtered by `ts_start` prefix matching today's date,
+  and by this slug (defensive — the file is per-slug already, but a stray
+  entry from a different SLUG should not pollute the cap). Sum is computed
+  via `jq` if available, otherwise a portable `awk` regex fallback. Cap
+  comparison is float-safe via `awk`. Emits `budget_block` event when
+  blocking.
