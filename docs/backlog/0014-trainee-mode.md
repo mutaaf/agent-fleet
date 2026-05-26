@@ -1,7 +1,7 @@
 ---
 id: 0014
 title: Trainee mode requires operator approval for the first N PRs
-status: in-progress
+status: shipped
 priority: P1
 area: safety
 created: 2026-05-26
@@ -48,37 +48,37 @@ trust it enough to try." This is the conversion-rate ticket.
 
 Each box maps 1:1 to a test scenario in `tests/trainee.sh`.
 
-- [ ] `agents.config.sh` gains an optional `TRAINEE_PR_COUNT` variable
+- [x] `agents.config.sh` gains an optional `TRAINEE_PR_COUNT` variable
       (default 0 = trainee mode disabled, current behavior preserved).
       `manifest.example.sh` documents it inline.
-- [ ] `lib/common.sh` exposes `fleet_trainee_remaining` which returns the
+- [x] `lib/common.sh` exposes `fleet_trainee_remaining` which returns the
       integer `max(0, TRAINEE_PR_COUNT - <merged feat/ PRs to main>)`. The
       merged count comes from `gh pr list --state merged --search "head:feat/
       base:main" --json number | jq length`. If `TRAINEE_PR_COUNT` is unset
       or 0, the function prints `0` and returns 0.
-- [ ] `lib/common.sh` exports `FLEET_TRAINEE_REMAINING` (the integer above)
+- [x] `lib/common.sh` exports `FLEET_TRAINEE_REMAINING` (the integer above)
       after `fleet_load_manifest`. The export is visible to subagents that
       consume the environment via `fleet_run_claude`.
-- [ ] `prompts/ship.prompt.md` is updated: when arming auto-merge in PHASE
+- [x] `prompts/ship.prompt.md` is updated: when arming auto-merge in PHASE
       1(e) and PHASE 2, the prompt instructs the dev agent to check
       `FLEET_TRAINEE_REMAINING`. If > 0: skip `gh pr merge --auto`, instead
       post a comment `[FLEET trainee mode <K>/<N>] Please review and merge
       manually.` where K = `TRAINEE_PR_COUNT - FLEET_TRAINEE_REMAINING + 1`.
       If 0: arm auto-merge as today.
-- [ ] `fleet_emit_event trainee_pr_opened number=<N> remaining=<R>` fires
+- [x] `fleet_emit_event trainee_pr_opened number=<N> remaining=<R>` fires
       when the dev agent opens a PR while trainee mode is active. The test
       stubs the prompt invocation, asserts the event.
-- [ ] `bin/fleet doctor` adds a `trainee_mode` check per project:
+- [x] `bin/fleet doctor` adds a `trainee_mode` check per project:
       INFO/WARN with `trainee mode active: N PRs remaining` when
       `FLEET_TRAINEE_REMAINING > 0`; PASS otherwise. Visible in `--json`.
-- [ ] `bin/fleet digest` (ticket 0012, if shipped first) shows
+- [x] `bin/fleet digest` (ticket 0012, if shipped first) shows
       `TRAINEE-N` in the state tag column. If 0012 hasn't shipped, just
       ensure the events.jsonl entry exists so a future digest can pick
       it up.
-- [ ] Given a fixture with `TRAINEE_PR_COUNT=3` and one merged `feat/` PR,
+- [x] Given a fixture with `TRAINEE_PR_COUNT=3` and one merged `feat/` PR,
       `fleet_trainee_remaining` prints `2`. Given the same with 5 merged
       PRs, it prints `0`. Given `TRAINEE_PR_COUNT` unset, it prints `0`.
-- [ ] Documented in `AGENTS.md § Telemetry` as the `trainee_pr_opened`
+- [x] Documented in `AGENTS.md § Telemetry` as the `trainee_pr_opened`
       event row.
 
 ## Out of scope
@@ -119,3 +119,21 @@ Each box maps 1:1 to a test scenario in `tests/trainee.sh`.
   ticket file frontmatter + README index row both still said `in-progress`;
   flipped both to `shipped` here. Writing `tests/trainee.sh` first (one test
   per acceptance-criteria box), then implementing the kit changes.
+- 2026-05-26 (implementation-dev): all 8 acceptance boxes green via
+  `tests/trainee.sh`. Implementation:
+  - `lib/common.sh`: added `fleet_trainee_remaining` with per-process cache
+    (`FLEET_TRAINEE_REMAINING_CACHED`); `fleet_load_manifest` now exports
+    `FLEET_TRAINEE_REMAINING` so subagents inherit it.
+  - `manifest.example.sh`: documented `TRAINEE_PR_COUNT` in the spend-bound
+    section.
+  - `prompts/ship.prompt.md`: added <=5-line trainee-mode gate at PHASE 1(e)
+    and PHASE 2, including the `fleet_emit_event trainee_pr_opened ...` line
+    and the `[FLEET trainee mode K/N]` comment template.
+  - `bin/fleet doctor`: new `trainee_mode` check (PASS when disabled or
+    graduated, WARN with remaining-count reason when active). Visible in
+    `--json`. Best-effort `gh` call, treats failures as 0 merged (safer
+    direction).
+  - `AGENTS.md § Telemetry`: documented the `trainee_pr_opened` event row.
+  - Local gate green: shellcheck -S warning, bash -n, check-backlog.mjs,
+    and `bash tests/trainee.sh` (plus all sibling tests). Reinstall: all
+    projects (touches lib/ + prompts/).

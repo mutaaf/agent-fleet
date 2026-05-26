@@ -30,6 +30,13 @@ SELF_CANCEL="20260628"
 # Unset (the default) = no cap, current behavior. Ticket 0004.
 # MAX_DAILY_USD=5
 
+# Optional trainee-mode gate: the first N feature PRs require manual merge by
+# the operator (the dev agent posts a `[FLEET trainee mode K/N]` PR comment
+# instead of arming auto-merge). The count graduates automatically once N
+# feat/ PRs have been merged to main. 0 or unset = disabled, full autonomy
+# from the first PR (current behavior). Ticket 0014.
+# TRAINEE_PR_COUNT=5
+
 # --- cadence --------------------------------------------------------------
 SHIP_MINUTE=41              # ship fires every hour at this minute
 GROOM_HOURS="0 6 12 18"     # groom fires at GROOM_MINUTE on these hours (local)

@@ -48,6 +48,70 @@ fleet_load_manifest() {
   CACHE_DIR="$HOME/.cache/${SLUG}-agent"
   LOG_DIR="$CACHE_DIR/logs"
   mkdir -p "$LOG_DIR"
+
+  # Trainee-mode export (ticket 0014). Computed once and exported so subagents
+  # spawned via fleet_run_claude inherit it through the env. The function
+  # itself caches per process — see FLEET_TRAINEE_REMAINING_CACHED below.
+  FLEET_TRAINEE_REMAINING="$(fleet_trainee_remaining)"
+  export FLEET_TRAINEE_REMAINING
+}
+
+# --- trainee mode (ticket 0014) ------------------------------------------
+# fleet_trainee_remaining — print the integer max(0, TRAINEE_PR_COUNT - merged)
+# where merged = count of merged feat/ PRs to main, queried once via `gh`.
+#
+# When TRAINEE_PR_COUNT is unset, 0, or non-numeric, print 0 and return — no
+# gh call, fast-out path so the no-trainee-mode case stays free.
+#
+# Result is cached for the rest of this process in FLEET_TRAINEE_REMAINING_CACHED
+# so a single ship run never pays for two API hits even if the prompt asks for
+# the value multiple times.
+#
+# If `gh` is missing or the API call fails, we conservatively treat the merged
+# count as 0 (i.e. all of TRAINEE_PR_COUNT remains) — the safer direction:
+# operator approval requested rather than skipped. The doctor's `gh_auth`
+# check surfaces the missing-gh case separately.
+fleet_trainee_remaining() {
+  local cap="${TRAINEE_PR_COUNT:-0}"
+  # Non-numeric or 0 -> disabled.
+  case "$cap" in
+    ''|0|*[!0-9]*) echo 0; return 0 ;;
+  esac
+
+  if [ -n "${FLEET_TRAINEE_REMAINING_CACHED:-}" ]; then
+    echo "$FLEET_TRAINEE_REMAINING_CACHED"
+    return 0
+  fi
+
+  local merged=0
+  if command -v gh >/dev/null 2>&1; then
+    local raw
+    raw="$(gh pr list \
+              --state merged \
+              --search "head:feat/ base:main" \
+              --json number \
+              --limit 100 \
+              ${REPO:+--repo "$REPO"} \
+            2>/dev/null || true)"
+    if [ -n "$raw" ] && [ "$raw" != "[]" ]; then
+      if command -v jq >/dev/null 2>&1; then
+        merged="$(printf '%s' "$raw" | jq 'length' 2>/dev/null || echo 0)"
+      else
+        # Count `"number":` occurrences as a portable fallback.
+        merged="$(printf '%s' "$raw" | tr -cd '{' | wc -c | tr -d ' ')"
+      fi
+    fi
+  fi
+  # Sanitize merged in case the fallback produced something odd.
+  case "$merged" in
+    ''|*[!0-9]*) merged=0 ;;
+  esac
+
+  local remaining=$(( cap - merged ))
+  [ "$remaining" -lt 0 ] && remaining=0
+  FLEET_TRAINEE_REMAINING_CACHED="$remaining"
+  export FLEET_TRAINEE_REMAINING_CACHED
+  echo "$remaining"
 }
 
 # --- prompt-version pinning ----------------------------------------------
