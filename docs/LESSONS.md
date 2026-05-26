@@ -28,6 +28,34 @@ HEAD` — the upstream tracking ref doesn't always survive whatever isolates
 the agent's checkout. Workaround: pass `--repo mutaaf/agent-fleet
 --head mutaaf:<branch>` explicitly. Also include `--base main` to be safe.
 
+## 2026-05-26 — bash scripts launched with `&` cannot be SIGINT-tested
+
+POSIX says: "a signal set to be ignored on entry to a process shall remain
+ignored." When the test harness launches `./script.sh &`, bash inherits
+SIGINT as SIG_IGN from the job-control context, so any subsequent
+`trap '...' INT` inside the script does NOT install — `trap -p INT` echoes
+empty afterwards. Symptom: a test that sends `kill -INT $PID` to a
+backgrounded helper waits forever even though Ctrl-C in a real terminal
+would work fine. Workaround: in tests, use `kill -TERM` (which is honoured)
+AND add a source-level grep assertion that the production code installs
+`trap <fn> INT TERM` — that pair exercises the cleanup path the test needs
+without requiring `setsid` (missing on macOS) or a pseudo-tty wrapper. See
+the AC#6 block in `tests/tail.sh` (ticket 0015) for the pattern.
+
+## 2026-05-26 — naming a shell function `tail` shadows `/usr/bin/tail`
+
+When `bin/fleet` declared a `tail()` function for the `fleet tail`
+subcommand, every internal `tail -F "$file"` call resolved to the shell
+function (which re-ran the subcommand recursively with `-F` as an
+unknown flag) instead of the system binary. Symptoms: "fleet tail:
+unknown flag '-F'" lines in the formatter output and lines from the
+fixture's events.jsonl never appearing live. Fix: name the dispatch
+function something OTHER than `tail` — we used `tail_cmd()`. Same
+pattern applies to any subcommand that would collide with a coreutils
+binary the same script also shells out to (`head`, `cat`, `sort`,
+`uniq`, etc.). When in doubt, prefix the dispatcher with `_cmd` or run
+the binary via `command tail …` to bypass the function.
+
 ## 2026-05-26 — GitHub Actions can silently stop firing for a PR
 
 While shipping ticket 0006, four consecutive pushes to
