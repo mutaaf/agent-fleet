@@ -27,3 +27,23 @@ the current branch to a remote" even after a successful `git push -u origin
 HEAD` — the upstream tracking ref doesn't always survive whatever isolates
 the agent's checkout. Workaround: pass `--repo mutaaf/agent-fleet
 --head mutaaf:<branch>` explicitly. Also include `--base main` to be safe.
+
+## 2026-05-26 — GitHub Actions can silently stop firing for a PR
+
+While shipping ticket 0006, four consecutive pushes to
+`feat/0006-auto-pause-on-sendbacks` registered ZERO workflow runs over
+~40 minutes — neither `CI` nor `auto-merge`. The PR head SHA's
+`/check-runs` was empty, `/actions/runs?branch=...` returned 0, the PR
+state stayed `mergeStateStatus=BLOCKED` with an empty `statusCheckRollup`.
+GitHub Actions service status was "All Systems Operational". No
+quota/banner appeared. Close+reopen, empty commits, content-changing
+commits, all failed to nudge a run. Symptom: the very same workflow that
+green-checked PRs #2–#6 within 20s simply doesn't fire on #7. Almost
+certainly a transient on the GitHub side (queue, billing-limit, or
+account-level flag), NOT something the loop did. Mitigation when seen:
+(a) wait 30+ min and re-push, (b) try a fresh branch name (push the same
+commits to `feat/<id>-<slug>-v2`), (c) escalate to a human via a PR
+comment rather than `gh pr merge --admin` (admin merge violates the
+"never bypass branch protection" Hard NO). Do NOT use `--admin` to
+unstick. The PR can sit with auto-merge armed and complete itself the
+moment CI fires.
