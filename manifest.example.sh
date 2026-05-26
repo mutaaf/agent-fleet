@@ -38,7 +38,10 @@ SELF_CANCEL="20260628"
 # TRAINEE_PR_COUNT=5
 
 # --- cadence --------------------------------------------------------------
-SHIP_MINUTE=41              # ship fires every hour at this minute
+SHIP_MINUTE=41              # ship fires at this minute
+SHIP_HOURS=""               # OPTIONAL. When set (e.g. "0 6 12 18"), ship fires only
+                            # at those hours. Empty (default) = every hour at :SHIP_MINUTE.
+                            # Use to throttle a project under rate-limit / suspension pressure.
 GROOM_HOURS="0 6 12 18"     # groom fires at GROOM_MINUTE on these hours (local)
 GROOM_MINUTE=17
 REVIEW_INTERVAL=300         # review poller period, seconds (300 = every 5 min)

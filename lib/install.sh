@@ -20,6 +20,10 @@ source "$PROJECT_DIR/agents.config.sh"
 : "${SLUG:?manifest missing SLUG}"
 NAMESPACE="${NAMESPACE:-com.fleet.$SLUG}"
 SHIP_MINUTE="${SHIP_MINUTE:-41}"
+# Optional. When set (e.g. "0 6 12 18"), ship fires only at those hours instead
+# of every hour — used to throttle the cadence on projects under rate-limit
+# pressure. Empty (the default) keeps the original "every hour at :SHIP_MINUTE".
+SHIP_HOURS="${SHIP_HOURS:-}"
 GROOM_HOURS="${GROOM_HOURS:-0 6 12 18}"
 GROOM_MINUTE="${GROOM_MINUTE:-17}"
 REVIEW_INTERVAL="${REVIEW_INTERVAL:-300}"
@@ -112,8 +116,12 @@ $schedule
 EOF
 }
 
-write_plist ship   ship.sh   "  <key>StartCalendarInterval</key>
+if [ -n "$SHIP_HOURS" ]; then
+  write_plist ship ship.sh "$(calendar_array "$SHIP_HOURS" "$SHIP_MINUTE")"
+else
+  write_plist ship ship.sh "  <key>StartCalendarInterval</key>
   <dict><key>Minute</key><integer>$SHIP_MINUTE</integer></dict>"
+fi
 write_plist groom  groom.sh  "$(calendar_array "$GROOM_HOURS" "$GROOM_MINUTE")"
 write_plist review review.sh "  <key>StartInterval</key><integer>$REVIEW_INTERVAL</integer>"
 
@@ -132,7 +140,11 @@ done
 
 echo
 echo "✓ installed fleet agents for $SLUG ($NAMESPACE.*):"
-echo "    agent-ship   — every hour at :$SHIP_MINUTE"
+if [ -n "$SHIP_HOURS" ]; then
+  echo "    agent-ship   — at :$SHIP_MINUTE on hours [$SHIP_HOURS]"
+else
+  echo "    agent-ship   — every hour at :$SHIP_MINUTE"
+fi
 echo "    agent-groom  — at :$GROOM_MINUTE on hours [$GROOM_HOURS]"
 echo "    agent-review — every $((REVIEW_INTERVAL/60)) min (polls; self-gates)"
 [ "$ENG_ENABLED" = "1" ] && echo "    agent-eng    — at :$ENG_MINUTE on hours [$ENG_HOURS]"
