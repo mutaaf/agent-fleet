@@ -1800,6 +1800,133 @@ if [ "$CMD" = "rollback" ]; then
   rollback "$@"
 fi
 
+# --- kickstart ------------------------------------------------------------
+# Ticket 0010. `fleet kickstart <slug> <phase> [--dry-run]` is the operator's
+# pre-flight check: it triggers a one-shot run of the per-slug launchd label
+# matching the phase (`agent-ship`, `agent-groom`, `agent-review`, `agent-eng`).
+# With `--dry-run`, the kickstart is prefixed by
+# `launchctl setenv AGENT_DRY_RUN 1` so the runner gates `fleet_run_claude`
+# into tool-locked mode (the prompt still runs end-to-end; only side-effects
+# are blocked — see fleet_run_claude in lib/common.sh).
+#
+# We use `launchctl setenv` rather than `env AGENT_DRY_RUN=1 launchctl
+# kickstart` because launchd jobs inherit the launchd user-session env, not
+# the caller's. `setenv` writes into that session env so the spawned runner
+# actually sees the variable. `unsetenv` after the kickstart call would
+# leave a race window where a concurrent launchd fire (e.g. groom at :17
+# while ship at :41) could also pick up the flag — so we intentionally
+# leave the var set on the dry-run path. Operators can clear it themselves
+# with `launchctl unsetenv AGENT_DRY_RUN` once they're done dry-running.
+# Without `--dry-run`, we do NOT touch the launchd env at all, so the var
+# stays unset across the kickstart call (verified by AC#6).
+#
+# Naming note (LESSONS 2026-05-26): we use `kickstart_cmd` rather than
+# `kickstart` so the dispatch function never shadows any coreutils binary
+# the same script might shell out to. No collision exists today, but
+# `tail_cmd` set the precedent for any user-facing subcommand name.
+#
+# Discovery: slug → manifest via the same two-root pattern as rollback/tail/
+# digest (FLEET_DISCOVERY_ROOT + ~/.local/share/agent-fleet/projects,
+# de-duped by SLUG, working-tree manifest wins). NAMESPACE comes from the
+# manifest; the label is "${NAMESPACE}.agent-${PHASE}".
+
+# Resolve slug → manifest path. Echoes the manifest path or empty (same
+# shape as rollback_resolve_manifest, kept independent so future churn in
+# either doesn't ripple).
+kickstart_resolve_manifest() {
+  local want="$1"
+  local roots=("${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}" "$HOME/.local/share/agent-fleet/projects")
+  local root m slug
+  for root in "${roots[@]}"; do
+    [ -d "$root" ] || continue
+    while IFS= read -r m; do
+      [ -n "$m" ] || continue
+      # shellcheck disable=SC1090
+      slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+      if [ "$slug" = "$want" ]; then
+        echo "$m"
+        return 0
+      fi
+    done < <(find "$root" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort)
+  done
+}
+
+kickstart_cmd() {
+  shift  # drop the leading "kickstart"
+  local slug_arg="" phase_arg="" dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet kickstart — trigger a one-shot agent run, optionally in dry-run mode.
+
+Usage:
+  fleet kickstart <slug> <phase>             trigger the launchd label
+  fleet kickstart <slug> <phase> --dry-run   set AGENT_DRY_RUN=1 first
+
+<phase> is one of: ship, groom, review, eng.
+
+In --dry-run mode the runner still calls claude end-to-end, but with
+\`--allowedTools none\` so no side-effects (commits, pushes, gh calls)
+land. The run emits \`run_dry_run plan_head=...\` to events.jsonl and
+still appends to runs.jsonl with the real cost. Operator unsets the env
+with: launchctl unsetenv AGENT_DRY_RUN
+USAGE
+        exit 0 ;;
+      --) shift ;;
+      -*) echo "fleet kickstart: unknown flag '$1'" >&2; exit 2 ;;
+      *)
+        if   [ -z "$slug_arg" ];  then slug_arg="$1";  shift
+        elif [ -z "$phase_arg" ]; then phase_arg="$1"; shift
+        else echo "fleet kickstart: unexpected extra argument '$1'" >&2; exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$slug_arg" ] || [ -z "$phase_arg" ]; then
+    echo "fleet kickstart: missing <slug> and/or <phase>" >&2
+    echo "usage: fleet kickstart <slug> <phase> [--dry-run]" >&2
+    exit 2
+  fi
+  case "$phase_arg" in
+    ship|groom|review|eng) ;;
+    *)
+      echo "fleet kickstart: <phase> must be ship|groom|review|eng (got '$phase_arg')" >&2
+      exit 2 ;;
+  esac
+
+  local manifest
+  manifest="$(kickstart_resolve_manifest "$slug_arg")"
+  if [ -z "$manifest" ]; then
+    echo "fleet kickstart: no project with SLUG=$slug_arg found" >&2
+    exit 2
+  fi
+  local namespace
+  # shellcheck disable=SC1090  # discovered at runtime
+  namespace=$( (source "$manifest"; echo "${NAMESPACE:-com.fleet.${SLUG:-$slug_arg}}") 2>/dev/null )
+  if [ -z "$namespace" ]; then
+    echo "fleet kickstart: could not derive NAMESPACE from $manifest" >&2
+    exit 2
+  fi
+
+  local uid="${UID:-$(id -u)}"
+  local label="gui/${uid}/${namespace}.agent-${phase_arg}"
+
+  # Dry-run: set the launchd session env so the spawned runner inherits it.
+  # We deliberately do NOT unsetenv afterwards — see the module header.
+  if [ "$dry" = "1" ]; then
+    launchctl setenv AGENT_DRY_RUN 1 || true
+  fi
+
+  launchctl kickstart -k "$label"
+  exit $?
+}
+
+if [ "$CMD" = "kickstart" ]; then
+  kickstart_cmd "$@"
+fi
+
 # --- lessons-sync ---------------------------------------------------------
 # Ticket 0009. `fleet lessons-sync` walks every discovered project, reads
 # its docs/LESSONS.md, and writes one merged file at

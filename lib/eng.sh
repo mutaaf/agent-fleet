@@ -27,5 +27,8 @@ EXIT=$?
 
 echo
 echo "=== ${SLUG}-eng complete $(date -u) — exit=$EXIT ==="
-fleet_emit_event run_completed "exit=$EXIT" "duration_ms=$(( ( $(date -u +%s) - RUN_STARTED_EPOCH ) * 1000 ))" || true
+# Ticket 0010: dry-run already emitted run_dry_run; skip the run_completed pair.
+if [ -z "${FLEET_DRY_RUN_EMITTED:-}" ]; then
+  fleet_emit_event run_completed "exit=$EXIT" "duration_ms=$(( ( $(date -u +%s) - RUN_STARTED_EPOCH ) * 1000 ))" || true
+fi
 exit $EXIT

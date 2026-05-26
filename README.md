@@ -445,7 +445,20 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet doctor --json           # machine-readable, for fleet-control
 ~/code/agent-fleet/bin/fleet tail                    # stream live events from every project (Ctrl-C to stop)
 ~/code/agent-fleet/bin/fleet rollback courtiq        # revert the last agent-shipped commit (revert/<id>-<slug> PR)
+~/code/agent-fleet/bin/fleet kickstart courtiq ship             # trigger a one-shot agent-ship run
+~/code/agent-fleet/bin/fleet kickstart courtiq ship --dry-run   # set AGENT_DRY_RUN=1 first, then kickstart
 ```
+
+**Dry-run mode (ticket 0010).** Setting `AGENT_DRY_RUN=1` flips
+`fleet_run_claude` into tool-locked mode — the prompt still runs end-to-end
+(real claude call, real cost on `runs.jsonl`), but `--allowedTools none` is
+appended so no commits, pushes, or `gh` calls happen. The runner emits
+`run_dry_run plan_head=<first-200-chars-of-result>` to `events.jsonl`
+instead of the usual `run_completed`, so downstream consumers can tell them
+apart without scraping the log. The easiest way to trigger one is
+`fleet kickstart <slug> <phase> --dry-run`, which prefixes the
+`launchctl kickstart` with a `launchctl setenv AGENT_DRY_RUN 1`. Clear the
+env when you're done dry-running: `launchctl unsetenv AGENT_DRY_RUN`.
 
 Run `doctor` after upgrading the kit (`bash lib/install.sh ...`) or before a
 long break. It validates each project's manifest, the AGENTS.md contract

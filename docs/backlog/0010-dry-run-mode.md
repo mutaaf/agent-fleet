@@ -1,7 +1,7 @@
 ---
 id: 0010
 title: AGENT_DRY_RUN end-to-end mode
-status: groomed
+status: in-progress
 priority: P2
 area: safety
 created: 2026-05-26
@@ -82,4 +82,14 @@ Each box maps 1:1 to a test scenario in `tests/dry-run.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: branched `feat/0010-dry-run-mode` from
+  `origin/main`, flipped status to `in-progress`. Plan:
+  (1) write `tests/dry-run.sh` covering all 7 ACs first;
+  (2) gate `fleet_run_claude` on `${AGENT_DRY_RUN:-}` — append
+      `--allowedTools none` to the claude argv and swap `run_completed` for
+      `run_dry_run plan_head=...` while still appending to runs.jsonl;
+  (3) add `bin/fleet kickstart <slug> <phase> [--dry-run]` that wraps
+      `launchctl kickstart -k gui/$UID/$NAMESPACE.agent-$PHASE`, prefixed by
+      `launchctl setenv AGENT_DRY_RUN 1` only when `--dry-run` is set;
+  (4) document the env var + flag under README "Daily ops" so
+      `grep AGENT_DRY_RUN README.md` matches.
