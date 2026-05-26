@@ -30,7 +30,7 @@ ones, `review` grades them.
 | 0012 | fleet digest one-line daily summary per project | P2 | shipped | observability |
 | 0014 | Trainee mode requires operator approval for the first N PRs | P1 | shipped | safety |
 | 0007 | Adaptive groom cadence when backlog is empty | P2 | in-progress | engine |
-| 0015 | fleet tail streams live events for one or all projects | P1 | groomed | observability |
+| 0015 | fleet tail streams live events for one or all projects | P1 | in-progress | observability |
 | 0017 | fleet rollback reverts the last agent-shipped commit | P1 | groomed | safety |
 | 0009 | Cross-project LESSONS aggregation | P2 | groomed | engine |
 | 0010 | AGENT_DRY_RUN end-to-end mode | P2 | groomed | safety |
