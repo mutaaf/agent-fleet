@@ -192,6 +192,7 @@ doctor_run_checks() {
       echo "ENG_ENABLED=${ENG_ENABLED:-0}"
       echo "REPO_URL=${REPO_URL:-}"
       echo "PROMPTS_SHA=${PROMPTS_SHA:-}"
+      echo "TRAINEE_PR_COUNT=${TRAINEE_PR_COUNT:-0}"
     ) 2>/dev/null
   ) || true
   slug="$(echo "$probe" | sed -n 's/^SLUG=//p')"
@@ -200,6 +201,7 @@ doctor_run_checks() {
   eng="$(echo "$probe" | sed -n 's/^ENG_ENABLED=//p')"
   repo_url="$(echo "$probe" | sed -n 's/^REPO_URL=//p')"
   local pinned_sha; pinned_sha="$(echo "$probe" | sed -n 's/^PROMPTS_SHA=//p')"
+  local trainee_cap; trainee_cap="$(echo "$probe" | sed -n 's/^TRAINEE_PR_COUNT=//p')"
   if [ -z "$slug" ] || [ -z "$repo_url" ] || [ -z "$sc" ]; then
     cfg_status="FAIL"
     cfg_reason="manifest missing required vars (SLUG/REPO_URL/SELF_CANCEL)"
@@ -306,6 +308,50 @@ doctor_run_checks() {
     pp_reason="pinned=$pinned_sha actual=$current_sha — reinstall kit to bump"
   fi
   echo "prompts_pinned|$pp_status|$pp_reason"
+
+  # check: trainee_mode (ticket 0014)
+  # Surfaces whether the project still requires manual operator merge on
+  # feature PRs. PASS = disabled (TRAINEE_PR_COUNT unset/0) or graduated
+  # (no PRs remain). WARN = active, with the remaining-count in the
+  # reason string so the operator sees "trainee mode active: N PRs
+  # remaining" without having to crack open the manifest. FAIL is reserved
+  # — trainee mode being active is informational, not an error.
+  local tm_status="PASS" tm_reason=""
+  case "$trainee_cap" in
+    ''|0|*[!0-9]*)
+      : ;;  # disabled -> PASS, no reason
+    *)
+      # Compute merged feat/ PR count via gh (best-effort).
+      local merged=0 raw=""
+      if command -v gh >/dev/null 2>&1; then
+        local repo_slug; repo_slug="$(echo "$repo_url" | sed -E 's#https?://github.com/##; s#\.git$##')"
+        raw="$(gh pr list \
+                  --state merged \
+                  --search "head:feat/ base:main" \
+                  --json number \
+                  --limit 100 \
+                  ${repo_slug:+--repo "$repo_slug"} \
+                2>/dev/null || true)"
+        if [ -n "$raw" ] && [ "$raw" != "[]" ]; then
+          if command -v jq >/dev/null 2>&1; then
+            merged="$(printf '%s' "$raw" | jq 'length' 2>/dev/null || echo 0)"
+          else
+            merged="$(printf '%s' "$raw" | tr -cd '{' | wc -c | tr -d ' ')"
+          fi
+        fi
+      fi
+      case "$merged" in ''|*[!0-9]*) merged=0 ;; esac
+      local remaining=$(( trainee_cap - merged ))
+      [ "$remaining" -lt 0 ] && remaining=0
+      if [ "$remaining" -gt 0 ]; then
+        tm_status="WARN"
+        tm_reason="trainee mode active: $remaining PRs remaining (cap=$trainee_cap)"
+      else
+        tm_reason="trainee mode graduated (cap=$trainee_cap, $merged merged)"
+      fi
+      ;;
+  esac
+  echo "trainee_mode|$tm_status|$tm_reason"
 }
 
 # Build the per-project block (human form). Reads check rows on stdin, decides

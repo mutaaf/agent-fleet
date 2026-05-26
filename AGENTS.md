@@ -120,6 +120,16 @@ postcard.
     pause persists across runner invocations. Resume = explicit
     `launchctl enable gui/$UID/$NAMESPACE.agent-ship` (or fleet-control's
     "Resume" action).
+  - `trainee_pr_opened {number, remaining}` — emitted by the dev agent
+    (driven from `prompts/ship.prompt.md`) immediately after `gh pr
+    create` when `FLEET_TRAINEE_REMAINING > 0`, i.e. the project's
+    `TRAINEE_PR_COUNT` cap has not yet graduated. The dev agent ALSO
+    skips `gh pr merge --auto` in this state and posts a
+    `[FLEET trainee mode K/N] Please review and merge manually.`
+    comment on the PR. `number` is the PR number; `remaining` is the
+    `FLEET_TRAINEE_REMAINING` value at emission time. Ticket 0014.
+    Operator graduates the project by merging PRs until the cap is met
+    — there is no manual reset.
 
 Add new event types in the same file; consumers MUST tolerate unknown types
 gracefully. Do not rename or repurpose an existing type — the contract is the

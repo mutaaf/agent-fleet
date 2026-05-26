@@ -57,6 +57,11 @@ freeze the loop.
         Print "PR #N in-flight — waiting" and exit.
 
   (e) Else (all gating checks green, CLEAN, not yet merged) → ensure auto-merge:
+        TRAINEE-MODE GATE (ticket 0014): if env `FLEET_TRAINEE_REMAINING > 0`,
+        do NOT arm auto-merge. Instead post one comment with
+        `gh pr comment N --body "[FLEET trainee mode K/N] Please review and
+        merge manually."` where K = `TRAINEE_PR_COUNT - FLEET_TRAINEE_REMAINING + 1`
+        and N = `TRAINEE_PR_COUNT`, then exit. Otherwise arm:
         gh pr merge N --auto --squash
         Print "PR #N healthy, auto-merge armed — waiting" and exit.
 
@@ -90,6 +95,14 @@ PHASE 2 — Ship the next ticket (only when no agent PR is left to tend).
   the trailer → push → gh pr create --fill --base main → gh pr merge --auto
   --squash → gh pr checks --watch → on green: ticket+index → shipped; on red:
   leave open with a comment naming the failure (next run's PHASE 1 recovers it).
+
+  TRAINEE-MODE GATE (ticket 0014): if env `FLEET_TRAINEE_REMAINING > 0`, the
+  dev agent MUST skip `gh pr merge --auto --squash` and instead post
+  `gh pr comment N --body "[FLEET trainee mode K/N] Please review and merge
+  manually."` (K = `TRAINEE_PR_COUNT - FLEET_TRAINEE_REMAINING + 1`,
+  N = `TRAINEE_PR_COUNT`). Also emit
+  `fleet_emit_event trainee_pr_opened number=$N remaining=$FLEET_TRAINEE_REMAINING`.
+  If `FLEET_TRAINEE_REMAINING = 0` (default), arm auto-merge as today.
 
   After `gh pr create` succeeds, emit the PR's identity into the typed event
   channel so fleet-control can link the run to the PR without scraping the
