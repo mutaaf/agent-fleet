@@ -1,7 +1,7 @@
 ---
 id: 0005
 title: Prompt-version pinning in agents.config.sh
-status: groomed
+status: in-progress
 priority: P1
 area: governance
 created: 2026-05-26
@@ -73,4 +73,12 @@ autonomous-agent kit, not a weekend hack.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev: picked up, opened
+  `feat/0005-prompt-version-pinning`. Plan: add `bin/fleet prompts-sha`
+  helper, a `_fleet_prompts_sha` function in `lib/common.sh` that compares
+  the optional `PROMPTS_SHA` from the manifest against the current
+  `prompts/` SHA and emits one `prompts_drift` event per run, a new
+  `prompts_pinned` doctor check, and install.sh stamping the copied
+  manifest with `# PROMPTS_SHA pinned at install time: <sha>`
+  (strip-and-reappend for idempotency). Tests in `tests/prompts-sha.sh`
+  + extensions to `tests/doctor.sh` cover each acceptance box.
