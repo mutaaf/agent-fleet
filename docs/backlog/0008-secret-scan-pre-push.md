@@ -1,7 +1,7 @@
 ---
 id: 0008
 title: Secret-scan pre-push hook in agent checkouts
-status: groomed
+status: in-progress
 priority: P1
 area: safety
 created: 2026-05-26
@@ -88,4 +88,17 @@ Each box maps 1:1 to a test scenario in `tests/secret-scan.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-26 — implementation-dev picked up the ticket. Approach:
+  - Add `fleet_install_prepush_hook <checkout_dir>` to `lib/common.sh`
+    near `fleet_checkout`, called automatically after the
+    `git config user.email`/`user.name` block.
+  - Hook body is a self-contained heredoc (<= 60 lines, no `jq`), delegates
+    to `gitleaks` when on PATH, otherwise greps `git diff --cached` (no
+    remote required during test) against the six built-in patterns.
+  - On block, hook emits `fleet_emit_event push_blocked
+    reason=secret_match pattern=<name>` by re-sourcing `lib/common.sh`
+    when reachable; falls back to a plain stderr message otherwise.
+  - Tests in `tests/secret-scan.sh` invoke the hook directly (not via
+    `git push`) and use obvious fake fixtures (e.g. `sk-ant-api03-`
+    followed by `A`*30, `ghp_` followed by `0`*36) so the test file
+    itself does not self-trip when committed.
