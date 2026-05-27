@@ -4,6 +4,7 @@ in-flight PR, and only if there's nothing to heal, ship the next ticket. Heal OR
 ship — never both in one run.
 
 PHASE 0 — Load the contract and the memory.
+  Read prompts/PRINCIPLES.md before doing anything else; cite the principle id (P-N) you're acting under in any contested decision.
   Read, in order: `AGENTS.md`, `docs/LESSONS.md`, `docs/backlog/README.md`.
   AGENTS.md's **"## Agent parameters"** section is authoritative for THIS project:
   it names the EXACT gating checks, the agent BRANCH PREFIXES, the LOCAL GATE
