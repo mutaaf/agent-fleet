@@ -90,3 +90,21 @@ comment rather than `gh pr merge --admin` (admin merge violates the
 "never bypass branch protection" Hard NO). Do NOT use `--admin` to
 unstick. The PR can sit with auto-merge armed and complete itself the
 moment CI fires.
+
+## 2026-05-27 — `$(cat file)` strips trailing newlines; tests that "restore" via command substitution silently mutate the file under test
+
+While shipping ticket 0018, the first version of `tests/principles.sh`
+backed up `prompts/PRINCIPLES.md` with `ORIGINAL="$(cat "$PRINCIPLES")"`
+and restored it with `printf '%s' "$ORIGINAL" > "$PRINCIPLES"`. Bash
+command substitution strips ALL trailing newlines from the captured
+output (POSIX behavior, not a bug), so the round-trip dropped the
+file's final `\n` even though the test reported success. Symptom on
+disk: `tail -c 4` shows `e.` instead of `e.\n`. The agent's local
+`git status` showed the (unintended) modification only because the
+test had run; CI would have caught it via the diff but only by
+coincidence. Fix: back up with `cp "$file" "$BACKUP"` and restore with
+`cp "$BACKUP" "$file"` — byte-exact, newline-preserving. NEVER use
+`$(cat …)` for content that is later written back to disk. Same rule
+applies to `read -d ''` and `mapfile`, both of which can also clip
+terminators in subtle ways. When in doubt, copy files; only use
+command substitution for content you're about to grep or compare.
