@@ -1,7 +1,7 @@
 ---
 id: 0016
 title: events.jsonl size-based rotation with retained archives
-status: groomed
+status: in-progress
 priority: P2
 area: telemetry
 created: 2026-05-26
@@ -129,4 +129,9 @@ Each box maps 1:1 to a test scenario in `tests/events-rotation.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-27 — implementation-dev: picked up. Plan: write `tests/events-rotation.sh`
+  with one block per AC, add `fleet_rotate_events` + integration into
+  `fleet_emit_event` in `lib/common.sh` (size helper via `stat -f %z` / `stat -c %s`,
+  one-time guard via `FLEET_EVENTS_ROTATE_CHECKED`), wire `events_size` check into
+  `bin/fleet doctor`, extend `tests/tail.sh` with a rotation-mid-tail regression,
+  document the new event type + rotation contract in `AGENTS.md § Telemetry`.
