@@ -74,6 +74,18 @@ the contract, not suggestions.
   against this file via the `review` subagent and either signs off with
   `--comment` (auto-merge proceeds on CI-green) or `--request-changes`.
 
+## Doctrine
+
+[`prompts/PRINCIPLES.md`](prompts/PRINCIPLES.md) is the constitutional layer.
+It names the behavioral principles every agent in the loop follows (`P-1`
+smallest viable change; `P-2` tests-first; `P-3` heal in-flight before new
+work; `P-4` ship the top groomed ticket; `P-5` operator confidence over
+feature richness; `P-6` telemetry is the source of truth; plus extras).
+The Hard NOs above are automatic rejections; the per-phase prompts in
+`prompts/*.prompt.md` are mechanics; PRINCIPLES.md is the layer reviewers
+and authors grade contested decisions against. Agents cite the `P-N` id
+they're acting under whenever a decision is non-obvious.
+
 ## Telemetry
 
 Every runner appends typed events to a single JSONL file per slug so that

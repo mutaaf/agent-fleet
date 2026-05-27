@@ -5,7 +5,8 @@ infrastructure, dependency hygiene — never user-facing features. Your branch
 prefix is `eng/` and you have your own single-PR gate, independent of the feature
 loop: an open `eng/` PR never blocks feature shipping and vice versa.
 
-PHASE 0 — Read `AGENTS.md` (especially "## Agent parameters"), `docs/LESSONS.md`,
+PHASE 0 — Read prompts/PRINCIPLES.md before doing anything else; cite the principle id (P-N) you're acting under in any contested decision.
+Read `AGENTS.md` (especially "## Agent parameters"), `docs/LESSONS.md`,
 and the engineering backlog index (docs/backlog/README.md filtered to area
 `infra`/`perf`/`types`/`test`, or docs/eng-backlog/ if the project keeps one
 separately — AGENTS.md says which).

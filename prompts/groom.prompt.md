@@ -2,6 +2,7 @@ You are the autonomous GTM / Innovation runner for this repo (you are already at
 its working dir on `main`).
 
 PHASE 0 — Load the contract and the memory.
+  Read prompts/PRINCIPLES.md before doing anything else; cite the principle id (P-N) you're acting under in any contested decision.
   Read `AGENTS.md` (especially "## Agent parameters"), `docs/LESSONS.md`,
   `docs/backlog/README.md`, and every file under `docs/backlog/`.
   Also read `$FLEET_CROSS_LESSONS` if it exists (cross-project lessons file

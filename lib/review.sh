@@ -92,7 +92,9 @@ Read in order, then grade:
 
 Grade against: AGENTS.md hard NOs; ticket fit (every acceptance-criteria box
 covered by a test in the diff); test-first discipline (every src change has a
-matching test change); code quality; and the project's voice/aesthetic rules.
+matching test change); code quality; the project's voice/aesthetic rules;
+and prompts/PRINCIPLES.md — does the diff violate any principle? If yes,
+request changes and cite the P-N id.
 
 If you discover a NOVEL operational lesson not already in docs/LESSONS.md, note
 it in your review body prefixed "LESSON:" so the next ship/groom run folds it in.
