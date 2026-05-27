@@ -1,7 +1,7 @@
 ---
 id: 0018
 title: prompts/PRINCIPLES.md codifies the loop's unwritten behavioral doctrine
-status: groomed
+status: in-progress
 priority: P2
 area: governance
 created: 2026-05-26
@@ -134,4 +134,10 @@ Each box maps 1:1 to a test scenario in `tests/principles.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-27 — implementation-dev started. Branched `feat/0018-prompts-principles`.
+  Plan: tests-first (pure-grep `tests/principles.sh`, one assertion per AC box),
+  then author `prompts/PRINCIPLES.md` with P-1..P-6 (plus extras as warranted),
+  add the PHASE 0 directive to the three prompt files, add the rubric bullet
+  to `lib/review.sh`, add a `## Doctrine` cross-reference to `AGENTS.md`, and
+  log the entry in `prompts/CHANGELOG.md`. PR body must carry
+  `Reinstall: all projects`.
