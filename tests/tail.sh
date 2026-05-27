@@ -338,6 +338,53 @@ fi
 echo "ok: AC#7 exact stdout via diff"
 
 # ========================================================================
+# AC #R (ticket 0016 cross-ticket regression) — `tail -F` must survive a
+#       rotation of events.jsonl: we start `fleet tail iso --since 1h`,
+#       move the live events.jsonl into events.jsonl.archive/<stamp>.jsonl
+#       (simulating fleet_rotate_events), recreate an empty events.jsonl,
+#       append a fresh event, and assert that the new event still shows
+#       up in the tail's stdout. Capital-F `tail -F` follows by name, not
+#       file descriptor, so this MUST work without additional plumbing.
+# ========================================================================
+ROT_FIXTURE="$TMP/rot-projects"
+mkdir -p "$ROT_FIXTURE/rot"
+cat > "$ROT_FIXTURE/rot/agents.config.sh" <<'CFG'
+SLUG="rotiso"
+PROJECT_NAME="RotIso"
+NAMESPACE="com.rotiso"
+REPO_URL="https://github.com/example/rotiso"
+SELF_CANCEL="20990101"
+CFG
+ROT_EVENTS="$HOME/.cache/rotiso-agent/events.jsonl"
+ROT_ARCHIVE="$HOME/.cache/rotiso-agent/events.jsonl.archive"
+mkdir -p "$(dirname "$ROT_EVENTS")" "$ROT_ARCHIVE"
+: > "$ROT_EVENTS"
+emit "$ROT_EVENTS" "$(( FAKE_NOW - 5 ))" rotiso ship pre_rotate kind=before
+
+OUT="$TMP/out.rotate.txt"
+FLEET_DISCOVERY_ROOT="$ROT_FIXTURE" "$FLEET" tail rotiso > "$OUT" 2>&1 &
+ROT_PID=$!
+# Give tail -F time to attach to the file.
+sleep 1
+
+# Rotate: move the live file into the archive, then recreate it. This is
+# the exact sequence fleet_rotate_events performs in lib/common.sh.
+mv "$ROT_EVENTS" "$ROT_ARCHIVE/19700101-000000.jsonl"
+: > "$ROT_EVENTS"
+sleep 1
+# Emit a fresh event into the NEW events.jsonl after the rotation.
+emit "$ROT_EVENTS" "$(( FAKE_NOW - 1 ))" rotiso ship post_rotate kind=after
+sleep 2
+stop_tail "$ROT_PID"
+
+if ! grep -q 'rotiso/ship  post_rotate  kind=after' "$OUT"; then
+  echo "FAIL: AC#R tail -F missed the post-rotation event"
+  cat "$OUT"
+  exit 1
+fi
+echo "ok: AC#R fleet tail survives events.jsonl rotation"
+
+# ========================================================================
 # AC #8 — README "Daily ops" section contains a one-line callout for
 #         `fleet tail`.
 # ========================================================================

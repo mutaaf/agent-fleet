@@ -1,7 +1,7 @@
 ---
 id: 0016
 title: events.jsonl size-based rotation with retained archives
-status: in-progress
+status: shipped
 priority: P2
 area: telemetry
 created: 2026-05-26
@@ -135,3 +135,16 @@ Each box maps 1:1 to a test scenario in `tests/events-rotation.sh`.
   one-time guard via `FLEET_EVENTS_ROTATE_CHECKED`), wire `events_size` check into
   `bin/fleet doctor`, extend `tests/tail.sh` with a rotation-mid-tail regression,
   document the new event type + rotation contract in `AGENTS.md § Telemetry`.
+- 2026-05-27 — implementation-dev: shipped. `fleet_rotate_events` added to
+  `lib/common.sh` adjacent to `fleet_emit_event`, with a `_fleet_file_size`
+  helper covering both `stat -f %z` (macOS) and `stat -c %s` (Linux). The
+  guard `FLEET_EVENTS_ROTATE_CHECKED` is set BEFORE the recursive
+  `events_rotated` emit so the inner call short-circuits cleanly. Doctor's
+  new `events_size` check uses python3 (with a node fallback) to validate
+  every line is JSON; size-only WARN when the file is over threshold AND no
+  archive < 7d old exists; PASS otherwise. `tests/tail.sh` got a new AC#R
+  block that simulates the exact mv+truncate sequence and asserts the
+  post-rotation event still streams via `tail -F`. Local gate green
+  (`shellcheck -S warning`, `bash -n`, `check-backlog`,
+  `check-prompts-changelog`); `tests/events.sh`, `tests/doctor.sh`,
+  `tests/tail.sh`, and `tests/events-rotation.sh` all pass.

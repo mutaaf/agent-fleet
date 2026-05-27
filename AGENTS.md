@@ -82,8 +82,10 @@ scraping `claude` transcripts. The contract is small enough to fit on a
 postcard.
 
 - **File**: `$CACHE_DIR/events.jsonl` (i.e. `~/.cache/<slug>-agent/events.jsonl`)
-- **Format**: one JSON object per line, append-only, never truncated. A future
-  ticket will cover GC if size becomes an issue — for now the channel grows.
+- **Format**: one JSON object per line, append-only, never truncated. Rotates
+  at `FLEET_EVENTS_MAX_BYTES` (default 1 MiB) into
+  `events.jsonl.archive/<UTC-stamp>.jsonl`; the contract above applies to all
+  files in the channel including archives.
 - **Writer**: `fleet_emit_event <type> [k=v ...]` in `lib/common.sh`. Shell-only,
   no `jq` dependency for writing (JSON is hand-composed via `_json_escape`).
   Readers may use `jq` freely.
@@ -129,6 +131,14 @@ postcard.
     the squash/merge commit being reverted. Ticket 0017. Consumers can
     treat this like any other PR-related event (it carries `slug` +
     `phase=rollback` like the rest).
+  - `events_rotated {archived, bytes}` — emitted by `fleet_rotate_events`
+    (ticket 0016) when `events.jsonl` reaches `FLEET_EVENTS_MAX_BYTES`
+    and is moved into `events.jsonl.archive/<UTC-stamp>.jsonl`. `archived`
+    is the absolute path of the rotated-out file; `bytes` is its size in
+    bytes at the moment of rotation. The marker is written as the FIRST
+    line of the new (empty) events.jsonl, so consumers tailing the
+    channel see an explicit rotation boundary without having to compare
+    inode numbers.
   - `trainee_pr_opened {number, remaining}` — emitted by the dev agent
     (driven from `prompts/ship.prompt.md`) immediately after `gh pr
     create` when `FLEET_TRAINEE_REMAINING > 0`, i.e. the project's
