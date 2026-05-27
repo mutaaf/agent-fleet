@@ -36,4 +36,4 @@ ones, `review` grades them.
 | 0010 | AGENT_DRY_RUN end-to-end mode | P2 | shipped | safety |
 | 0013 | prompts/CHANGELOG.md + fleet prompts-diff explain drift | P2 | shipped | governance |
 | 0016 | events.jsonl size-based rotation with retained archives | P2 | shipped | telemetry |
-| 0018 | prompts/PRINCIPLES.md codifies the loop's unwritten behavioral doctrine | P2 | in-progress | governance |
+| 0018 | prompts/PRINCIPLES.md codifies the loop's unwritten behavioral doctrine | P2 | shipped | governance |

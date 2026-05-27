@@ -1,7 +1,7 @@
 ---
 id: 0018
 title: prompts/PRINCIPLES.md codifies the loop's unwritten behavioral doctrine
-status: in-progress
+status: shipped
 priority: P2
 area: governance
 created: 2026-05-26
@@ -141,3 +141,11 @@ Each box maps 1:1 to a test scenario in `tests/principles.sh`.
   to `lib/review.sh`, add a `## Doctrine` cross-reference to `AGENTS.md`, and
   log the entry in `prompts/CHANGELOG.md`. PR body must carry
   `Reinstall: all projects`.
+- 2026-05-27 — shipped. PR
+  [#28](https://github.com/mutaaf/agent-fleet/pull/28) merged green
+  (`shellcheck` + `validate` both SUCCESS). Authored 8 principles
+  (P-1..P-8) in 113 lines, well under the 150-line cap. `tests/principles.sh`
+  uses a `cp` byte-exact backup for the SHA round-trip so the file under
+  test is restored verbatim (a `$(cat)` round-trip strips trailing
+  newlines — minor but worth noting). No sibling tickets spawned;
+  scope held to the original ticket.
