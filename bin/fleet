@@ -890,6 +890,94 @@ doctor_run_checks() {
   esac
   echo "trainee_mode|$tm_status|$tm_reason"
 
+  # check: events_size (ticket 0016)
+  # Surfaces the health of $CACHE_DIR/events.jsonl per project:
+  #   PASS when the file is under FLEET_EVENTS_MAX_BYTES (default 1 MiB) OR
+  #        the events.jsonl.archive directory shows a rotation marker file
+  #        mtime within the last 7 days (rotation is doing its job).
+  #   WARN when the file is at/above the threshold AND no recent rotation
+  #        marker exists — `lib/common.sh` will rotate on the next emit,
+  #        but if a host has gone quiet (no agents firing) the file may be
+  #        oversized for a while and the operator should know.
+  #   FAIL when ANY line in events.jsonl does not parse as JSON. Best-
+  #        effort: a missing file is PASS (nothing to check). The malformed
+  #        case never aborts the doctor pass — we always emit the row.
+  local es_status="PASS" es_reason=""
+  local es_cache="$HOME/.cache/${slug}-agent"
+  local es_events="$es_cache/events.jsonl"
+  local es_archive_dir="$es_cache/events.jsonl.archive"
+  local es_max="${FLEET_EVENTS_MAX_BYTES:-1048576}"
+  if [ -f "$es_events" ]; then
+    # Malformed-line check first: any single line failing JSON.parse promotes
+    # to FAIL regardless of size. We use python3 (ships with macOS Command
+    # Line Tools) to avoid a node hard-dep here; fall back to node if python3
+    # is missing. If neither exists we silently skip the parse check (PASS).
+    local es_bad=""
+    if command -v python3 >/dev/null 2>&1; then
+      es_bad="$(python3 - "$es_events" <<'PY' 2>/dev/null || true
+import json, sys
+path = sys.argv[1]
+try:
+  with open(path, encoding="utf-8") as f:
+    for i, line in enumerate(f, start=1):
+      s = line.strip()
+      if not s:
+        continue
+      try:
+        json.loads(s)
+      except Exception:
+        print(i)
+        break
+except Exception:
+  pass
+PY
+)"
+    elif command -v node >/dev/null 2>&1; then
+      es_bad="$(node -e '
+        const fs = require("fs");
+        const lines = fs.readFileSync(process.argv[1], "utf8").split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          const s = lines[i].trim();
+          if (!s) continue;
+          try { JSON.parse(s); }
+          catch (e) { console.log(i + 1); process.exit(0); }
+        }
+      ' "$es_events" 2>/dev/null || true)"
+    fi
+    if [ -n "$es_bad" ]; then
+      es_status="FAIL"
+      es_reason="events.jsonl line $es_bad does not parse as JSON"
+    else
+      # Size check + rotation-marker freshness.
+      local es_size
+      es_size=$(stat -f %z "$es_events" 2>/dev/null || stat -c %s "$es_events" 2>/dev/null || echo 0)
+      if [ "$es_size" -ge "$es_max" ]; then
+        # Look for a recent (< 7d) archive file: a rotation has fired
+        # recently and the next emit will rotate this one too.
+        local es_now es_recent=""
+        es_now=$(date -u +%s)
+        if [ -d "$es_archive_dir" ]; then
+          local f
+          for f in "$es_archive_dir"/*.jsonl; do
+            [ -f "$f" ] || continue
+            local fm fage
+            fm=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)
+            fage=$(( es_now - fm ))
+            if [ "$fage" -lt 604800 ]; then
+              es_recent="$f"
+              break
+            fi
+          done
+        fi
+        if [ -z "$es_recent" ]; then
+          es_status="WARN"
+          es_reason="events.jsonl is ${es_size}B (>= ${es_max}B) with no rotation in the last 7d"
+        fi
+      fi
+    fi
+  fi
+  echo "events_size|$es_status|$es_reason"
+
   # check: groom_cadence (ticket 0007)
   # Surfaces whether `lib/groom.sh` has throttled itself because the
   # backlog ran dry. The signal is the per-slug marker file

@@ -866,12 +866,119 @@ _json_escape() {
   printf '%s' "$out"
 }
 
+# --- size-based rotation (ticket 0016) ------------------------------------
+# events.jsonl is append-only by contract. Without rotation it grows
+# unbounded across months of runs (~6 events/ship × 24 ships/day × N days),
+# which slows down every consumer that scans the file (`fleet tail`,
+# `fleet digest`, jq-on-an-old-record audits). Rotation keeps the
+# line-addressable working file bounded while preserving every historical
+# event under `events.jsonl.archive/<UTC-stamp>.jsonl` so the contract
+# in AGENTS.md § Telemetry ("append-only, never truncated") still holds
+# across the channel as a whole.
+#
+# Threshold: ${FLEET_EVENTS_MAX_BYTES:-1048576} (default 1 MiB). Tunable
+# via env so tests can exercise the rotation path without seeding a real
+# MiB of data on disk, and so an operator can shrink the live file
+# proactively on a tight host.
+#
+# Archive naming: `<YYYYMMDD>-<HHMMSS>.jsonl` (UTC). Sortable, collision-
+# free at one-second granularity (rotation runs at most once per process
+# AND emit-frequency is well below 1 Hz in practice), no zone ambiguity.
+#
+# Atomicity: `mv` is a same-filesystem rename (both paths live under
+# $CACHE_DIR), so a concurrent emitter that races a rotation lands either
+# in the archive (event preserved) or in the new file (event preserved) —
+# no event is lost. The per-slug flock from ticket 0001 already serializes
+# runners; this is the residual "fleet_emit_event called from outside the
+# locked region" case (e.g. by the dev agent inside `prompts/ship.prompt.md`).
+
+# _fleet_file_size <path>  — echo the file's size in bytes via `stat`. We
+# avoid `du -b` (GNU-only) and `wc -c` (reads the file). BSD `stat -f %z`
+# is macOS; GNU `stat -c %s` is Linux. The kit's hosts are macOS today
+# but the Linux variant keeps test CI portable. Echoes "0" on a missing
+# file so callers can do a single threshold comparison without an exists check.
+_fleet_file_size() {
+  local path="${1:?_fleet_file_size: path required}"
+  [ -f "$path" ] || { echo 0; return 0; }
+  stat -f %z "$path" 2>/dev/null \
+    || stat -c %s "$path" 2>/dev/null \
+    || echo 0
+}
+
+# fleet_rotate_events  — rotate $CACHE_DIR/events.jsonl into the archive when
+# it crosses the size threshold. Returns 0 in every path (rotation is a
+# best-effort house-keeping operation; the caller must never abort on it).
+#
+# Sequence on trigger:
+#   1. mkdir -p $CACHE_DIR/events.jsonl.archive   (lazy — only when needed).
+#   2. mv events.jsonl archive/<UTC-stamp>.jsonl  (atomic same-fs rename).
+#   3. : > events.jsonl                           (truncate-create the new file).
+#   4. fleet_emit_event events_rotated archived=<path> bytes=<n>  — recurse
+#      back into fleet_emit_event. The FLEET_EVENTS_ROTATE_CHECKED guard
+#      set in step 5 prevents this nested call from re-evaluating the
+#      threshold against the freshly-empty file.
+#   5. FLEET_EVENTS_ROTATE_CHECKED=1 export — done LAST so the recursive
+#      emit in step 4 is the only "free" emit-without-check call.
+#
+# Note we set the guard BEFORE the recursive emit; otherwise the inner
+# fleet_emit_event would re-enter fleet_rotate_events, see the brand-new
+# (empty) file, return immediately, and we'd just waste one stat call. The
+# guard inside fleet_emit_event short-circuits this cleanly.
+fleet_rotate_events() {
+  local events="$CACHE_DIR/events.jsonl"
+  local max="${FLEET_EVENTS_MAX_BYTES:-1048576}"
+  local size
+  size="$(_fleet_file_size "$events")"
+  # No file or under threshold = no-op. Returns 0; caller proceeds.
+  if [ "$size" -lt "$max" ]; then
+    return 0
+  fi
+
+  local archive_dir="$CACHE_DIR/events.jsonl.archive"
+  mkdir -p "$archive_dir" 2>/dev/null || return 0
+
+  local stamp; stamp="$(date -u +%Y%m%d-%H%M%S)"
+  local archived="$archive_dir/${stamp}.jsonl"
+
+  # If two rotations land in the same second (vanishingly unlikely given
+  # the one-per-process guard, but the kit's tests exercise threshold=100
+  # paths), append a suffix so we never clobber a prior archive.
+  if [ -e "$archived" ]; then
+    local i=1
+    while [ -e "${archive_dir}/${stamp}-${i}.jsonl" ]; do
+      i=$(( i + 1 ))
+    done
+    archived="${archive_dir}/${stamp}-${i}.jsonl"
+  fi
+
+  mv "$events" "$archived" 2>/dev/null || return 0
+  : > "$events" 2>/dev/null || return 0
+
+  # Mark the guard BEFORE the recursive emit so the inner call short-circuits.
+  FLEET_EVENTS_ROTATE_CHECKED=1
+  export FLEET_EVENTS_ROTATE_CHECKED
+
+  fleet_emit_event events_rotated "archived=$archived" "bytes=$size" || true
+  return 0
+}
+
 # fleet_emit_event <type> [k=v ...]  — append one JSON line to events.jsonl.
 # Every event carries ts (ISO8601 UTC), slug, phase, type. Extras are taken
 # verbatim as k=v pairs and rendered as JSON keys. Best-effort: failures here
 # never break the runner (caller usually invokes with `|| true`).
+#
+# Ticket 0016: before appending, call fleet_rotate_events ONCE per process
+# (guarded by FLEET_EVENTS_ROTATE_CHECKED). The guard means a high-frequency
+# emitter pays the stat() check exactly once per process invocation, which
+# matches the cadence of every real producer (ship/groom/review/eng each
+# spawn a fresh process per launchd fire).
 fleet_emit_event() {
   local type="${1:?fleet_emit_event: type required}"; shift || true
+  if [ -z "${FLEET_EVENTS_ROTATE_CHECKED:-}" ]; then
+    FLEET_EVENTS_ROTATE_CHECKED=1
+    export FLEET_EVENTS_ROTATE_CHECKED
+    fleet_rotate_events || true
+  fi
   local ts slug phase line kv k v esc_v
   ts="$(date -u +%FT%TZ)"
   slug="${SLUG:-unknown}"
