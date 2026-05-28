@@ -1,7 +1,7 @@
 ---
 id: 0019
 title: fleet overview prints a single-glance cross-project health table
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-05-28
@@ -156,4 +156,27 @@ Each box maps 1:1 to a test scenario in `tests/overview.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-28 — implementation-dev: branch `feat/0019-fleet-overview-cross-project-table`
+  opened. Interpretation of the engineering notes:
+  - `overview` dispatch function name is safe (no coreutils collision —
+    LESSONS 2026-05-26 about `tail` shadowing). Verified `command -v
+    overview` returns nothing in a fresh shell. Kept the dispatcher as
+    `overview` per the ticket; no `_cmd` suffix needed.
+  - `REVIEW` column source choice: `events.jsonl` has no `review_blocked`
+    event type today, and the ticket explicitly authorises the fallback
+    of `gh pr list --search "review:changes-requested"` per the cheapest-
+    wins clause. We use the gh fallback for the absolute count
+    (`SENDBK`) AND for the per-project review timestamp (`REVIEW`'s "ok
+    Nh"/"block Nh" age). When `gh` is offline / unauthenticated the
+    `IN-FLIGHT`, `REVIEW`, and `SENDBK` columns degrade to `—` / 0 / `—`
+    respectively — the local-only columns (`SHIP`, `$TODAY`, `STATE`
+    minus `STUCK`) still render. AC#7 covers this with a stubbed gh
+    that exits 4.
+  - State derivation reuses `digest_state` (already in bin/fleet) plus
+    one delta: `digest_state` doesn't compute `HEAL` or `STUCK` from
+    `gh`. The ticket asks `overview` to ADD those two; we do that in a
+    second pass inside `overview()` itself, so `digest_state`'s
+    predicates stay the single source of truth for `EXPIRED`/`PAUSED`/
+    `OVER-BUDGET` (and `THROTTLED`, which `overview` doesn't surface).
+    AC#2 priority order honoured: `EXPIRED` > `PAUSED` > `OVER-BUDGET` >
+    `STUCK` > `HEAL` > `OK`.
