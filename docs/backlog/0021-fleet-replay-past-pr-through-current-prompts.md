@@ -1,7 +1,7 @@
 ---
 id: 0021
 title: fleet replay re-runs a past merged PR through the current prompts in dry-run
-status: in-progress
+status: shipped
 priority: P2
 area: governance
 created: 2026-05-28
@@ -191,3 +191,6 @@ Each box maps 1:1 to a test scenario in `tests/replay.sh`.
   We DO append to `runs.jsonl` so cost accounting reflects the replay.
   No changes to `lib/common.sh` — `fleet_log_init` stays out of this. The
   prompt label is just a string we tag.
+- 2026-05-28 — shipped via PR #36 (merge commit fe8015cd). Both gating CI
+  checks (`shellcheck`, `validate`) green on first push; auto-merge fired
+  ~75s after open. No regressions in the rest of `tests/*.sh`.
