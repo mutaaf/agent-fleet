@@ -1,7 +1,7 @@
 ---
 id: 0020
 title: Heal phase detects infra-flake CI failures and reruns instead of code-fixing
-status: in-progress
+status: shipped
 priority: P1
 area: safety
 created: 2026-05-28
@@ -171,3 +171,10 @@ Each box maps 1:1 to a test scenario in `tests/heal-infra-flake.sh`.
   `fleet_match_infra_flake` after `fleet_emit_event`, splice a pre-step
   into `prompts/ship.prompt.md` PHASE 1 RED branch, append AGENTS.md
   Telemetry bullet for `infra_flake_rerun`, add CHANGELOG entry.
+- 2026-05-28: shipped via PR #34 (squash-merged after both gating
+  checks went green). Final API: `fleet_match_infra_flake <log-file>`,
+  `fleet_infra_flake_already_rerun <token> <run_id> [window]`,
+  `FLEET_HEAL_CATALOG` override constant, `FLEET_HEAL_PATTERNS` array
+  shape `<token>|<ERE>`. No sibling tickets opened; no novel LESSON
+  appended (the failure modes captured here are exactly the ones the
+  catalog now codifies, so the lesson is the code).
