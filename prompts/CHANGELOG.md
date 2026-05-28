@@ -15,6 +15,28 @@ The companion command is `bin/fleet prompts-diff` (ticket 0013):
 - `fleet prompts-diff --changelog` — print all entries newer than the
   installed-prompts SHA (verbatim markdown from this file).
 
+## 2026-05-28 — review send-backs draft LESSONS skeletons for operator promotion
+
+Adds `P-9` to `prompts/PRINCIPLES.md`: every `--request-changes` review the
+review subagent posts ALSO drops a date-stamped, HTML-comment-marked DRAFT
+block at the top of `docs/LESSONS.md` via the new
+`_review_emit_lesson_draft <pr> <body-file>` helper (ticket 0022, sourced
+from `lib/common.sh`). The block sits AFTER the file header and BEFORE the
+first promoted `## YYYY-MM-DD` entry; a second send-back on the same PR
+dedupe-replaces the existing block in place rather than stacking. The
+reviewer prompt in `lib/review.sh` gains the mechanism in plain prose —
+the helper is invoked from a tiny `chore/lesson-draft-<N>-<ts>` side-PR
+against `main`, never on the agent PR's own branch (the reviewer is
+read-only on the diff per the existing rubric). A new event type
+`lesson_draft_emitted {pr, headline}` lands in `AGENTS.md § Telemetry`
+and fires from the helper, giving operators a draft-promotion debt
+counter straight from `events.jsonl`. Sign-off (`--comment`) reviews
+explicitly do NOT touch LESSONS — only blocking verdicts carry the
+failure mode worth remembering. Operator promotion path is unchanged:
+edit `docs/LESSONS.md`, delete the `<!-- DRAFT ... -->` markers, refine
+the heading. The HTML comment markers make `grep -v 'DRAFT'` trivial
+for any consumer that wants only promoted entries.
+
 ## 2026-05-28 — ship PHASE 1 RED gains an infra-flake pre-step
 
 The heal step's contract was "red gating check → run the local gate,

@@ -1112,3 +1112,133 @@ fleet_infra_flake_already_rerun() {
   done < "$events"
   return 1
 }
+
+# --- reviewer send-back LESSONS drafter (ticket 0022) ---------------------
+# When `lib/review.sh` posts a `--request-changes` review, it ALSO calls this
+# helper to drop a date-stamped, HTML-comment-marked DRAFT block at the top
+# of docs/LESSONS.md so the operator can promote (or delete) it later. The
+# whole point is that the failure-to-memory loop becomes one operator edit
+# instead of "remember to copy the review body by hand."
+#
+# Args:
+#   $1 — PR number (integer, used in marker + headline)
+#   $2 — absolute path to a file containing the review body verbatim
+#   $3 — (optional) absolute path to the LESSONS.md to mutate; defaults
+#        to "docs/LESSONS.md" relative to cwd. Tests pass a fixture path.
+#
+# Behavior:
+#   1. Reads the body verbatim from $2 (cp into a temp buffer — never
+#      $(cat file), per LESSONS 2026-05-27).
+#   2. Builds the draft block:
+#        <!-- DRAFT: reviewer send-back, PR #<N>, <YYYY-MM-DD> -->
+#        ## <YYYY-MM-DD> — DRAFT — <first 80 chars of body's first line>
+#
+#        (From review of PR #<N> — promote or delete.)
+#
+#        <full body, verbatim>
+#        <!-- /DRAFT -->
+#   3. Dedupe: if the LESSONS already contains an opening marker for the
+#      same PR number, REPLACE the existing block in place (header→/DRAFT)
+#      rather than prepend a second one.
+#   4. Otherwise insert AFTER the first heading line of the file
+#      (`^# ` at the very top) and BEFORE the first non-draft `## YYYY-MM-DD`
+#      entry, so promoted lessons keep their positions.
+#   5. Emits `lesson_draft_emitted pr=<N> headline=<first 80 chars>` exactly
+#      once per call.
+#
+# All file mutation goes through a tmp file + `mv` (LESSONS 2026-05-27).
+# Returns 0 on success, non-zero on usage error. Never silently no-ops on
+# missing inputs — caller (lib/review.sh) is responsible for guarding the
+# call on a non-empty body + the request-changes verdict.
+_review_emit_lesson_draft() {
+  local pr="${1:?_review_emit_lesson_draft: PR number required}"
+  local body_file="${2:?_review_emit_lesson_draft: body-file path required}"
+  local lessons="${3:-docs/LESSONS.md}"
+  [ -f "$body_file" ] || { echo "_review_emit_lesson_draft: body-file $body_file missing" >&2; return 1; }
+  [ -f "$lessons" ] || { echo "_review_emit_lesson_draft: lessons-file $lessons missing" >&2; return 1; }
+
+  local today first_line headline
+  today="$(date -u +%Y-%m-%d)"
+  # First non-empty line of the body, trimmed and truncated to 80 chars.
+  first_line="$(awk 'NF { print; exit }' "$body_file" | tr -d '\r')"
+  headline="$(printf '%s' "$first_line" | cut -c1-80)"
+
+  # Build the draft block in a temp file. Body is appended verbatim from the
+  # caller's file — we never round-trip through a shell variable to avoid the
+  # $(cat) newline-strip trap.
+  local tmpdir block buf
+  tmpdir="$(mktemp -d -t fleet-lesson-draft.XXXXXX)"
+  block="$tmpdir/block.md"
+  buf="$tmpdir/lessons.new"
+  {
+    printf -- '<!-- DRAFT: reviewer send-back, PR #%s, %s -->\n' "$pr" "$today"
+    printf -- '## %s — DRAFT — %s\n' "$today" "$headline"
+    printf -- '\n'
+    printf -- '(From review of PR #%s — promote or delete.)\n' "$pr"
+    printf -- '\n'
+    cat "$body_file"
+    # Ensure the closing marker sits on its own line even if the body lacks
+    # a trailing newline.
+    case "$(tail -c1 "$body_file" 2>/dev/null || true)" in
+      "") ;;
+      *) printf -- '\n' ;;
+    esac
+    printf -- '<!-- /DRAFT -->\n'
+  } > "$block"
+
+  # Look for an existing draft marker for THIS PR.
+  if grep -qE "^<!-- DRAFT: reviewer send-back, PR #${pr}," "$lessons"; then
+    # Dedupe-replace path. Use awk: when we hit the opening marker for this
+    # PR, swap in the new block and skip lines until the matching close.
+    awk -v pr="$pr" -v block_file="$block" '
+      BEGIN { skipping = 0 }
+      {
+        if (skipping) {
+          if ($0 == "<!-- /DRAFT -->") { skipping = 0 }
+          next
+        }
+        if ($0 ~ "^<!-- DRAFT: reviewer send-back, PR #" pr ",") {
+          while ((getline line < block_file) > 0) print line
+          close(block_file)
+          skipping = 1
+          next
+        }
+        print
+      }
+    ' "$lessons" > "$buf"
+  else
+    # Prepend path. Insert AFTER the first heading line (`^# ` at file top)
+    # and BEFORE the first non-draft `## YYYY-MM-DD` entry. If no such
+    # entry exists, insert after the first blank line that follows the
+    # header preamble.
+    awk -v block_file="$block" '
+      BEGIN { inserted = 0; seen_header = 0 }
+      {
+        if (!inserted && seen_header && $0 ~ /^## [0-9]{4}-[0-9]{2}-[0-9]{2}/) {
+          while ((getline line < block_file) > 0) print line
+          close(block_file)
+          print ""
+          inserted = 1
+        }
+        if (!seen_header && $0 ~ /^# /) { seen_header = 1 }
+        print
+      }
+      END {
+        if (!inserted) {
+          # Fallback — append at end of file. Should rarely happen since
+          # LESSONS.md always has at least one promoted entry by the time
+          # this helper is exercised in production, but the test harness
+          # might feed an empty body of promoted entries.
+          while ((getline line < block_file) > 0) print line
+          close(block_file)
+        }
+      }
+    ' "$lessons" > "$buf"
+  fi
+
+  mv "$buf" "$lessons"
+  rm -rf "$tmpdir"
+
+  fleet_emit_event lesson_draft_emitted "pr=$pr" "headline=$headline" || true
+  return 0
+}
