@@ -2262,6 +2262,426 @@ if [ "$CMD" = "kickstart" ]; then
   kickstart_cmd "$@"
 fi
 
+# --- replay ---------------------------------------------------------------
+# Ticket 0021. `fleet replay <slug> --pr <N> [--phase ship|review] [--out
+# FILE] [--request-changes-ok]` re-runs the kit's CURRENT prompts against
+# a past (merged OR open) PR in dry-run, so an operator who just edited
+# `prompts/PRINCIPLES.md` or `prompts/ship.prompt.md` can sanity-check the
+# change against real historical behavior BEFORE the live loop fires under
+# it.
+#
+# Substrate: ticket 0010's `AGENT_DRY_RUN=1` already tool-locks `claude`
+# with `--allowedTools none`. We invoke claude directly here (not
+# `fleet_run_claude`) because:
+#   - replay is operator-invoked, not a launchd runner — there's no
+#     `fleet_log_init` to chain off of, and we don't want a log file in
+#     `$LOG_DIR/replay-…` polluting log-mtime-based "last run" surfaces.
+#   - We DO want the same runs.jsonl append shape (cost accounting per
+#     AC#8), so we mirror the JSON layout `fleet_run_claude` writes today
+#     but tag `phase=replay` so `fleet digest` can sort replay calls
+#     from real ship runs.
+#
+# Prompt composition (per the ticket's "User → operator" lens):
+#   --phase review → AGENTS.md + LESSONS.md + ticket + diff + the review
+#                    contract ("VERDICT: sign-off | request-changes" + a
+#                    rationale). The diff is the substance the prompt is
+#                    grading.
+#   --phase ship   → AGENTS.md + LESSONS.md + ticket (NO diff — ship is
+#                    asked "what would you do?", not "is this good?").
+#                    Verdict line: "ACTION: ship | heal | wait | noop".
+#
+# Verdict parsing: we grep the claude `.result` for the first line
+# matching the phase's regex. If no line matches, replay prints
+# `VERDICT: unknown` (or `ACTION: unknown`) and exits 1 — the operator
+# sees the raw output in the saved file.
+#
+# Exit codes:
+#   0  — verdict matches the success condition for the phase.
+#   1  — verdict missing OR doesn't match (the default success is
+#        sign-off/ship/heal; --request-changes-ok flips this).
+#   2  — usage error: PR head isn't an agent feature prefix, missing
+#        flag value, slug not resolved.
+#
+# Naming (LESSONS 2026-05-26): the dispatcher is named `replay()` — no
+# coreutils binary by that name (we checked: `man replay` / `which replay`
+# come up empty on macOS). The function shells out to `claude`, `gh`, and
+# `git` only; nothing collides.
+
+# Resolve slug → manifest path. Echoes the manifest or empty. Reuses the
+# same two-root union pattern as rollback/kickstart (per ticket 0017's
+# engineering notes). We declare a thin wrapper around
+# `rollback_resolve_manifest` rather than duplicating the body so a future
+# discovery-shape change ripples through one site.
+replay_resolve_manifest() {
+  rollback_resolve_manifest "$1"
+}
+
+# Parse the leading "<id>-<slug-tail>" out of an agent headRefName so the
+# operator's "the ticket file is docs/backlog/<NNNN>-…" derivation has a
+# stable input. Returns the part after the feat/ prefix, or empty.
+replay_branch_tail() {
+  local head="$1"
+  case "$head" in
+    feat/*) echo "${head#feat/}" ;;
+    eng/*)  echo "${head#eng/}" ;;
+    *)      echo "" ;;
+  esac
+}
+
+# Compose the prompt body for one phase. Reads files from $checkout (the
+# fresh agent-fleet checkout the function created) and the PR metadata
+# from environment locals the caller already has in scope.
+#
+# Args: $1 phase, $2 checkout dir, $3 ticket-file path (may not exist),
+# $4 diff (already on disk at this path), $5 pr_number, $6 pr_title,
+# $7 head_ref, $8 pr_body, $9 merged_at.
+replay_compose_prompt() {
+  local phase="$1" checkout="$2" ticket_path="$3" diff_path="$4"
+  local pr_number="$5" pr_title="$6" head_ref="$7" pr_body="$8" merged_at="$9"
+
+  # Top matter: shared across phases.
+  printf 'You are replaying the kit'\''s CURRENT %s prompt against a past PR.\n' "$phase"
+  printf 'This is a dry-run: produce only a verdict + rationale.\n\n'
+
+  printf '## PR metadata\n'
+  # Use `printf -- 'fmt' arg` so a leading '-' in the format-line body is
+  # not interpreted as a flag by some printf implementations.
+  printf -- '- number: #%s\n' "$pr_number"
+  printf -- '- title: %s\n' "$pr_title"
+  printf -- '- head: %s\n' "$head_ref"
+  printf -- '- merged_at: %s\n' "${merged_at:-(open)}"
+  printf '\n'
+
+  if [ -f "$checkout/AGENTS.md" ]; then
+    printf '## AGENTS.md (current tree)\n'
+    cat "$checkout/AGENTS.md"
+    printf '\n'
+  fi
+  if [ -f "$checkout/docs/LESSONS.md" ]; then
+    printf '## docs/LESSONS.md (current tree)\n'
+    cat "$checkout/docs/LESSONS.md"
+    printf '\n'
+  fi
+  if [ -n "$ticket_path" ] && [ -f "$ticket_path" ]; then
+    printf '## Ticket\n'
+    cat "$ticket_path"
+    printf '\n'
+  fi
+  if [ -n "$pr_body" ]; then
+    printf '## PR body\n%s\n\n' "$pr_body"
+  fi
+
+  case "$phase" in
+    review)
+      if [ -f "$diff_path" ]; then
+        printf '## Diff (the substance to grade)\n'
+        printf '```\n'
+        cat "$diff_path"
+        printf '\n```\n\n'
+      fi
+      printf '## Review contract\n'
+      printf 'Read prompts/PRINCIPLES.md and AGENTS.md § Hard NOs. Decide whether\n'
+      printf 'this diff would land cleanly under the current rules. Respond with\n'
+      printf 'EXACTLY one line of the form:\n'
+      printf '\n'
+      printf '  VERDICT: sign-off\n'
+      printf '  VERDICT: request-changes\n'
+      printf '\n'
+      printf 'followed by a one-paragraph rationale citing the principle id\n'
+      printf '(P-N) you are acting under, if any.\n'
+      ;;
+    ship)
+      printf '## Ship contract\n'
+      printf 'Read prompts/PRINCIPLES.md, AGENTS.md, docs/LESSONS.md, and the\n'
+      printf 'ticket above. Decide what the ship runner would do RIGHT NOW for\n'
+      printf 'this ticket. Respond with EXACTLY one line of the form:\n'
+      printf '\n'
+      printf '  ACTION: ship\n'
+      printf '  ACTION: heal\n'
+      printf '  ACTION: wait\n'
+      printf '  ACTION: noop\n'
+      printf '\n'
+      printf 'followed by a one-paragraph rationale.\n'
+      ;;
+  esac
+}
+
+# Append a runs.jsonl row for the replay call. Mirrors the shape
+# fleet_run_claude emits (slug/phase/ts_start/ts_end/exit/model/
+# session_id/total_cost_usd/duration_ms/num_turns/usage/is_error/
+# result_head) so cost accounting + `fleet digest` ingest it without
+# special-casing. Best-effort: missing jq → no append, no error.
+replay_append_runs() {
+  local runs_file="$1" claude_json="$2" slug="$3" phase="$4"
+  local ts_start="$5" ts_end="$6" model="$7" claude_exit="$8"
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -e . "$claude_json" >/dev/null 2>&1 || return 0
+  local rec
+  rec="$(jq -c \
+    --arg slug "$slug" --arg phase "$phase" --arg exit "$claude_exit" \
+    --arg s "$ts_start" --arg e "$ts_end" --arg model "$model" \
+    '{slug:$slug,phase:$phase,ts_start:$s,ts_end:$e,exit:($exit|tonumber),model:$model,
+      session_id:.session_id, total_cost_usd:.total_cost_usd, duration_ms:.duration_ms,
+      num_turns:.num_turns, usage:.usage, is_error:.is_error, result_head:((.result//"")[0:500])}' \
+    "$claude_json" 2>/dev/null)"
+  if [ -n "$rec" ]; then
+    mkdir -p "$(dirname "$runs_file")" 2>/dev/null || true
+    printf '%s\n' "$rec" >> "$runs_file"
+  fi
+}
+
+replay() {
+  shift  # drop the leading "replay"
+  local slug_arg="" pr_number="" phase="review" out_path="" want_rc_ok=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pr)        pr_number="${2:-}";  shift 2 ;;
+      --pr=*)      pr_number="${1#--pr=}"; shift ;;
+      --phase)     phase="${2:-review}"; shift 2 ;;
+      --phase=*)   phase="${1#--phase=}"; shift ;;
+      --out)       out_path="${2:-}"; shift 2 ;;
+      --out=*)     out_path="${1#--out=}"; shift ;;
+      --request-changes-ok) want_rc_ok=1; shift ;;
+      --dry)       shift ;;  # the default; accepted for symmetry
+      -h|--help)
+        cat <<USAGE
+fleet replay — re-run the kit's current prompts against a past PR in dry-run.
+
+Usage:
+  fleet replay <slug> --pr <N>                          phase=review (default)
+  fleet replay <slug> --pr <N> --phase ship             phase=ship
+  fleet replay <slug> --pr <N> --request-changes-ok     succeed iff verdict is request-changes
+  fleet replay <slug> --pr <N> --out FILE               write the full claude result to FILE
+
+Composes a prompt input from the PR's metadata + diff (review) or just
+metadata + ticket (ship), the AGENTS.md and docs/LESSONS.md from a fresh
+kit checkout, then invokes claude with --allowedTools none so no
+side-effects land. Prints the parsed verdict line (VERDICT: ... for
+review, ACTION: ... for ship); exit 0 on success, 1 on a missing/wrong
+verdict, 2 on usage error.
+USAGE
+        exit 0 ;;
+      --) shift ;;
+      -*) echo "fleet replay: unknown flag '$1'" >&2; exit 2 ;;
+      *)
+        if [ -z "$slug_arg" ]; then slug_arg="$1"; shift
+        else echo "fleet replay: unexpected extra argument '$1'" >&2; exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$slug_arg" ] || [ -z "$pr_number" ]; then
+    echo "fleet replay: missing <slug> or --pr <N>" >&2
+    echo "usage: fleet replay <slug> --pr <N> [--phase review|ship] [--out FILE] [--request-changes-ok]" >&2
+    exit 2
+  fi
+  case "$phase" in
+    review|ship) ;;
+    *)
+      echo "fleet replay: --phase must be 'review' or 'ship' (got '$phase')" >&2
+      exit 2 ;;
+  esac
+
+  # Resolve slug → manifest → REPO_URL + CACHE_DIR.
+  local manifest
+  manifest="$(replay_resolve_manifest "$slug_arg")"
+  if [ -z "$manifest" ]; then
+    echo "fleet replay: no project with SLUG=$slug_arg found" >&2
+    exit 2
+  fi
+  local slug repo_url repo cache_dir model
+  # shellcheck disable=SC1090  # discovered at runtime
+  eval "$(
+    source "$manifest"
+    echo "slug='${SLUG:-}'"
+    echo "repo_url='${REPO_URL:-}'"
+    echo "model='${MODEL:-claude-opus-4-7}'"
+  )"
+  repo="$(echo "$repo_url" | sed -E 's#https?://github.com/##; s#\.git$##')"
+  cache_dir="$HOME/.cache/${slug}-agent"
+  mkdir -p "$cache_dir"
+
+  # Fetch PR metadata. We pull more fields than we strictly need so the
+  # composed prompt has every relevant header for the verdict-rendering
+  # subagent (title/body matter; mergeCommit/mergedAt confirm the
+  # merged-vs-open state).
+  local pr_view_json
+  pr_view_json="$(gh pr view "$pr_number" \
+                    --repo "$repo" \
+                    --json number,title,headRefName,body,mergeCommit,mergedAt,files,state \
+                    2>/dev/null || true)"
+  if [ -z "$pr_view_json" ] || [ "$pr_view_json" = "{}" ]; then
+    echo "fleet replay: gh pr view $pr_number returned nothing" >&2
+    exit 1
+  fi
+
+  # Parse the PR fields. We reuse the rollback_json_* helpers — they're
+  # robust enough for flat-string fields and the one-deep mergeCommit oid.
+  local pr_title head_ref pr_body merged_at
+  pr_title="$(rollback_json_string "$pr_view_json" "title")"
+  head_ref="$(rollback_json_string "$pr_view_json" "headRefName")"
+  # `body` may contain quoted JSON characters; we only echo it into the
+  # prompt, never re-emit it as JSON, so the shallow extractor is fine.
+  pr_body="$(rollback_json_string "$pr_view_json" "body")"
+  merged_at="$(rollback_json_string "$pr_view_json" "mergedAt")"
+
+  local branch_tail
+  branch_tail="$(replay_branch_tail "$head_ref")"
+  if [ -z "$branch_tail" ]; then
+    echo "not an agent feature PR; replay is scoped to feat/ and eng/ branches" >&2
+    exit 2
+  fi
+
+  # Identify the linked ticket by the PR title's `feat/<id>-` prefix
+  # convention. The branch_tail looks like "0017-fleet-rollback"; we
+  # split on the first dash to get the 4-digit id.
+  local ticket_id="${branch_tail%%-*}"
+
+  # Fresh checkout to read AGENTS.md, LESSONS.md, and the ticket file at
+  # the CURRENT tree's state (the whole point of "replay against current
+  # prompts"). Uses $CACHE_DIR/replay-checkout — a separate dir from
+  # ship/groom/review so a running ship can't race with a replay.
+  local checkout="$cache_dir/replay-checkout"
+  rm -rf "$checkout"
+  mkdir -p "$(dirname "$checkout")"
+  if ! git clone --depth 1 "$repo_url" "$checkout" >/dev/null 2>&1; then
+    echo "fleet replay: git clone $repo_url failed" >&2
+    exit 1
+  fi
+
+  # Find the ticket file by 4-digit id. We glob rather than assume the
+  # exact slug-tail so a renamed-on-merge ticket still resolves.
+  local ticket_path=""
+  local cand
+  for cand in "$checkout/docs/backlog/${ticket_id}-"*.md; do
+    if [ -f "$cand" ]; then
+      ticket_path="$cand"
+      break
+    fi
+  done
+
+  # Pull the diff for review phase. We only need this when the prompt
+  # grades the diff; ship doesn't, per the ticket's AC#2.
+  local diff_path="$cache_dir/replay-pr${pr_number}.diff"
+  if [ "$phase" = "review" ]; then
+    gh pr diff "$pr_number" --repo "$repo" > "$diff_path" 2>/dev/null || true
+  fi
+
+  # Compose the prompt body into a tmpfile, then pipe it to claude with
+  # tool-lock. We do NOT shell out to fleet_run_claude — see the header.
+  local prompt_file claude_out_json
+  prompt_file="$(mktemp -t fleet-replay-prompt.XXXXXX)"
+  claude_out_json="$(mktemp -t fleet-replay-claude.XXXXXX)"
+  replay_compose_prompt \
+    "$phase" "$checkout" "$ticket_path" "$diff_path" \
+    "$pr_number" "$pr_title" "$head_ref" "$pr_body" "$merged_at" \
+    > "$prompt_file"
+
+  local ts_start ts_end claude_exit
+  ts_start="$(date -u +%FT%TZ)"
+  # AGENT_DRY_RUN is the kit's standard tool-lock env var — set it for
+  # the duration of the claude call so any consumer that inspects env
+  # (e.g. a future telemetry hook) sees we were in dry-run.
+  AGENT_DRY_RUN=1 claude \
+    --print \
+    --output-format json \
+    --dangerously-skip-permissions \
+    --model "$model" \
+    --allowedTools none \
+    < "$prompt_file" \
+    > "$claude_out_json" 2>/dev/null
+  claude_exit=$?
+  ts_end="$(date -u +%FT%TZ)"
+
+  # Parse `result` from the claude JSON. Best-effort: missing jq → fall
+  # back to the raw text.
+  local result_text=""
+  if command -v jq >/dev/null 2>&1 && jq -e . "$claude_out_json" >/dev/null 2>&1; then
+    result_text="$(jq -r '.result // empty' "$claude_out_json")"
+  else
+    result_text="$(cat "$claude_out_json")"
+  fi
+
+  # Persist the full result to disk so the operator can `cat` it later.
+  if [ -z "$out_path" ]; then
+    local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    out_path="$cache_dir/replay-${slug}-pr${pr_number}-${phase}-${stamp}.txt"
+  fi
+  mkdir -p "$(dirname "$out_path")" 2>/dev/null || true
+  printf '%s\n' "$result_text" > "$out_path"
+
+  # Append to runs.jsonl with phase=replay (per AC#8).
+  replay_append_runs \
+    "$cache_dir/runs.jsonl" "$claude_out_json" \
+    "$slug" "replay" "$ts_start" "$ts_end" "$model" "$claude_exit"
+
+  # --- render summary -----------------------------------------------------
+  echo "Replaying $phase prompt against $slug PR #$pr_number ($branch_tail)"
+  [ -n "$ticket_path" ] && echo "  ticket: ${ticket_path#"$checkout/"} (${merged_at:-open})"
+  echo "  prompt: composed at $prompt_file"
+  echo "  result: $out_path"
+  echo
+
+  # Truncate the printed body to ~400 chars per AC#1.
+  local head_400="${result_text:0:400}"
+  echo "$head_400"
+  [ "${#result_text}" -gt 400 ] && echo "[... truncated; full result at $out_path]"
+  echo
+
+  # Parse the verdict line.
+  local verdict_re verdict
+  case "$phase" in
+    review) verdict_re='^VERDICT:[[:space:]]+(sign-off|request-changes)' ;;
+    ship)   verdict_re='^ACTION:[[:space:]]+(heal|ship|wait|noop)' ;;
+  esac
+  verdict="$(printf '%s\n' "$result_text" \
+              | grep -E -m1 "$verdict_re" \
+              | head -1)"
+
+  # Print the parsed verdict line on its own — the test grep relies on
+  # this exact prefix (^VERDICT: / ^ACTION:) anchored at the start of a
+  # line in stdout.
+  if [ -n "$verdict" ]; then
+    printf '%s\n' "$verdict"
+  else
+    case "$phase" in
+      review) echo "VERDICT: unknown" ;;
+      ship)   echo "ACTION: unknown" ;;
+    esac
+  fi
+
+  # Compute exit code from the verdict + --request-changes-ok flag.
+  local verdict_kind=""
+  if [ -n "$verdict" ]; then
+    verdict_kind="$(printf '%s' "$verdict" \
+                    | sed -nE 's/^(VERDICT|ACTION):[[:space:]]+([a-zA-Z_-]+).*/\2/p')"
+  fi
+
+  rm -f "$prompt_file" "$claude_out_json"
+
+  case "$phase" in
+    review)
+      if [ "$want_rc_ok" = "1" ]; then
+        [ "$verdict_kind" = "request-changes" ] && exit 0 || exit 1
+      else
+        [ "$verdict_kind" = "sign-off" ] && exit 0 || exit 1
+      fi
+      ;;
+    ship)
+      # Success = "would do real work" (ship or heal). wait/noop/unknown → 1.
+      # --request-changes-ok is review-only; on ship we ignore it.
+      case "$verdict_kind" in
+        ship|heal) exit 0 ;;
+        *)         exit 1 ;;
+      esac
+      ;;
+  esac
+}
+
+if [ "$CMD" = "replay" ]; then
+  replay "$@"
+fi
+
 # --- overview -------------------------------------------------------------
 # Ticket 0019. `fleet overview` prints a single cross-project table answering
 # "what is the fleet doing right now?" One row per discovered project, columns:
