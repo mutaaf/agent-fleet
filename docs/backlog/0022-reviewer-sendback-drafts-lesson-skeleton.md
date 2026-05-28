@@ -1,7 +1,7 @@
 ---
 id: 0022
 title: Reviewer send-backs drop a LESSONS skeleton draft for operator promotion
-status: groomed
+status: in-progress
 priority: P2
 area: engine
 created: 2026-05-28
@@ -185,4 +185,27 @@ Each box maps 1:1 to a test scenario in `tests/review-lesson-draft.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+### 2026-05-28 — implementation-dev
+
+Mechanism chosen: **side-PR**. `lib/review.sh` today does NOT commit to the
+PR branch — the reviewer is read-only on the diff. Per the ticket's
+engineering note, the helper opens a tiny `chore/lesson-draft-<N>-<ts>`
+branch against `main` and pushes a single-file commit touching
+`docs/LESSONS.md`. This keeps the reviewer's "no writes to the agent PR's
+branch" invariant intact while still landing the draft on `main` where the
+operator can promote it. The mechanism is wired through the prompt
+heredoc in `lib/review.sh` (instructions for the agent), with the actual
+LESSONS mutation done by the new helper `_review_emit_lesson_draft` in
+`lib/common.sh`.
+
+Helper signature: `_review_emit_lesson_draft <pr> <body-file> [lessons-file]`.
+File mutation goes through `awk` + a temp file + `mv` (per LESSONS
+2026-05-27). Dedupe key is the PR number, matched on the opening HTML
+comment marker. Event `lesson_draft_emitted {pr, headline}` is appended to
+`AGENTS.md § Telemetry` and emitted exactly once per helper invocation.
+A new constitutional principle `P-9` lands in `prompts/PRINCIPLES.md` with
+a matching `prompts/CHANGELOG.md` entry. Tests in
+`tests/review-lesson-draft.sh` cover all eight acceptance boxes by
+invoking the helper directly against a fixture LESSONS.md (no actual `gh`
+calls required for the unit, mirroring the `tests/sendback-pause.sh` stub
+pattern).

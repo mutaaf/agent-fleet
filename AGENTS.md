@@ -166,6 +166,18 @@ postcard.
     lives in `lib/heal-catalog.sh`; adding a new pattern is one line
     + a fixture log in `tests/heal-infra-flake.sh` + an inline LESSON
     reference (date + repo).
+  - `lesson_draft_emitted {pr, headline}` — emitted by
+    `_review_emit_lesson_draft` (ticket 0022) from `lib/common.sh` whenever
+    the reviewer posts a `--request-changes` verdict. The helper prepends
+    (or dedupe-replaces) a date-stamped, HTML-comment-marked DRAFT block
+    in `docs/LESSONS.md` so the operator can promote it later. `pr` is
+    the PR number; `headline` is the first 80 chars of the review body's
+    first line. Dedupe key is the PR number — a second send-back on the
+    same PR updates the existing block in place and emits a second event
+    (the event log preserves the streak). Sign-off (`--comment`) reviews
+    do NOT emit this event. Consumer guidance: counts here vs.
+    `pr_opened` give a "draft promotion debt" metric — every emitted
+    event corresponds to one draft block waiting for an operator pass.
   - `trainee_pr_opened {number, remaining}` — emitted by the dev agent
     (driven from `prompts/ship.prompt.md`) immediately after `gh pr
     create` when `FLEET_TRAINEE_REMAINING > 0`, i.e. the project's

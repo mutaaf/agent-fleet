@@ -7,7 +7,7 @@ per-phase prompts are mechanics; this file is the constitutional layer that
 makes both gradeable. In any contested decision an agent makes, cite the
 principle id (`P-N`) you're acting under so the operator can audit the call.
 
-Eight principles. They are uniform across the fleet — that's doctrine.
+Nine principles. They are uniform across the fleet — that's doctrine.
 
 ## P-1 — Smallest viable change
 
@@ -111,3 +111,23 @@ branch. Pruning is allowed only in the groom path and only for EXACT
 duplicates. The cross-project lessons file produced by
 `fleet lessons-sync` (ticket 0009) is read at PHASE 0 of every run — a
 pattern another project already learned MUST inform this one.
+
+## P-9 — Review send-backs draft LESSONS; the operator promotes
+
+Every `--request-changes` review is a candidate lesson. The reviewer drops
+a date-stamped, HTML-comment-marked DRAFT block at the top of
+`docs/LESSONS.md` (on a side-PR, never on main directly); the operator
+promotes it to a real lesson or deletes it. Drafts are intentionally
+manual to promote — the operator stays responsible for what LESSONS says.
+
+What this looks like in practice: the review subagent that posts
+`gh pr review --request-changes` ALSO invokes
+`_review_emit_lesson_draft <pr> <body-file>` (from `lib/common.sh`,
+ticket 0022). The helper prepends a `<!-- DRAFT: reviewer send-back,
+PR #N, YYYY-MM-DD -->` block AFTER the file header and BEFORE the first
+promoted `## YYYY-MM-DD` entry, dedupe-replacing any existing draft for
+the same PR. A `lesson_draft_emitted {pr, headline}` event fires per
+call so the operator can read draft-promotion debt straight from
+`events.jsonl`. Sign-off (`--comment`) reviews never write to LESSONS —
+only blocking verdicts do, because only those carry the failure mode
+worth remembering.

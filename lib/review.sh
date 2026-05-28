@@ -103,7 +103,31 @@ Do NOT commit to the PR branch — you are read-only on the diff.
 Deliver exactly one verdict:
   clean    → gh pr review $PR --repo $REPO --comment --body "<detailed sign-off>"
   blocking → gh pr review $PR --repo $REPO --request-changes --body "<summary>"
-Never --approve. End the session immediately after the gh pr review call.
+Never --approve.
+
+If (and ONLY if) you posted --request-changes, ALSO drop a LESSONS draft
+skeleton for the operator to promote later. Mechanism (ticket 0022):
+
+  1. Write your review body verbatim to /tmp/fleet-review/draft-body.txt.
+  2. Run (from a fresh checkout of $REPO with main checked out):
+
+       bash -c 'source lib/common.sh && \
+                fleet_load_manifest "$PROJECT_DIR" && \
+                FLEET_PHASE=review _review_emit_lesson_draft \
+                  '"$PR"' /tmp/fleet-review/draft-body.txt docs/LESSONS.md'
+
+  3. Open a tiny side-PR (NOT main):
+       git checkout -b chore/lesson-draft-${PR}-$(date -u +%s)
+       git add docs/LESSONS.md
+       git commit -m "chore: draft LESSON from review #${PR}"
+       git push -u origin HEAD
+       gh pr create --repo $REPO --base main --fill
+
+Do NOT call _review_emit_lesson_draft on the --comment sign-off path.
+Do NOT commit to the PR's own branch (you are read-only on the diff).
+
+End the session immediately after the gh pr review call (and the optional
+draft side-PR for blocking verdicts).
 PROMPT
 
   cd "$CACHE_DIR/review-checkout" || { echo "review-checkout missing"; continue; }
