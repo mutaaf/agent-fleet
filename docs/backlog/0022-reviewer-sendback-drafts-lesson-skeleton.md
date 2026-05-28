@@ -1,7 +1,7 @@
 ---
 id: 0022
 title: Reviewer send-backs drop a LESSONS skeleton draft for operator promotion
-status: in-progress
+status: shipped
 priority: P2
 area: engine
 created: 2026-05-28
