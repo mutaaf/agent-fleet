@@ -1,7 +1,7 @@
 ---
 id: 0019
 title: fleet overview prints a single-glance cross-project health table
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-05-28
