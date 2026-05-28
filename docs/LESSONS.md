@@ -108,3 +108,21 @@ coincidence. Fix: back up with `cp "$file" "$BACKUP"` and restore with
 applies to `read -d ''` and `mapfile`, both of which can also clip
 terminators in subtle ways. When in doubt, copy files; only use
 command substitution for content you're about to grep or compare.
+
+## 2026-05-28 — `printf '- foo\n' "$bar"` treats the leading dash as a flag
+
+While shipping ticket 0021's `replay_compose_prompt`, the first cut used
+`printf '- number: #%s\n' "$pr_number"` to render markdown bullet lines
+into the composed prompt body. Bash's builtin `printf` (and /usr/bin/printf
+on macOS, and dash on Ubuntu) parses the FIRST argument for option flags —
+so a format string starting with `-` is interpreted as a flag and the
+command fails with `printf: - : invalid option / usage: printf [-v var]
+format [arguments]` to stderr. Symptom: the prompt body got truncated and
+stderr was littered with usage banners, but the run still proceeded
+because the printf failure was non-fatal in this code path. Fix: use the
+POSIX `--` end-of-options marker, i.e. `printf -- '- number: #%s\n'
+"$pr_number"`. Same trap applies to any `printf '%s' "$str"` where `$str`
+might start with `-` and gets passed positionally — quote it through `--`
+or prefix the format with a literal char (`printf '%s\n' "-$str"`). Cheap
+defensive habit: any time the FIRST byte of the format or the first
+argument is `-`, add `--` between `printf` and the format.
