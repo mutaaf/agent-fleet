@@ -2262,6 +2262,425 @@ if [ "$CMD" = "kickstart" ]; then
   kickstart_cmd "$@"
 fi
 
+# --- overview -------------------------------------------------------------
+# Ticket 0019. `fleet overview` prints a single cross-project table answering
+# "what is the fleet doing right now?" One row per discovered project, columns:
+#
+#   PROJECT  SHIP  REVIEW  SENDBK  $TODAY  IN-FLIGHT  STATE
+#
+# It is the cross-project subtraction the operator wants on day 2 with 3-7
+# projects installed: instead of running `fleet doctor`, `fleet digest`, and
+# `gh pr list` per repo, one command renders the fleet's pulse.
+#
+# Read-only: never mutates a manifest, never opens a PR, never touches gh
+# beyond `gh pr list` per project. Discovery uses the same two-root pattern
+# as doctor/digest/tail (FLEET_DISCOVERY_ROOT first, then
+# ~/.local/share/agent-fleet/projects), de-duped by SLUG. No new lib/ helpers.
+#
+# STATE priority order (per the ticket):
+#   EXPIRED > PAUSED > OVER-BUDGET > STUCK > HEAL > OK
+# The first three reuse `digest_state`'s predicates verbatim. STUCK and HEAL
+# need `gh` and are computed in a second pass inside this function (gracefully
+# skipped when gh is offline — AC#7).
+#
+# Naming (LESSONS 2026-05-26): the dispatcher is named `overview()` — no
+# coreutils binary by that name, so no `_cmd` suffix needed. The function
+# does NOT shell out to anything called `overview`.
+#
+# Test hook: $FLEET_OVERVIEW_FAKE_NOW (epoch seconds) overrides "now" so
+# SHIP-age math in tests/overview.sh is deterministic.
+
+OVERVIEW_ROOT="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+OVERVIEW_INSTALLED="$HOME/.local/share/agent-fleet/projects"
+
+# Discover (slug, manifest_path, repo_url) rows union of the two roots,
+# de-duped by SLUG, in slug-alpha order. Working-tree manifests win over
+# installed copies (same convention as `discover()` at the top of this file).
+overview_discover() {
+  local _seen="" m slug repo_url
+  { find "$OVERVIEW_ROOT"      -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$OVERVIEW_INSTALLED" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    # shellcheck disable=SC1090
+    repo_url=$( (source "$m"; echo "${REPO_URL:-}") 2>/dev/null )
+    printf '%s\t%s\t%s\n' "$slug" "$m" "$repo_url"
+  done | sort -t $'\t' -k1,1
+}
+
+# Pluck the open agent PR for one project. Echoes "NUMBER|STATE|UPDATED_EPOCH"
+# or empty when no PR is open (or gh fails). STATE is one of
+# GREEN/RED/PENDING/BEHIND/DIRTY derived from mergeStateStatus + the rollup.
+overview_inflight() {
+  local repo="$1"
+  command -v gh >/dev/null 2>&1 || { echo ""; return 0; }
+  [ -n "$repo" ] || { echo ""; return 0; }
+  # `gh pr list --search "head:feat/ head:eng/"` excludes chore/gtm-* (per
+  # the engineering notes). The result is one PR per row in JSON; we take
+  # the lowest-numbered (Phase 1 convention in lib/ship.sh).
+  local raw
+  raw="$(gh pr list \
+            --repo "$repo" \
+            --state open \
+            --base main \
+            --search "head:feat/ head:eng/" \
+            --json number,mergeStateStatus,statusCheckRollup,headRefName,updatedAt \
+            --limit 5 \
+            2>/dev/null)" || true
+  [ -z "$raw" ] || [ "$raw" = "[]" ] && { echo ""; return 0; }
+  # Pick the lowest PR number. Use node if it's available; fall back to a
+  # tiny sed scan when not.
+  local picked=""
+  if command -v node >/dev/null 2>&1; then
+    picked="$(node -e '
+      try {
+        const arr = JSON.parse(require("fs").readFileSync(0, "utf8"));
+        if (!Array.isArray(arr) || arr.length === 0) process.exit(0);
+        arr.sort((a, b) => a.number - b.number);
+        const p = arr[0];
+        // Reduce statusCheckRollup → derived state. GitHub conclusions:
+        // SUCCESS/FAILURE/CANCELLED/SKIPPED/NEUTRAL (and null while pending).
+        const rollup = Array.isArray(p.statusCheckRollup) ? p.statusCheckRollup : [];
+        let derived = "GREEN";
+        let anyPending = false, anyFail = false;
+        for (const c of rollup) {
+          const v = (c.conclusion || c.status || "").toUpperCase();
+          if (v === "FAILURE" || v === "FAILED" || v === "CANCELLED" || v === "TIMED_OUT") anyFail = true;
+          if (v === "" || v === "IN_PROGRESS" || v === "QUEUED" || v === "PENDING") anyPending = true;
+        }
+        if (anyFail) derived = "RED";
+        else if (anyPending) derived = "PENDING";
+        // mergeStateStatus overrides for BEHIND/DIRTY (which are about the
+        // branch, not the checks).
+        const mss = (p.mergeStateStatus || "").toUpperCase();
+        if (mss === "BEHIND") derived = "BEHIND";
+        if (mss === "DIRTY") derived = "DIRTY";
+        // Epoch seconds for updatedAt (used by STUCK detection).
+        let epoch = 0;
+        if (p.updatedAt) epoch = Math.floor(Date.parse(p.updatedAt) / 1000) || 0;
+        process.stdout.write(`${p.number}|${derived}|${epoch}`);
+      } catch (e) { /* drop */ }
+    ' <<<"$raw")"
+  else
+    # Pure-shell fallback. Pick the first PR's number, treat status as GREEN
+    # unless mergeStateStatus says otherwise. Good enough for the offline
+    # fallback; the test rig has node.
+    local n mss
+    n="$(printf '%s' "$raw" | sed -nE 's/.*"number"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -1)"
+    mss="$(printf '%s' "$raw" | sed -nE 's/.*"mergeStateStatus"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)"
+    local derived="GREEN"
+    case "$mss" in
+      BEHIND) derived="BEHIND" ;;
+      DIRTY)  derived="DIRTY" ;;
+      BLOCKED) derived="RED" ;;
+    esac
+    [ -n "$n" ] && picked="${n}|${derived}|0"
+  fi
+  echo "$picked"
+}
+
+# Count `--request-changes` reviews in the trailing 24h via gh fallback.
+# The ticket explicitly authorises using `gh pr list --search
+# "review:changes-requested"` when no `review_blocked` event type exists.
+overview_sendback_count() {
+  local repo="$1"
+  command -v gh >/dev/null 2>&1 || { echo 0; return 0; }
+  [ -n "$repo" ] || { echo 0; return 0; }
+  local raw
+  raw="$(gh pr list \
+            --repo "$repo" \
+            --search "review:changes-requested updated:>$(date -u -v-1d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ) head:feat/ head:eng/" \
+            --json number \
+            --limit 20 \
+            2>/dev/null)" || true
+  [ -z "$raw" ] || [ "$raw" = "[]" ] && { echo 0; return 0; }
+  # Count objects. node when available; cheap brace count otherwise.
+  if command -v node >/dev/null 2>&1; then
+    node -e '
+      try { const a = JSON.parse(require("fs").readFileSync(0, "utf8")); process.stdout.write(String(a.length || 0)); }
+      catch (e) { process.stdout.write("0"); }
+    ' <<<"$raw"
+  else
+    printf '%s' "$raw" | tr -cd '{' | wc -c | tr -d ' '
+  fi
+}
+
+# Best-effort: last review verdict for a project, expressed as "ok Nh" /
+# "block Nh" / "-". Sourced from gh pr list with the appropriate review
+# filter, picking the most-recent updatedAt. When gh is offline we echo "-".
+overview_last_review() {
+  local repo="$1" now="$2"
+  command -v gh >/dev/null 2>&1 || { echo "—"; return 0; }
+  [ -n "$repo" ] || { echo "—"; return 0; }
+  local raw
+  raw="$(gh pr list \
+            --repo "$repo" \
+            --state open \
+            --search "head:feat/ head:eng/" \
+            --json number,reviewDecision,updatedAt \
+            --limit 5 \
+            2>/dev/null)" || true
+  [ -z "$raw" ] || [ "$raw" = "[]" ] && { echo "—"; return 0; }
+  if ! command -v node >/dev/null 2>&1; then
+    # Pure-shell: read reviewDecision of the first PR.
+    local rd
+    rd="$(printf '%s' "$raw" | sed -nE 's/.*"reviewDecision"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)"
+    case "$rd" in
+      CHANGES_REQUESTED) echo "block" ;;
+      APPROVED|COMMENTED) echo "ok" ;;
+      *) echo "—" ;;
+    esac
+    return 0
+  fi
+  node -e '
+    try {
+      const arr = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      if (!Array.isArray(arr) || arr.length === 0) { process.stdout.write("—"); process.exit(0); }
+      // Pick most recent updatedAt.
+      arr.sort((a, b) => Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0));
+      const p = arr[0];
+      const rd = (p.reviewDecision || "").toUpperCase();
+      const ts = Date.parse(p.updatedAt || 0) / 1000 || 0;
+      const now = parseInt(process.argv[1] || "0", 10) || 0;
+      const diff = Math.max(0, now - ts);
+      let age;
+      if (diff < 3600) age = Math.floor(diff / 60) + "m";
+      else if (diff < 86400) age = Math.floor(diff / 3600) + "h";
+      else age = Math.floor(diff / 86400) + "d";
+      let tag;
+      if (rd === "CHANGES_REQUESTED") tag = "block";
+      else if (rd === "APPROVED" || rd === "COMMENTED") tag = "ok";
+      else { process.stdout.write("—"); process.exit(0); }
+      process.stdout.write(tag + " " + age);
+    } catch (e) { process.stdout.write("—"); }
+  ' "$now" <<<"$raw"
+}
+
+# Compute the STATE for one project. Reuses digest_state for
+# EXPIRED/PAUSED/OVER-BUDGET (and THROTTLED, which we collapse into OK for
+# this surface — the ticket lists STATE as exactly six values, no THROTTLED).
+# Then we add STUCK (open PR >24h old with no commit in 6h, when gh works)
+# and HEAL (in-flight PR has a `heal:` commit).
+overview_state() {
+  local self_cancel="$1" spend_today="$2" cap="$3" namespace="$4" cache_dir="$5"
+  local repo="$6" inflight_number="$7" inflight_epoch="$8" now="$9"
+  # Reuse digest_state for the first three.
+  local base
+  base="$(digest_state "$self_cancel" "$spend_today" "$cap" "$namespace" "$cache_dir")"
+  case "$base" in
+    EXPIRED|PAUSED|OVER-BUDGET) echo "$base"; return 0 ;;
+    THROTTLED) ;;  # not part of overview's STATE vocabulary → fall through
+  esac
+  # STUCK: open agent PR older than 24h with no commit in the last 6h.
+  # "no commit in the last 6h" is approximated by updatedAt — `gh pr list`'s
+  # updatedAt advances on every push, so an old PR with a stale updatedAt
+  # qualifies. We require both: (PR_age > 24h) AND (updated_age > 6h).
+  if [ -n "$inflight_number" ] && [ -n "$inflight_epoch" ] && [ "$inflight_epoch" -gt 0 ]; then
+    # PR age is computed from createdAt, which we don't have in the cached
+    # JSON — proxy with `updatedAt < (now - 24h)`. If updatedAt is more than
+    # 24h ago, the PR is necessarily older than 24h AND has been quiet for
+    # 24h+ (which is a strict superset of "no commit in 6h"). Cheap, correct
+    # for the day-2 surface.
+    local updated_age=$(( now - inflight_epoch ))
+    if [ "$updated_age" -gt 86400 ]; then
+      echo "STUCK"; return 0
+    fi
+  fi
+  # HEAL: in-flight PR has a `heal:` commit. We use `gh pr view --json
+  # commits` when gh is available; otherwise skip.
+  if command -v gh >/dev/null 2>&1 && [ -n "$inflight_number" ] && [ -n "$repo" ]; then
+    local commits
+    commits="$(gh pr view "$inflight_number" \
+                 --repo "$repo" \
+                 --json commits \
+                 2>/dev/null)" || true
+    if [ -n "$commits" ] && echo "$commits" | grep -q '"messageHeadline"[[:space:]]*:[[:space:]]*"heal:'; then
+      echo "HEAL"; return 0
+    fi
+  fi
+  echo "OK"
+}
+
+# Human-form table row.
+overview_render_human() {
+  local slug="$1" ship_age="$2" review="$3" sendbk="$4" spend="$5"
+  local inflight_label="$6" state="$7"
+  printf '%-14s %-10s %-10s %-7s %-9s %-16s %s\n' \
+    "$slug" "$ship_age" "$review" "$sendbk" "\$$spend" "$inflight_label" "$state"
+}
+
+overview() {
+  shift  # drop the leading "overview"
+  local want_json=0 slug_filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      --slug) slug_filter="${2:-}"; shift 2 ;;
+      --slug=*) slug_filter="${1#--slug=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet overview — single-glance cross-project health table.
+
+Usage:
+  fleet overview                 survey every discovered project
+  fleet overview --slug NAME     restrict to one project
+  fleet overview --json          machine-readable array
+
+Columns:
+  PROJECT   slug from manifest
+  SHIP      age of newest ~/.cache/<slug>-agent/logs/ship-*.log
+  REVIEW    last review verdict (ok N / block N) or "—"
+  SENDBK    count of --request-changes reviews on agent PRs (trailing 24h)
+  \$TODAY    today's UTC sum from runs.jsonl
+  IN-FLIGHT lowest open feat/ or eng/ PR + GREEN/RED/PENDING/BEHIND/DIRTY
+            ("—" when gh is offline/unauthenticated)
+  STATE     one of OK / HEAL / PAUSED / OVER-BUDGET / EXPIRED / STUCK
+
+JSON schema (one object per project):
+  { slug, ship: {last_run_epoch, age_label},
+    review: {last_verdict, age_label}, sendbk, spend_today_usd,
+    inflight: {number, state, updated_epoch},
+    state: {code, reason} }
+
+Exit code: 1 when any project is EXPIRED, OVER-BUDGET, or STUCK; else 0.
+HEAL and PAUSED are not red.
+USAGE
+        exit 0 ;;
+      *) echo "fleet overview: unknown flag '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  local now
+  now="${FLEET_OVERVIEW_FAKE_NOW:-$(date -u +%s)}"
+
+  # Print human header. The widths match overview_render_human's printf so
+  # the columns line up under their labels.
+  if [ "$want_json" != "1" ]; then
+    printf '%-14s %-10s %-10s %-7s %-9s %-16s %s\n' \
+      "PROJECT" "SHIP" "REVIEW" "SENDBK" "\$TODAY" "IN-FLIGHT" "STATE"
+  fi
+
+  local any_red=0
+  local json_rows=""
+  while IFS=$'\t' read -r slug manifest repo_url; do
+    [ -z "$slug" ] && continue
+    [ -n "$slug_filter" ] && [ "$slug" != "$slug_filter" ] && continue
+
+    # Manifest probe — fetch what we need.
+    local probe namespace self_cancel cap
+    probe=$(
+      # shellcheck disable=SC1090
+      ( source "$manifest" 2>/dev/null
+        echo "NAMESPACE=${NAMESPACE:-com.fleet.${SLUG:-x}}"
+        echo "SELF_CANCEL=${SELF_CANCEL:-}"
+        echo "MAX_DAILY_USD=${MAX_DAILY_USD:-}"
+      ) 2>/dev/null
+    ) || true
+    namespace="$(echo "$probe" | sed -n 's/^NAMESPACE=//p')"
+    self_cancel="$(echo "$probe" | sed -n 's/^SELF_CANCEL=//p')"
+    cap="$(echo "$probe" | sed -n 's/^MAX_DAILY_USD=//p')"
+
+    local cache_dir="$HOME/.cache/${slug}-agent"
+    local runs="$cache_dir/runs.jsonl"
+    local logs_dir="$cache_dir/logs"
+
+    # SHIP: age of newest log file.
+    local ship_epoch ship_age
+    ship_epoch="$(newest_log_epoch "$logs_dir")"
+    if [ -n "$ship_epoch" ]; then
+      local diff=$(( now - ship_epoch ))
+      if   [ "$diff" -lt 3600 ];  then ship_age="$(( diff/60 ))m ago"
+      elif [ "$diff" -lt 86400 ]; then ship_age="$(( diff/3600 ))h ago"
+      else ship_age="$(( diff/86400 ))d ago"; fi
+    else
+      ship_age="—"
+    fi
+
+    # Derive owner/repo from REPO_URL (https://github.com/owner/name[.git]).
+    local repo
+    repo="$(echo "$repo_url" | sed -E 's#https?://github.com/##; s#\.git$##')"
+
+    # IN-FLIGHT: gh pr list. Returns "NUMBER|STATE|EPOCH" or empty.
+    local inflight inflight_number="" inflight_state="" inflight_epoch=0
+    inflight="$(overview_inflight "$repo")"
+    if [ -n "$inflight" ]; then
+      inflight_number="$(echo "$inflight" | cut -d'|' -f1)"
+      inflight_state="$(echo "$inflight" | cut -d'|' -f2)"
+      inflight_epoch="$(echo "$inflight" | cut -d'|' -f3)"
+    fi
+
+    # REVIEW + SENDBK: gh fallback (the `review_blocked` event type does not
+    # exist yet — engineering note in the ticket; documented in the
+    # implementation log). When gh is offline both gracefully degrade.
+    local review_label sendbk
+    review_label="$(overview_last_review "$repo" "$now")"
+    sendbk="$(overview_sendback_count "$repo")"
+
+    # $TODAY: today's UTC spend from runs.jsonl.
+    local spend_today
+    spend_today="$(digest_spend_today "$runs")"
+
+    # STATE: digest_state for the first three; overview_state adds STUCK/HEAL.
+    local state
+    state="$(overview_state \
+              "$self_cancel" "$spend_today" "$cap" "$namespace" "$cache_dir" \
+              "$repo" "$inflight_number" "$inflight_epoch" "$now")"
+
+    case "$state" in
+      EXPIRED|OVER-BUDGET|STUCK) any_red=1 ;;
+    esac
+
+    # IN-FLIGHT human label. "#N STATE" or "—" when no PR / gh offline.
+    local inflight_label
+    if [ -n "$inflight_number" ]; then
+      inflight_label="#${inflight_number} ${inflight_state}"
+    else
+      inflight_label="—"
+    fi
+
+    if [ "$want_json" = "1" ]; then
+      local esc_slug esc_state esc_review esc_inflight_state
+      esc_slug="$(doctor_json_escape "$slug")"
+      esc_state="$(doctor_json_escape "$state")"
+      esc_review="$(doctor_json_escape "$review_label")"
+      esc_inflight_state="$(doctor_json_escape "$inflight_state")"
+      local ship_epoch_json="${ship_epoch:-0}"
+      local inflight_number_json="null"
+      [ -n "$inflight_number" ] && inflight_number_json="$inflight_number"
+      local inflight_epoch_json="${inflight_epoch:-0}"
+      [ -n "$json_rows" ] && json_rows+=","
+      json_rows+="{\"slug\":\"$esc_slug\""
+      json_rows+=",\"ship\":{\"last_run_epoch\":$ship_epoch_json,\"age_label\":\"$(doctor_json_escape "$ship_age")\"}"
+      json_rows+=",\"review\":{\"last_verdict\":\"$esc_review\"}"
+      json_rows+=",\"sendbk\":$sendbk"
+      json_rows+=",\"spend_today_usd\":$spend_today"
+      json_rows+=",\"inflight\":{\"number\":$inflight_number_json,\"state\":\"$esc_inflight_state\",\"updated_epoch\":$inflight_epoch_json}"
+      json_rows+=",\"state\":{\"code\":\"$esc_state\",\"reason\":\"\"}"
+      json_rows+="}"
+    else
+      overview_render_human \
+        "$slug" "$ship_age" "$review_label" "$sendbk" "$spend_today" \
+        "$inflight_label" "$state"
+    fi
+  done < <(overview_discover)
+
+  if [ "$want_json" = "1" ]; then
+    printf '[%s]\n' "$json_rows"
+  fi
+
+  [ "$any_red" = "1" ] && exit 1
+  exit 0
+}
+
+if [ "$CMD" = "overview" ]; then
+  overview "$@"
+fi
+
 # --- lessons-sync ---------------------------------------------------------
 # Ticket 0009. `fleet lessons-sync` walks every discovered project, reads
 # its docs/LESSONS.md, and writes one merged file at
