@@ -39,10 +39,38 @@ freeze the loop.
             git log origin/main..origin/B --grep '^heal:' --oneline | wc -l
           If >= 2, post a PR comment that 2 attempts are exhausted and a human
           should look, then exit. Do NOT try a third time.
-        - Otherwise: git checkout -B B origin/B; install deps only if needed;
-          run the LOCAL GATE COMMAND (AGENTS.md) for the failing check; read the
-          real failure; make the MINIMUM root-cause fix (never weaken/skip a
-          test); re-run until green; commit as:
+        - INFRA-FLAKE PRE-STEP (ticket 0020): BEFORE running the local gate,
+          ask the catalog whether this red is a known infra-only flake the
+          loop should just rerun. The catalog lives in `lib/heal-catalog.sh`
+          (sourced by `lib/common.sh`) and codifies the four LESSONS-grade
+          patterns: `actions_silent`, `supabase_port_bind`,
+          `account_suspended`, `gh_graphql_502`.
+            RUN_ID=<the failed run id from gh pr checks --json>
+            LOG=$(mktemp)
+            gh run view "$RUN_ID" --log-failed > "$LOG" 2>/dev/null || true
+            # shellcheck source=lib/common.sh
+            source "$FLEET_LIB/common.sh" 2>/dev/null || \
+              source "$(dirname "$0")/lib/common.sh" 2>/dev/null || true
+            TOKEN=$(fleet_match_infra_flake "$LOG")
+          On a non-empty TOKEN:
+            - DEDUPE GATE (AC#5): if
+              `fleet_infra_flake_already_rerun "$TOKEN" "$RUN_ID"` returns 0
+              (a matching `infra_flake_rerun` event exists within the last
+              2h), fall through to the normal local-gate heal path below —
+              do NOT rerun again. This prevents loops on a genuinely-broken
+              infra.
+            - Otherwise: trigger ONE rerun, emit the event, and exit
+              cleanly. NO `heal:` commit. The heal attempt counter is NOT
+              incremented.
+                gh run rerun "$RUN_ID" --failed
+                fleet_emit_event infra_flake_rerun pattern="$TOKEN" run_id="$RUN_ID" pr="$N"
+                echo "INFRA_FLAKE $TOKEN — rerunning run $RUN_ID"
+                exit 0
+        - Otherwise (no token, or dedupe trip): git checkout -B B origin/B;
+          install deps only if needed; run the LOCAL GATE COMMAND
+          (AGENTS.md) for the failing check; read the real failure; make
+          the MINIMUM root-cause fix (never weaken/skip a test); re-run
+          until green; commit as:
             heal: <one-line root cause> (attempt K)
             Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
           push to B. Auto-merge stays armed; CI re-runs. Append a LESSON if novel.

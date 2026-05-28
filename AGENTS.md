@@ -151,6 +151,21 @@ postcard.
     line of the new (empty) events.jsonl, so consumers tailing the
     channel see an explicit rotation boundary without having to compare
     inode numbers.
+  - `infra_flake_rerun {pattern, run_id, pr}` — emitted by the ship
+    runner's PHASE 1 RED branch (driven from `prompts/ship.prompt.md`)
+    when `fleet_match_infra_flake` (ticket 0020) classifies the failed
+    job log as one of the four catalog patterns: `actions_silent`,
+    `supabase_port_bind`, `account_suspended`, `gh_graphql_502`. On a
+    match the runner invokes `gh run rerun <run_id> --failed` exactly
+    once, emits this event, prints `INFRA_FLAKE <token> — rerunning
+    run <id>`, and exits cleanly — no `heal:` commit is created and
+    the 2-attempt heal-cap is NOT advanced. Dedupe: a second match
+    on the same `pattern`+`run_id` within 2h (scanned from this
+    channel) falls through to the normal heal path so a genuinely-
+    broken infra cannot trap the runner in a rerun loop. The catalog
+    lives in `lib/heal-catalog.sh`; adding a new pattern is one line
+    + a fixture log in `tests/heal-infra-flake.sh` + an inline LESSON
+    reference (date + repo).
   - `trainee_pr_opened {number, remaining}` — emitted by the dev agent
     (driven from `prompts/ship.prompt.md`) immediately after `gh pr
     create` when `FLEET_TRAINEE_REMAINING > 0`, i.e. the project's

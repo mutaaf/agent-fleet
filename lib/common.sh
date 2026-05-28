@@ -997,3 +997,118 @@ fleet_emit_event() {
   mkdir -p "$CACHE_DIR" 2>/dev/null || true
   printf '%s\n' "$line" >> "$CACHE_DIR/events.jsonl"
 }
+
+# --- infra-flake catalog (ticket 0020) ------------------------------------
+# The heal step's contract is "red gating check → fix the root cause". A
+# handful of failure modes break that contract: GitHub Actions silently
+# stopping, Supabase port-bind races, transient `account suspended` 403s,
+# `gh` GraphQL 502s. Each of those wants `gh run rerun --failed`, not a
+# fabricated heal commit. We catalog the patterns in `lib/heal-catalog.sh`
+# so adding a new one is one line + a fixture log + a LESSONS reference,
+# and we let tests swap the catalog file via `FLEET_HEAL_CATALOG=...`.
+#
+# The catalog file populates a `FLEET_HEAL_PATTERNS` array whose entries
+# are `<token>|<ERE>` strings. The match function walks them in order and
+# prints the first matching token (or empty if nothing matches).
+#
+# Why a separate file: per ticket 0020 § Engineering notes, the catalog is
+# grep-friendly and version-controlled independently. The constant below
+# resolves to `$FLEET_LIB/heal-catalog.sh` by default; tests override it
+# (see tests/heal-infra-flake.sh AC#2) without touching the installed copy.
+FLEET_HEAL_CATALOG="${FLEET_HEAL_CATALOG:-$FLEET_LIB/heal-catalog.sh}"
+if [ -f "$FLEET_HEAL_CATALOG" ]; then
+  # shellcheck disable=SC1090
+  source "$FLEET_HEAL_CATALOG"
+fi
+
+# fleet_match_infra_flake <log-file>  — scan a CI log against the catalog and
+# echo the first matching pattern's token (one of `actions_silent`,
+# `supabase_port_bind`, `account_suspended`, `gh_graphql_502`, or whatever
+# additional tokens future catalog entries introduce). Echoes nothing when
+# no pattern matches OR the log file is missing/empty.
+#
+# Best-effort and side-effect-free: only reads `<log-file>`, never writes
+# anything, never invokes `gh`. The caller (`prompts/ship.prompt.md` PHASE 1
+# RED branch) decides what to do with the token.
+fleet_match_infra_flake() {
+  local logfile="${1:?fleet_match_infra_flake: log-file path required}"
+  [ -f "$logfile" ] || return 0
+  [ -s "$logfile" ] || return 0
+  # No catalog loaded → nothing to match. Don't error; the heal step falls
+  # through to the normal code-fix path on an empty echo. `declare -p` is
+  # the portable way to ask "is this an array with elements?" without
+  # tripping `set -u` on an unset name.
+  if ! declare -p FLEET_HEAL_PATTERNS >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "${#FLEET_HEAL_PATTERNS[@]}" -eq 0 ]; then
+    return 0
+  fi
+  local entry token regex
+  for entry in "${FLEET_HEAL_PATTERNS[@]}"; do
+    token="${entry%%|*}"
+    regex="${entry#*|}"
+    [ -z "$token" ] && continue
+    [ "$regex" = "$entry" ] && continue   # malformed entry, skip
+    if grep -E -q -- "$regex" "$logfile" 2>/dev/null; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# fleet_infra_flake_already_rerun <token> <run_id> [window_seconds]
+#
+# Dedupe gate for the heal-phase rerun step. Returns 0 (already rerun) when
+# `$CACHE_DIR/events.jsonl` carries an `infra_flake_rerun` event with the
+# same `pattern=<token>` AND `run_id=<run_id>` whose `ts` falls within
+# `[now - window, now]`. Otherwise returns 1 (not deduped — proceed).
+#
+# Default window is 2h (7200s), matching the ticket's AC#5. The window is
+# generous enough to absorb a slow CI queue but short enough that a
+# genuinely-broken infra can't trap the runner in a rerun loop — after the
+# window, the heal step falls through to the normal code-fix path, which
+# either succeeds (the flake has since become a real failure that needs
+# attention) or escalates via the 2-attempt cap.
+#
+# Side-effect-free: only reads events.jsonl, never writes anything. Caller
+# convention: `fleet_infra_flake_already_rerun <tok> <id> && fall_through`.
+fleet_infra_flake_already_rerun() {
+  local token="${1:?fleet_infra_flake_already_rerun: token required}"
+  local run_id="${2:?fleet_infra_flake_already_rerun: run_id required}"
+  local window="${3:-7200}"
+  local events="$CACHE_DIR/events.jsonl"
+  [ -f "$events" ] || return 1
+
+  local cutoff_iso
+  cutoff_iso="$(_fleet_cutoff_iso "$window")"
+
+  # ISO8601 UTC strings are lexicographically sortable, so a string compare
+  # is enough to test "ts within window". We scan one line at a time and
+  # short-circuit on the first match; events.jsonl is bounded by ticket
+  # 0016's rotation, so a linear scan is fine.
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      *'"type":"infra_flake_rerun"'*) ;;
+      *) continue ;;
+    esac
+    case "$line" in
+      *'"pattern":"'"$token"'"'*) ;;
+      *) continue ;;
+    esac
+    case "$line" in
+      *'"run_id":"'"$run_id"'"'*) ;;
+      *) continue ;;
+    esac
+    # Pull the ts out and bail if it's older than the cutoff.
+    local ts
+    ts="$(printf '%s' "$line" | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
+    [ -z "$ts" ] && continue
+    if [ "$ts" \> "$cutoff_iso" ] || [ "$ts" = "$cutoff_iso" ]; then
+      return 0
+    fi
+  done < "$events"
+  return 1
+}
