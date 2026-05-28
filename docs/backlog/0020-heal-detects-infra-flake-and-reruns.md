@@ -1,7 +1,7 @@
 ---
 id: 0020
 title: Heal phase detects infra-flake CI failures and reruns instead of code-fixing
-status: groomed
+status: in-progress
 priority: P1
 area: safety
 created: 2026-05-28
@@ -165,4 +165,9 @@ Each box maps 1:1 to a test scenario in `tests/heal-infra-flake.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-28: implementation-dev started. Branch
+  `feat/0020-heal-detects-infra-flake`. Plan: tests-first per AC#1-7,
+  add `lib/heal-catalog.sh` (sourced by `lib/common.sh`), add
+  `fleet_match_infra_flake` after `fleet_emit_event`, splice a pre-step
+  into `prompts/ship.prompt.md` PHASE 1 RED branch, append AGENTS.md
+  Telemetry bullet for `infra_flake_rerun`, add CHANGELOG entry.

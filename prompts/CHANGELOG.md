@@ -15,6 +15,33 @@ The companion command is `bin/fleet prompts-diff` (ticket 0013):
 - `fleet prompts-diff --changelog` — print all entries newer than the
   installed-prompts SHA (verbatim markdown from this file).
 
+## 2026-05-28 — ship PHASE 1 RED gains an infra-flake pre-step
+
+The heal step's contract was "red gating check → run the local gate,
+fix the root cause, commit `heal:`". That assumption burns two heal
+attempts and real claude budget on failures that are NOT the agent's
+code — GitHub Actions silently stopping, `supabase start` losing a
+port-bind race, transient `Your account is suspended` 403s from
+`actions/checkout@v4`, `gh pr checks --watch` aborting on a GraphQL
+502. Ticket 0020 introduces `lib/heal-catalog.sh` (four hand-curated
+regexes pinned to the LESSONS entry each one codifies) and two new
+shell helpers in `lib/common.sh`: `fleet_match_infra_flake <log>`
+prints the matching catalog token (or empty), and
+`fleet_infra_flake_already_rerun <token> <run_id>` answers the dedupe
+question from `events.jsonl`. The ship prompt's PHASE 1 (a) branch
+now downloads the failed job log via `gh run view <id> --log-failed`,
+runs it through `fleet_match_infra_flake`, and on a match: triggers
+`gh run rerun <id> --failed` exactly once, emits
+`infra_flake_rerun pattern=<token> run_id=<id> pr=<N>`, prints
+`INFRA_FLAKE <token> — rerunning run <id>`, and exits with no `heal:`
+commit and no heal-attempt counter advance. A second match on the
+same `<token>+<run_id>` within 2h falls through to the normal heal
+path so a genuinely-broken infra cannot trap the runner in a rerun
+loop. Catalog growth: one line in `lib/heal-catalog.sh` + a fixture
+log in `tests/heal-infra-flake.sh` + an inline LESSON reference
+(date + repo) per pattern. Auto-detection of NEW infra flakes is
+out of scope; that lives in a follow-up ticket.
+
 ## 2026-05-27 — PRINCIPLES.md adds the constitutional layer
 
 Introduces `prompts/PRINCIPLES.md` — eight numbered principles (`P-1` ..

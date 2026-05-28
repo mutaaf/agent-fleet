@@ -38,6 +38,6 @@ ones, `review` grades them.
 | 0016 | events.jsonl size-based rotation with retained archives | P2 | shipped | telemetry |
 | 0018 | prompts/PRINCIPLES.md codifies the loop's unwritten behavioral doctrine | P2 | shipped | governance |
 | 0019 | fleet overview prints a single-glance cross-project health table | P1 | shipped | observability |
-| 0020 | Heal phase detects infra-flake CI failures and reruns instead of code-fixing | P1 | groomed | safety |
+| 0020 | Heal phase detects infra-flake CI failures and reruns instead of code-fixing | P1 | in-progress | safety |
 | 0021 | fleet replay re-runs a past merged PR through the current prompts in dry-run | P2 | groomed | governance |
 | 0022 | Reviewer send-backs drop a LESSONS skeleton draft for operator promotion | P2 | groomed | engine |
