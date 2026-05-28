@@ -1,7 +1,7 @@
 ---
 id: 0021
 title: fleet replay re-runs a past merged PR through the current prompts in dry-run
-status: groomed
+status: in-progress
 priority: P2
 area: governance
 created: 2026-05-28
@@ -181,4 +181,13 @@ Each box maps 1:1 to a test scenario in `tests/replay.sh`.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-28 — picked up by implementation-dev. Branch `feat/0021-fleet-replay`. Plan:
+  add a new `replay()` dispatcher in `bin/fleet` that reuses
+  `rollback_resolve_manifest` (per ticket 0017), composes a prompt input from
+  `gh pr view --json` + `gh pr diff` + the AGENTS.md/LESSONS.md/ticket files
+  from a fresh kit checkout, then invokes `claude --print --output-format json
+  --allowedTools none` directly (we don't need `fleet_run_claude` since the
+  caller is not a runner — and we want `phase=replay` to be a plain label).
+  We DO append to `runs.jsonl` so cost accounting reflects the replay.
+  No changes to `lib/common.sh` — `fleet_log_init` stays out of this. The
+  prompt label is just a string we tag.
