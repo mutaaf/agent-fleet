@@ -178,6 +178,17 @@ postcard.
     do NOT emit this event. Consumer guidance: counts here vs.
     `pr_opened` give a "draft promotion debt" metric — every emitted
     event corresponds to one draft block waiting for an operator pass.
+  - `prompts_pin_changed {old, new}` — emitted by `lib/install.sh` (ticket
+    0024) once per install when the `PROMPTS_SHA=` value the project would
+    end up running differs from the previously-installed pin. `old` is
+    the prior copy's SHA (empty on a first install — falls back to the
+    SOURCE manifest's value as the comparison anchor); `new` is the SHA
+    computed from the kit's current `prompts/`. Carries `phase=install`
+    so consumers can distinguish bootstrap pin transitions from runtime
+    `prompts_drift` warnings. Consumed by `fleet prompts-score` to
+    assemble the per-revision timeline: every transition in this channel
+    becomes a row boundary in the score table. Idempotent: a re-install
+    with no kit/source edits finds `old == new` and stays silent.
   - `trainee_pr_opened {number, remaining}` — emitted by the dev agent
     (driven from `prompts/ship.prompt.md`) immediately after `gh pr
     create` when `FLEET_TRAINEE_REMAINING > 0`, i.e. the project's

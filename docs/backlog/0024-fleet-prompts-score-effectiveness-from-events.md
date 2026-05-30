@@ -1,7 +1,7 @@
 ---
 id: 0024
 title: fleet prompts-score grades each prompt revision from real event history
-status: groomed
+status: shipped
 priority: P1
 area: governance
 created: 2026-05-30
@@ -244,4 +244,20 @@ The dev agent will NOT do these even if they seem related.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-30 — implementation-dev: branch `feat/0024-fleet-prompts-score`
+  opened. Plan: write `tests/prompts-score.sh` first against the synthetic
+  fixture, then implement `prompts_score()` in `bin/fleet` reusing
+  `digest_parse_since`, `digest_iso_to_epoch`, and the JSONL awk patterns
+  from `digest_event_count_since`; add the `prompts_pin_changed` emit in
+  `lib/install.sh` guarded by an old/new SHA diff; append the new event to
+  AGENTS.md § Telemetry.
+- 2026-05-30 — shipped. `tests/prompts-score.sh` covers all nine
+  acceptance-criteria checkboxes plus the install.sh emit path, asserting
+  against a checked-in golden at `tests/fixtures/prompts-score.golden.txt`.
+  The implementation uses three awk passes over events.jsonl + runs.jsonl
+  (timeline assembly, event aggregation, run aggregation) so the heavy
+  lift stays in awk while the bash layer just renders rows. `lib/install.sh`
+  reads the previously-installed `PROMPTS_SHA` BEFORE the source-manifest
+  copy clobbers it, then compares against the freshly-computed pin and
+  emits `prompts_pin_changed {old, new, phase=install}` exactly once when
+  they differ — idempotent against re-installs with no kit/source edits.
