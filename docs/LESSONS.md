@@ -109,6 +109,22 @@ applies to `read -d ''` and `mapfile`, both of which can also clip
 terminators in subtle ways. When in doubt, copy files; only use
 command substitution for content you're about to grep or compare.
 
+## 2026-05-30 — `grep -qF "--flag"` treats the pattern as an option too
+
+The `printf` trap from 2026-05-28 has a sibling. While writing
+`tests/weekly.sh` (ticket 0025) the AC#13 help-text check used
+`grep -qF "$kw" "$help_out"` to verify the help banner mentions
+`--since`, `--slug`, `--json`. macOS BSD grep parses `--since` as an
+unrecognized option and fails with `grep: unrecognized option
+'--since'` to stderr, exits 2, and the test sees a false-negative
+"keyword missing" because `grep -q` returned non-zero. The same trap
+applies to GNU grep on Ubuntu. Fix: use the POSIX `--` end-of-options
+marker — `grep -qF -- "$kw" "$file"`. Same defensive habit as the
+printf rule: any time the FIRST byte of the pattern argument is `-`,
+insert `--` between the flags and the pattern. Tooling that takes
+patterns positionally and ALSO accepts double-dash options (grep,
+sed -E, awk -v, find -name) all share this footgun.
+
 ## 2026-05-28 — `printf '- foo\n' "$bar"` treats the leading dash as a flag
 
 While shipping ticket 0021's `replay_compose_prompt`, the first cut used
