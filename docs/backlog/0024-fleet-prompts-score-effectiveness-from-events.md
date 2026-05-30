@@ -1,7 +1,7 @@
 ---
 id: 0024
 title: fleet prompts-score grades each prompt revision from real event history
-status: groomed
+status: in-progress
 priority: P1
 area: governance
 created: 2026-05-30
@@ -244,4 +244,10 @@ The dev agent will NOT do these even if they seem related.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-05-30 — implementation-dev: branch `feat/0024-fleet-prompts-score`
+  opened. Plan: write `tests/prompts-score.sh` first against the synthetic
+  fixture, then implement `prompts_score()` in `bin/fleet` reusing
+  `digest_parse_since`, `digest_iso_to_epoch`, and the JSONL awk patterns
+  from `digest_event_count_since`; add the `prompts_pin_changed` emit in
+  `lib/install.sh` guarded by an old/new SHA diff; append the new event to
+  AGENTS.md § Telemetry.
