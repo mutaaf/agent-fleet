@@ -444,6 +444,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet doctor --slug courtiq   # one project
 ~/code/agent-fleet/bin/fleet doctor --json           # machine-readable, for fleet-control
 ~/code/agent-fleet/bin/fleet overview                # one-table cross-project pulse — SHIP/REVIEW/SENDBK/$TODAY/IN-FLIGHT/STATE
+~/code/agent-fleet/bin/fleet weekly                  # Sunday ROI rollup over the trailing 7d — SHIPPED/$SPEND/DRAFTS↑/HEAL/INFRA/PAUSED/SELF-CANCEL
 ~/code/agent-fleet/bin/fleet tail                    # stream live events from every project (Ctrl-C to stop)
 ~/code/agent-fleet/bin/fleet rollback courtiq        # revert the last agent-shipped commit (revert/<id>-<slug> PR)
 ~/code/agent-fleet/bin/fleet kickstart courtiq ship             # trigger a one-shot agent-ship run

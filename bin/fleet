@@ -9,6 +9,8 @@
 #   fleet doctor              diagnose every installed project (PASS/WARN/FAIL)
 #   fleet doctor --json       machine-readable summary for fleet-control
 #   fleet doctor --slug NAME  restrict to one project
+#   fleet weekly              Sunday ROI rollup over the trailing 7d window
+#                             (ticket 0025 — pure consumer of telemetry)
 #   fleet prompts-sha         print the SHA256 of the kit's prompts/ tree
 #                             (ticket 0005 — for PROMPTS_SHA pinning)
 #
@@ -1470,6 +1472,403 @@ USAGE
 
 if [ "$CMD" = "digest" ]; then
   digest "$@"
+fi
+
+# --- weekly (ticket 0025) ------------------------------------------------
+# `fleet weekly` prints a one-screen Sunday ROI rollup per project covering
+# the trailing 7 days (configurable via --since Nh|Nd). Pure consumer of
+# events.jsonl + runs.jsonl — emits NO new event types (P-6: telemetry is
+# the source of truth; readers compose, they do not invent).
+#
+# Discovery reuses the same root-redirect pattern as `digest` / `overview`
+# (FLEET_DISCOVERY_ROOT). Render is deliberately separate from `digest`
+# because the column set differs (no LAST line; adds DRAFTS, PAUSED, INFRA).
+# All per-row math reuses the digest helpers above:
+#   digest_parse_since, digest_iso_to_epoch, digest_spend_since,
+#   digest_event_count_since
+# plus three thin wrappers named for the event type they count
+# (weekly_draft_count_since / weekly_heal_count_since /
+#  weekly_infra_flake_count_since) so the call sites read like English.
+#
+# Test seam: FLEET_WEEKLY_FAKE_NOW (epoch seconds) overrides "now" so the
+# WEEK header, the cutoff math, and the self-cancel countdown all become
+# deterministic for tests/weekly.sh.
+#
+# Naming clash check (LESSONS 2026-05-26): `weekly` is not a coreutils
+# binary on macOS or Linux; no `_cmd` suffix needed.
+
+WEEKLY_ROOT="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+WEEKLY_INSTALLED="$HOME/.local/share/agent-fleet/projects"
+
+# Discover (slug, manifest_path) rows union of the two roots, de-duped by
+# SLUG, slug-alpha sorted. Working-tree manifests win over installed
+# copies (same convention as `overview_discover`).
+weekly_discover() {
+  local _seen="" m slug
+  { find "$WEEKLY_ROOT"      -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$WEEKLY_INSTALLED" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf '%s\t%s\n' "$slug" "$m"
+  done | sort -t $'\t' -k1,1
+}
+
+# Thin, intent-named wrappers around digest_event_count_since so call
+# sites read clearly. Each just counts one event type in the window.
+weekly_draft_count_since() {        # $1 = events.jsonl, $2 = cutoff epoch
+  digest_event_count_since "$1" "$2" "lesson_draft_emitted"
+}
+weekly_heal_count_since() {         # $1 = events.jsonl, $2 = cutoff epoch
+  digest_event_count_since "$1" "$2" "gate_failed"
+}
+weekly_infra_flake_count_since() {  # $1 = events.jsonl, $2 = cutoff epoch
+  digest_event_count_since "$1" "$2" "infra_flake_rerun"
+}
+
+# Count SHIP-prefixed runs.jsonl rows whose ts_start is in window. The
+# result_head's "SHIP <ticket-id>" prefix is the dev agent's standard
+# exit-line format (per prompts/ship.prompt.md line 159); we treat it as
+# the proxy for "merged agent PR" since the offline rule (AC#2) forbids
+# us from cross-referencing gh's mergedAt.
+weekly_ship_count_since() {  # $1 = runs.jsonl, $2 = cutoff epoch
+  local runs="$1" cutoff="$2"
+  [ -f "$runs" ] || { echo 0; return 0; }
+  awk -v cutoff="$cutoff" '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    {
+      ts=""; head=""
+      if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"result_head"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        head=substr($0, RSTART, RLENGTH)
+        sub(/.*"result_head"[[:space:]]*:[[:space:]]*"/, "", head); sub(/".*/, "", head)
+      }
+      if (ts == "" || head == "") next
+      if (substr(head, 1, 5) != "SHIP ") next
+      if (iso2ep(ts) < cutoff) next
+      n++
+    }
+    END { print (n+0) }
+  ' "$runs"
+}
+
+# Days since the project's agent-ship plist was last touched (proxy for
+# "how long has this project been paused?"). The mtime of
+# ~/Library/LaunchAgents/com.<slug>.agent-ship.plist updates on each
+# install.sh; if a project has been paused for less than the time since
+# the last install, this OVERSTATES — acceptable for v1 per the ticket
+# engineering notes. Echoes a non-negative integer, or empty when no
+# plist exists.
+weekly_paused_days() {  # $1 = namespace (e.g. com.courtiq)
+  local namespace="$1"
+  local plist="$HOME/Library/LaunchAgents/${namespace}.agent-ship.plist"
+  [ -f "$plist" ] || { echo ""; return 0; }
+  local mtime now
+  mtime="$(stat -f %m "$plist" 2>/dev/null || stat -c %Y "$plist" 2>/dev/null)"
+  [ -n "$mtime" ] || { echo ""; return 0; }
+  now="${FLEET_WEEKLY_FAKE_NOW:-$(date -u +%s)}"
+  local diff=$(( now - mtime ))
+  [ "$diff" -lt 0 ] && diff=0
+  echo $(( diff / 86400 ))
+}
+
+# Is the project currently paused (agent-ship label disabled in launchctl)?
+# Echoes "1" yes, "0" no. Skipped silently when launchctl is unavailable.
+weekly_is_paused() {  # $1 = namespace
+  local namespace="$1"
+  command -v launchctl >/dev/null 2>&1 || { echo 0; return 0; }
+  if launchctl print-disabled "gui/$UID" 2>/dev/null \
+       | grep -q "\"$namespace.agent-ship\" => true"; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# Self-cancel days remaining, honouring FLEET_WEEKLY_FAKE_NOW so the
+# golden file's countdown stays stable. Echoes a possibly-negative integer
+# (negative = past) or empty when SELF_CANCEL is unset / unparseable.
+weekly_self_cancel_days() {  # $1 = YYYYMMDD
+  local sc="$1"
+  case "$sc" in
+    ''|*[!0-9]*) echo ""; return 0 ;;
+  esac
+  local target; target=$(date -u -j -f "%Y%m%d" "$sc" +%s 2>/dev/null) || { echo ""; return 0; }
+  local now_epoch="${FLEET_WEEKLY_FAKE_NOW:-$(date -u +%s)}"
+  local today_iso today_epoch
+  today_iso="$(date -u -r "$now_epoch" +%Y%m%d 2>/dev/null || date -u -d "@$now_epoch" +%Y%m%d)"
+  today_epoch=$(date -u -j -f "%Y%m%d" "$today_iso" +%s 2>/dev/null) \
+    || today_epoch=$(date -u -d "$today_iso" +%s 2>/dev/null) || today_epoch=0
+  echo $(( (target - today_epoch) / 86400 ))
+}
+
+# Pad a string to a fixed DISPLAY width, treating the few non-ASCII glyphs
+# we render (↑, ⚠, ✗, – en-dash) as 1 display column even though they
+# take 3 UTF-8 bytes each. bash printf's %-Ns counts bytes, so without
+# this helper the DRAFTS↑ header and the SELF-CANCEL "EXPIRED ✗" cells
+# would mis-align under their column boundaries.
+weekly_pad() {  # $1 = string, $2 = display width
+  local s="$1" w="$2"
+  local stripped="$s"
+  stripped="${stripped//↑/X}"
+  stripped="${stripped//⚠/X}"
+  stripped="${stripped//✗/X}"
+  stripped="${stripped//–/X}"
+  local len="${#stripped}"
+  local pad=$(( w - len ))
+  [ "$pad" -lt 0 ] && pad=0
+  printf '%s%*s' "$s" "$pad" ''
+}
+
+# Render one row (header or data). Eight columns, fixed widths. The
+# DRAFTS, SELF-CANCEL columns may carry unicode glyphs — we route through
+# weekly_pad so the byte-width arithmetic stays display-correct.
+weekly_render_row() {
+  local project="$1" shipped="$2" spend="$3" drafts="$4"
+  local heal="$5" infra="$6" paused="$7" self_cancel="$8"
+  weekly_pad "$project" 14;     printf ' '
+  weekly_pad "$shipped" 8;      printf ' '
+  weekly_pad "$spend" 8;        printf ' '
+  weekly_pad "$drafts" 8;       printf ' '
+  weekly_pad "$heal" 5;         printf ' '
+  weekly_pad "$infra" 6;        printf ' '
+  weekly_pad "$paused" 7;       printf ' '
+  printf '%s\n' "$self_cancel"
+}
+
+weekly() {
+  shift  # drop the leading "weekly"
+  local want_json=0 slug_filter="" since="7d"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)    want_json=1; shift ;;
+      --slug)    slug_filter="${2:-}"; shift 2 ;;
+      --slug=*)  slug_filter="${1#--slug=}"; shift ;;
+      --since)   since="${2:-}"; shift 2 ;;
+      --since=*) since="${1#--since=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet weekly — Sunday ROI rollup, one row per project.
+
+Usage:
+  fleet weekly                 default --since 7d window
+  fleet weekly --since 14d     biweekly view (also accepts Nh)
+  fleet weekly --slug NAME     restrict to one project (no ALL: line)
+  fleet weekly --json          one JSON object per project + one summary
+
+Columns:
+  PROJECT      slug from manifest
+  SHIPPED      count of merged agent PRs in window (SHIP-prefixed runs)
+  \$SPEND       sum of runs.jsonl total_cost_usd in window
+  DRAFTS↑      lesson_draft_emitted events in window (suffix * when > 0)
+  HEAL         gate_failed events in window
+  INFRA        infra_flake_rerun events in window
+  PAUSED       "Nd!" if agent-ship label is disabled, else "no"
+  SELF-CANCEL  days remaining (Nd / Nd ⚠ if ≤7 / EXPIRED ✗ if past)
+
+Trailing lines:
+  N* drafts waiting on you...  (only when sum(DRAFTS) > 0)
+  ALL: P PRs shipped, \$S spent (\$avg/PR avg), H heal, I infra-flake
+       rerun, P paused, E expired.  (suppressed when --slug given)
+
+JSON schema (per-project):
+  {slug, shipped, spend, drafts, heal, infra, paused_days,
+   self_cancel_days, self_cancel_state}  self_cancel_state in ok|warn|expired
+JSON schema (summary):
+  {summary:true, prs, spend, avg_per_pr, heal, infra, paused, expired,
+   window_days}
+
+Read-only — no commits, no PRs, no new event types.
+USAGE
+        exit 0 ;;
+      *) echo "fleet weekly: unknown flag '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  local since_seconds
+  if ! since_seconds="$(digest_parse_since "$since")"; then
+    echo "weekly: invalid --since \"$since\" (use Nh or Nd)" >&2
+    exit 2
+  fi
+  local now cutoff
+  now="${FLEET_WEEKLY_FAKE_NOW:-$(date -u +%s)}"
+  cutoff=$(( now - since_seconds ))
+  local window_days=$(( since_seconds / 86400 ))
+  [ "$window_days" -lt 1 ] && window_days=1
+
+  # Header banner — only printed in human mode.
+  if [ "$want_json" != "1" ]; then
+    local from_iso to_iso
+    from_iso="$(date -u -r "$cutoff" +%F 2>/dev/null || date -u -d "@$cutoff" +%F)"
+    to_iso="$(date -u -r "$now" +%F 2>/dev/null || date -u -d "@$now" +%F)"
+    printf 'WEEK OF %s – %s (%dd)\n' "$from_iso" "$to_iso" "$window_days"
+    printf '\n'
+    weekly_render_row "PROJECT" "SHIPPED" "\$SPEND" "DRAFTS↑" "HEAL" "INFRA" "PAUSED" "SELF-CANCEL"
+    # Underline. 73 = total printable width of the row (14+1+8+1+8+1+8+1+5+1+6+1+7+1+11 = 74).
+    printf -- '%s\n' "─────────────────────────────────────────────────────────────────────────"
+  fi
+
+  # Aggregate per-project, accumulating totals for the ALL: line.
+  local total_prs=0 total_drafts=0 total_heal=0 total_infra=0
+  local total_paused=0 total_expired=0
+  # We sum spend in awk (float).
+  local total_spend_dollars="0.00"
+
+  local json_rows=""
+  local slug manifest
+  while IFS=$'\t' read -r slug manifest; do
+    [ -z "$slug" ] && continue
+    [ -n "$slug_filter" ] && [ "$slug" != "$slug_filter" ] && continue
+
+    # Manifest probe — fetch namespace + self-cancel.
+    local probe namespace self_cancel
+    probe=$(
+      # shellcheck disable=SC1090
+      ( source "$manifest" 2>/dev/null
+        echo "NAMESPACE=${NAMESPACE:-com.fleet.${SLUG:-x}}"
+        echo "SELF_CANCEL=${SELF_CANCEL:-}"
+      ) 2>/dev/null
+    ) || true
+    namespace="$(echo "$probe" | sed -n 's/^NAMESPACE=//p')"
+    self_cancel="$(echo "$probe" | sed -n 's/^SELF_CANCEL=//p')"
+
+    local cache_dir="$HOME/.cache/${slug}-agent"
+    local runs="$cache_dir/runs.jsonl"
+    local events="$cache_dir/events.jsonl"
+
+    local shipped spend drafts heal infra
+    shipped="$(weekly_ship_count_since        "$runs"   "$cutoff")"
+    spend="$(  digest_spend_since             "$runs"   "$cutoff")"
+    drafts="$( weekly_draft_count_since       "$events" "$cutoff")"
+    heal="$(   weekly_heal_count_since        "$events" "$cutoff")"
+    infra="$(  weekly_infra_flake_count_since "$events" "$cutoff")"
+
+    # PAUSED + paused_days.
+    local is_paused paused_days paused_cell
+    is_paused="$(weekly_is_paused "$namespace")"
+    if [ "$is_paused" = "1" ]; then
+      paused_days="$(weekly_paused_days "$namespace")"
+      [ -z "$paused_days" ] && paused_days=0
+      paused_cell="${paused_days}d!"
+      total_paused=$(( total_paused + 1 ))
+    else
+      paused_days=""
+      paused_cell="no"
+    fi
+
+    # SELF-CANCEL cell + state.
+    local sc_days sc_cell sc_state
+    sc_days="$(weekly_self_cancel_days "$self_cancel")"
+    if [ -z "$sc_days" ]; then
+      sc_cell="—"; sc_state="ok"
+    elif [ "$sc_days" -lt 0 ]; then
+      sc_cell="EXPIRED ✗"; sc_state="expired"
+      total_expired=$(( total_expired + 1 ))
+    elif [ "$sc_days" -le 7 ]; then
+      sc_cell="${sc_days}d ⚠"; sc_state="warn"
+    else
+      sc_cell="${sc_days}d"; sc_state="ok"
+    fi
+
+    # DRAFTS cell: append `*` when > 0 to draw the eye (per AC#2).
+    local drafts_cell="$drafts"
+    [ "$drafts" -gt 0 ] && drafts_cell="${drafts}*"
+
+    # Accumulate totals (drafts numeric, not with asterisk).
+    total_prs=$(( total_prs + shipped ))
+    total_drafts=$(( total_drafts + drafts ))
+    total_heal=$(( total_heal + heal ))
+    total_infra=$(( total_infra + infra ))
+    total_spend_dollars="$(awk -v a="$total_spend_dollars" -v b="$spend" \
+      'BEGIN { printf("%.2f", a + b) }')"
+
+    if [ "$want_json" = "1" ]; then
+      local esc_slug
+      esc_slug="$(doctor_json_escape "$slug")"
+      local paused_days_json="null"
+      [ -n "$paused_days" ] && paused_days_json="$paused_days"
+      local sc_days_json="null"
+      [ -n "$sc_days" ] && sc_days_json="$sc_days"
+      [ -n "$json_rows" ] && json_rows+=$'\n'
+      json_rows+="{\"slug\":\"$esc_slug\""
+      json_rows+=",\"shipped\":$shipped"
+      json_rows+=",\"spend\":$spend"
+      json_rows+=",\"drafts\":$drafts"
+      json_rows+=",\"heal\":$heal"
+      json_rows+=",\"infra\":$infra"
+      json_rows+=",\"paused_days\":$paused_days_json"
+      json_rows+=",\"self_cancel_days\":$sc_days_json"
+      json_rows+=",\"self_cancel_state\":\"$sc_state\"}"
+    else
+      weekly_render_row "$slug" "$shipped" "\$$spend" "$drafts_cell" \
+                        "$heal" "$infra" "$paused_cell" "$sc_cell"
+    fi
+  done < <(weekly_discover)
+
+  # Avg cost per PR. Empty / null when no PRs shipped this window.
+  local avg_per_pr="" avg_per_pr_json="null"
+  if [ "$total_prs" -gt 0 ]; then
+    avg_per_pr="$(awk -v s="$total_spend_dollars" -v p="$total_prs" \
+      'BEGIN { printf("%.2f", s / p) }')"
+    avg_per_pr_json="$avg_per_pr"
+  fi
+
+  if [ "$want_json" = "1" ]; then
+    # Stream one JSON object per line, project rows first, then summary.
+    [ -n "$json_rows" ] && printf '%s\n' "$json_rows"
+    printf '{"summary":true'
+    printf ',"prs":%s' "$total_prs"
+    printf ',"spend":%s' "$total_spend_dollars"
+    printf ',"avg_per_pr":%s' "$avg_per_pr_json"
+    printf ',"heal":%s' "$total_heal"
+    printf ',"infra":%s' "$total_infra"
+    printf ',"paused":%s' "$total_paused"
+    printf ',"expired":%s' "$total_expired"
+    printf ',"window_days":%s' "$window_days"
+    printf '}\n'
+    exit 0
+  fi
+
+  # Human-mode trailing lines.
+  # Drafts hint: only when sum > 0.
+  if [ "$total_drafts" -gt 0 ]; then
+    printf '\n%d* drafts waiting on you. Promote in <repo>/docs/LESSONS.md or run\n' "$total_drafts"
+    printf '`fleet digest --slug <slug>` for the per-project event tail.\n'
+  fi
+
+  # ALL: summary. Suppressed when --slug filter is set.
+  if [ -z "$slug_filter" ]; then
+    printf '\n'
+    if [ "$total_prs" -gt 0 ]; then
+      printf 'ALL: %d PRs shipped, $%s spent ($%s/PR avg), %d heal attempts,\n' \
+        "$total_prs" "$total_spend_dollars" "$avg_per_pr" "$total_heal"
+    else
+      printf 'ALL: %d PRs shipped, $%s spent, %d heal attempts,\n' \
+        "$total_prs" "$total_spend_dollars" "$total_heal"
+    fi
+    printf '     %d infra-flake rerun, %d paused, %d expired.\n' \
+      "$total_infra" "$total_paused" "$total_expired"
+  fi
+
+  exit 0
+}
+
+if [ "$CMD" = "weekly" ]; then
+  weekly "$@"
 fi
 
 # --- prompts-score (ticket 0024) -----------------------------------------
