@@ -1,7 +1,7 @@
 ---
 id: 0025
 title: fleet weekly prints a Sunday ROI rollup with draft-promotion debt per project
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-05-30
@@ -248,3 +248,21 @@ The dev agent will NOT do these even if they seem related.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+- 2026-05-30: Picked up by implementation-dev. Branch
+  `feat/0025-fleet-weekly-roi-rollup`. Plan:
+  1. Write `tests/weekly.sh` with one assertion block per AC checkbox
+     and a `tests/fixtures/weekly/` directory seeding three synthetic
+     projects (with `runs.jsonl` + `events.jsonl`) plus a checked-in
+     golden file `tests/fixtures/weekly.golden.txt`.
+  2. Implement `weekly()` in `bin/fleet` next to `digest()` —
+     dispatcher + helpers (`weekly_draft_count_since`,
+     `weekly_heal_count_since`, `weekly_infra_flake_count_since`,
+     `weekly_paused_days`, `weekly_ship_count_since`).
+  3. Add the new subcommand to the help banner at the top of
+     `bin/fleet` and to README.md "Daily ops" code block.
+  4. Run the local gate (`shellcheck lib/*.sh bin/fleet && bash -n
+     lib/*.sh bin/fleet && node scripts/check-backlog.mjs`) green
+     and `bash tests/weekly.sh` green.
+  5. PR with the standard trailer; no `Reinstall:` line (no `lib/`
+     or `prompts/` touch).
