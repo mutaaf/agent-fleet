@@ -1,7 +1,7 @@
 ---
 id: 0025
 title: fleet weekly prints a Sunday ROI rollup with draft-promotion debt per project
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-05-30
@@ -266,3 +266,5 @@ The dev agent will NOT do these even if they seem related.
      and `bash tests/weekly.sh` green.
   5. PR with the standard trailer; no `Reinstall:` line (no `lib/`
      or `prompts/` touch).
+- 2026-05-30: PR #43 merged green (shellcheck + validate both pass).
+  Status → shipped.
