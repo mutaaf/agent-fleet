@@ -43,4 +43,4 @@ ones, `review` grades them.
 | 0022 | Reviewer send-backs drop a LESSONS skeleton draft for operator promotion | P2 | shipped | engine |
 | 0023 | fleet kickstart --demo runs a credential-less end-to-end loop in 60 seconds | P2 | groomed | docs |
 | 0024 | fleet prompts-score grades each prompt revision from real event history | P1 | shipped | governance |
-| 0025 | fleet weekly prints a Sunday ROI rollup with draft-promotion debt per project | P1 | in-progress | observability |
+| 0025 | fleet weekly prints a Sunday ROI rollup with draft-promotion debt per project | P1 | shipped | observability |
