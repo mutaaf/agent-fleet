@@ -1,7 +1,7 @@
 ---
 id: 0023
 title: fleet kickstart --demo runs a credential-less end-to-end loop in 60 seconds
-status: groomed
+status: in-progress
 priority: P2
 area: docs
 created: 2026-05-30
@@ -224,5 +224,21 @@ The dev agent will NOT do these even if they seem related.
   laptop.
 
 ## Implementation log
+
+- 2026-05-30 — picked up by implementation-dev. Status → in-progress.
+  Plan: `kickstart_demo()` in `bin/fleet` writes a fixture project under
+  `mktemp -d -t fleet-demo`, installs `gh`/`claude`/`git-push-stub` stubs
+  under `$HOME/.local/bin` (per LESSONS 2026-05-26 — `lib/common.sh`
+  resets PATH on source, so stubs anywhere else evaporate), then sources
+  `lib/common.sh`, calls `fleet_load_manifest` on the fixture, and
+  manually emits the four required event types (`run_started`,
+  `pr_opened`, `lesson_draft_emitted`, `run_completed`) directly via
+  `fleet_emit_event` rather than driving `ship.sh`. Rationale: AC#7
+  requires the demo to succeed with PATH=`$HOME/.local/bin` ONLY (no
+  real `git`), so the synthetic loop cannot actually shell out to git
+  for a checkout — it walks the events.jsonl channel as a consumer, not
+  via the production runner. The `_review_emit_lesson_draft` helper is
+  reused so the seeded DRAFT block in the fixture's LESSONS.md is the
+  same shape ticket 0022 produces in production.
 
 (Appended by the implementation-dev agent during execution.)
