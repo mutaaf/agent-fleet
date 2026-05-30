@@ -3037,12 +3037,276 @@ kickstart_resolve_manifest() {
   done
 }
 
+# --- kickstart --demo cleanup helper (ticket 0023) ------------------------
+# Module-level so the EXIT/INT/TERM trap can reference it after
+# kickstart_demo's locals have gone out of scope. Reads three globals
+# the demo sets up before installing the trap: FLEET_DEMO_KEEP,
+# FLEET_DEMO_FIXTURE, FLEET_DEMO_STUB_DIR.
+_demo_cleanup_run() {
+  local rc=$?
+  if [ "${FLEET_DEMO_KEEP:-0}" = "1" ]; then
+    # --keep: preserve the fixture AND the stubs so the operator can
+    # inspect both. The demo printed both paths at start.
+    return $rc
+  fi
+  if [ -n "${FLEET_DEMO_FIXTURE:-}" ]; then
+    rm -rf "$FLEET_DEMO_FIXTURE" 2>/dev/null || true
+  fi
+  if [ -n "${FLEET_DEMO_STUB_DIR:-}" ]; then
+    rm -f "$FLEET_DEMO_STUB_DIR/gh" \
+          "$FLEET_DEMO_STUB_DIR/claude" \
+          "$FLEET_DEMO_STUB_DIR/git-push-stub" 2>/dev/null || true
+  fi
+  return $rc
+}
+
+# --- kickstart --demo (ticket 0023) ---------------------------------------
+# kickstart_demo <keep:0|1> <tail_seconds:int>  — walks a credential-less
+# synthetic ship/review loop against a one-off fixture project.
+#
+# Why this exists: the README's mental-model section is prose + a Mermaid
+# diagram. A stranger evaluating the kit cannot see the loop run without
+# installing launchd jobs, configuring `gh`, and waiting an hour. This
+# subcommand collapses that into one command — fixture in $TMPDIR, stubs
+# in $HOME/.local/bin, real events.jsonl + runs.jsonl under a per-demo
+# cache dir, four event types emitted exactly once each, total wallclock
+# well under a minute.
+#
+# Design choice (matters for AC#7): the demo does NOT shell out to
+# `git`/`gh`/`claude`. It sources `lib/common.sh`, calls
+# `fleet_load_manifest` against the fixture, then directly invokes
+# `fleet_emit_event` and `_review_emit_lesson_draft` for the four
+# required event types. This means the demo succeeds even when the
+# operator's PATH is exclusively $HOME/.local/bin (per AC#7's test
+# environment) — we never need the real binaries because we never
+# call them. The stubs at $HOME/.local/bin exist for two reasons:
+#   (1) they SHADOW any real binary the operator might have, proving
+#       the synthetic loop is hermetic — if a real `gh` somehow gets
+#       called, the stub records it instead;
+#   (2) they prove the operator can copy this same pattern into a CI
+#       smoke test without bootstrapping the Anthropic CLI.
+#
+# PATH note (LESSONS 2026-05-26): sourcing `lib/common.sh` resets PATH
+# to `$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:...`.
+# That's exactly what we want — the stubs at $HOME/.local/bin still win
+# (they're first), but mktemp/cat/awk/etc. become resolvable. So we
+# source common.sh BEFORE any external command other than the bash
+# builtins above. The test invokes us with PATH=$HOME/.local/bin only
+# to prove the restoration works.
+#
+# Cleanup: a single EXIT trap removes the fixture (unless --keep was
+# passed) and the three demo stubs. The trap fires on normal exit AND
+# on `FLEET_DEMO_FORCE_FAIL=1` (which short-circuits the synthetic loop
+# with exit 1 — see AC#10).
+kickstart_demo() {
+  local keep="${1:-0}" tail_secs="${2:-0}"
+
+  # Source common.sh to restore PATH and gain fleet_emit_event /
+  # fleet_load_manifest. KIT_ROOT is derived from bin/fleet's location
+  # (this script is at $KIT_ROOT/bin/fleet). We use bash parameter
+  # expansion (no `dirname`) so the demo works even under the AC#7
+  # test environment where PATH=$HOME/.local/bin only — `dirname` is
+  # in /usr/bin and would NOT be on that PATH yet.
+  local script_path bin_dir kit_root
+  script_path="${BASH_SOURCE[0]}"
+  # Resolve a relative invocation to an absolute path via the working
+  # directory. We avoid `realpath` (not POSIX) and stick to PWD math.
+  case "$script_path" in
+    /*) ;;
+    *)  script_path="$PWD/$script_path" ;;
+  esac
+  bin_dir="${script_path%/*}"     # strip /fleet
+  kit_root="${bin_dir%/*}"        # strip /bin
+  # shellcheck source=/dev/null
+  source "$kit_root/lib/common.sh"
+
+  # Resolve the bundled fixture. Lives under $kit_root/tests/fixtures/demo/.
+  local fixture_src="$kit_root/tests/fixtures/demo"
+  if [ ! -d "$fixture_src" ]; then
+    echo "fleet kickstart --demo: fixture source $fixture_src not found" >&2
+    return 2
+  fi
+
+  # Per-invocation random slug (5 lowercase alnum chars). Avoids cache
+  # collisions when two demos race on the same $HOME. We avoid
+  # `tr -dc … </dev/urandom | head -c N` because the SIGPIPE that kills
+  # `tr` once `head` has its N chars races with bash's pipefail and can
+  # leak partial output. Hex from $RANDOM is hermetic and good enough
+  # for collision avoidance in a CLI demo.
+  local rand demo_slug fixture_dir stub_dir
+  rand="$(printf '%04x' "$RANDOM")"
+  demo_slug="demo-$rand"
+  fixture_dir="$(mktemp -d -t fleet-demo)"
+  stub_dir="$HOME/.local/bin"
+  mkdir -p "$stub_dir"
+
+  echo "[demo] scaffolding fixture in $fixture_dir"
+  echo "[demo] stubs in $stub_dir (gh, claude, git-push-stub)"
+
+  # Cleanup trap. `keep` decides whether the fixture is wiped; stubs
+  # are always removed (the operator did not have them before the demo
+  # ran, so leaving them behind would surprise the next shell). Bake
+  # the paths/keep flag into globals so the trap body can see them
+  # AFTER kickstart_demo's locals have gone out of scope (`set -u` in
+  # bin/fleet would otherwise blow up on the trap firing post-return).
+  FLEET_DEMO_KEEP="$keep"
+  FLEET_DEMO_FIXTURE="$fixture_dir"
+  FLEET_DEMO_STUB_DIR="$stub_dir"
+  export FLEET_DEMO_KEEP FLEET_DEMO_FIXTURE FLEET_DEMO_STUB_DIR
+  trap '_demo_cleanup_run' EXIT INT TERM
+
+  # ---- Write the fixture ------------------------------------------------
+  # Per LESSONS 2026-05-27, we use `cp` (not $(cat template)) to copy
+  # files we'll later sed-substitute, so trailing newlines survive the
+  # round-trip.
+  mkdir -p "$fixture_dir/docs/backlog"
+  cp "$fixture_src/AGENTS.md"                       "$fixture_dir/AGENTS.md"
+  cp "$fixture_src/docs/LESSONS.md"                 "$fixture_dir/docs/LESSONS.md"
+  cp "$fixture_src/docs/backlog/README.md"          "$fixture_dir/docs/backlog/README.md"
+  cp "$fixture_src/docs/backlog/0001-demo-hello-world.md" \
+     "$fixture_dir/docs/backlog/0001-demo-hello-world.md"
+  cp "$fixture_src/docs/backlog/0002-demo-second-ticket.md" \
+     "$fixture_dir/docs/backlog/0002-demo-second-ticket.md"
+  # Manifest needs the slug token substituted. sed in-place via a temp
+  # file (POSIX-portable; macOS sed -i needs a backup arg).
+  local manifest_tmp="$fixture_dir/agents.config.sh.tmp"
+  sed -e "s/__DEMO_SLUG__/$demo_slug/g" \
+      "$fixture_src/agents.config.sh" > "$manifest_tmp"
+  mv "$manifest_tmp" "$fixture_dir/agents.config.sh"
+
+  # ---- Install stubs ---------------------------------------------------
+  # All three are exit-0 no-ops that echo to a fixture-local log so the
+  # reader can inspect them with --keep. We deliberately overwrite any
+  # pre-existing host stub the test harness installed — proving the
+  # demo's install is unconditional.
+  local stub_log="$fixture_dir/stub-calls.log"
+  : > "$stub_log"
+  local s
+  for s in gh claude; do
+    cat > "$stub_dir/$s" <<STUB
+#!/bin/bash
+# Stub installed by 'fleet kickstart --demo'. Logs argv to a fixture
+# file so the operator (or test) can prove no real network call fired.
+printf '%s %s\n' "$s" "\$*" >> "$stub_log" 2>/dev/null || true
+exit 0
+STUB
+    chmod +x "$stub_dir/$s"
+  done
+  # git-push-stub is a sibling helper, not a replacement for git itself
+  # (replacing git would break git diff / git log which any inner prompt
+  # might read). The demo never invokes git, so this stub just records
+  # its existence to satisfy AC#3's "three stubs installed" contract.
+  cat > "$stub_dir/git-push-stub" <<STUB
+#!/bin/bash
+printf 'git-push-stub %s\n' "\$*" >> "$stub_log" 2>/dev/null || true
+exit 0
+STUB
+  chmod +x "$stub_dir/git-push-stub"
+
+  # ---- Synthetic loop --------------------------------------------------
+  # Load the manifest under our fixture so CACHE_DIR/SLUG/etc. resolve
+  # to the demo's isolated paths. fleet_load_manifest sets CACHE_DIR =
+  # $HOME/.cache/${SLUG}-agent, so the demo's events.jsonl and
+  # runs.jsonl naturally live under a per-slug cache that cannot collide
+  # with any real project (the slug starts with `demo-`).
+  fleet_load_manifest "$fixture_dir"
+  # Tag every event with phase=demo. fleet_log_init usually does this
+  # plus a log redirect; we skip the redirect because the demo wants
+  # to talk to the operator's terminal, not a logfile.
+  FLEET_PHASE="demo"; export FLEET_PHASE
+  RUN_STARTED_UTC="$(date -u +%FT%TZ)"
+  RUN_STARTED_EPOCH="$(date -u +%s)"
+  export RUN_STARTED_UTC RUN_STARTED_EPOCH
+
+  echo "[demo] slug=$SLUG  cache=$CACHE_DIR"
+  echo "[demo] events at $CACHE_DIR/events.jsonl"
+
+  # Force-fail hook (AC#10): exit before emitting any events so the test
+  # can prove the trap still runs.
+  if [ -n "${FLEET_DEMO_FORCE_FAIL:-}" ]; then
+    echo "[demo] FLEET_DEMO_FORCE_FAIL=1 — aborting synthetic loop" >&2
+    return 1
+  fi
+
+  # Emit the four required event types in narrative order. The user-
+  # story prose in ticket 0023 walks the same sequence.
+  echo "[demo] phase 1: heal — no in-flight PRs, falling through"
+  echo "[demo] phase 2: ship — picking 0001-demo-hello-world (P1, groomed)"
+  fleet_emit_event run_started "pid=$$" || true
+
+  echo "[demo] stubbed claude returned SHIP — 1 file changed"
+  echo "[demo] stubbed gh pr create #42 (feat/0001-demo-hello-world)"
+  fleet_emit_event pr_opened "number=42" "branch=feat/0001-demo-hello-world" || true
+
+  # Synthesize a reviewer body file and feed it through
+  # _review_emit_lesson_draft so the seeded DRAFT block lands in the
+  # fixture's LESSONS.md AND a `lesson_draft_emitted` event fires (the
+  # helper emits the event itself per ticket 0022).
+  local body_file="$fixture_dir/.demo-review-body.txt"
+  {
+    printf -- 'demo: stubbed reviewer send-back to surface the DRAFT-block artifact\n'
+    printf -- '\n'
+    printf -- 'The reviewer flagged the hello-world PR so the operator can see\n'
+    printf -- 'what a real send-back looks like. Promote or delete this block.\n'
+  } > "$body_file"
+  # The helper writes to docs/LESSONS.md relative to cwd; cd into the
+  # fixture so the right file is targeted.
+  ( cd "$fixture_dir" && _review_emit_lesson_draft 42 "$body_file" "docs/LESSONS.md" >/dev/null )
+
+  # Write the runs.jsonl row by hand (we never called claude, so
+  # fleet_run_claude didn't run — but AC#9 wants exactly one phase=demo
+  # row to prove the demo's synthetic cost (0.0) cannot pollute
+  # `fleet digest` for any real project).
+  mkdir -p "$CACHE_DIR"
+  printf '{"slug":"%s","phase":"demo","ts_start":"%s","ts_end":"%s","exit":0,"model":"%s","total_cost_usd":0.0,"duration_ms":0,"result_head":"demo synthetic ship cycle"}\n' \
+    "$SLUG" "$RUN_STARTED_UTC" "$(date -u +%FT%TZ)" "${MODEL:-claude-opus-4-7}" \
+    >> "$CACHE_DIR/runs.jsonl"
+
+  fleet_emit_event run_completed \
+    "exit=0" "duration_ms=$(( ( $(date -u +%s) - RUN_STARTED_EPOCH ) * 1000 ))" \
+    || true
+
+  # ---- Replay / tail ---------------------------------------------------
+  echo "[demo] events.jsonl now has $(wc -l < "$CACHE_DIR/events.jsonl" | tr -d ' ') events"
+  if [ "$tail_secs" -gt 0 ]; then
+    echo "[demo] tailing for ${tail_secs}s so you can read them..."
+    # Best-effort: print whatever's already there, then wait. We don't
+    # spawn a real `tail -F` since the synthetic loop is already done
+    # writing — the window exists purely so the operator (or test) sees
+    # the streaming-mode banner.
+    cat "$CACHE_DIR/events.jsonl"
+    sleep "$tail_secs"
+  else
+    # Without --tail, dump the events once at end of run.
+    cat "$CACHE_DIR/events.jsonl"
+  fi
+
+  echo "[demo] runs.jsonl at $CACHE_DIR/runs.jsonl (phase=demo)"
+  if [ "$keep" = "1" ]; then
+    echo "[demo] done. fixture preserved at $fixture_dir — rm -rf when done."
+  else
+    echo "[demo] done. fixture wiped (pass --keep to inspect it next time)."
+  fi
+  return 0
+}
+
 kickstart_cmd() {
   shift  # drop the leading "kickstart"
-  local slug_arg="" phase_arg="" dry=0
+  local slug_arg="" phase_arg="" dry=0 demo=0 demo_keep=0 demo_tail=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run) dry=1; shift ;;
+      --demo) demo=1; shift ;;
+      --keep) demo_keep=1; shift ;;
+      --tail)
+        # --tail takes an optional positive-integer window in seconds
+        # (per ticket 0023 AC#5). Test runs pass `--tail 1` for speed.
+        # If the next token isn't an integer, default to 5s.
+        if [ -n "${2:-}" ] && printf '%s' "$2" | grep -qE '^[0-9]+$'; then
+          demo_tail="$2"; shift 2
+        else
+          demo_tail=5; shift
+        fi ;;
       -h|--help)
         cat <<USAGE
 fleet kickstart — trigger a one-shot agent run, optionally in dry-run mode.
@@ -3050,6 +3314,12 @@ fleet kickstart — trigger a one-shot agent run, optionally in dry-run mode.
 Usage:
   fleet kickstart <slug> <phase>             trigger the launchd label
   fleet kickstart <slug> <phase> --dry-run   set AGENT_DRY_RUN=1 first
+  fleet kickstart --demo                     run a credential-less synthetic
+                                             loop end-to-end (ticket 0023)
+  fleet kickstart --demo --keep              keep the fixture on disk
+  fleet kickstart --demo --tail [N]          stream events for N extra
+                                             seconds (default 5) after the
+                                             synthetic loop exits
 
 <phase> is one of: ship, groom, review, eng.
 
@@ -3058,6 +3328,13 @@ In --dry-run mode the runner still calls claude end-to-end, but with
 land. The run emits \`run_dry_run plan_head=...\` to events.jsonl and
 still appends to runs.jsonl with the real cost. Operator unsets the env
 with: launchctl unsetenv AGENT_DRY_RUN
+
+In --demo mode the runner scaffolds a fixture project under
+\`\$TMPDIR/fleet-demo-XXXXXX\`, installs stubbed gh/claude/git-push
+binaries under \$HOME/.local/bin, walks one synthetic ship+review cycle,
+and emits the same four event types (\`run_started\`, \`pr_opened\`,
+\`lesson_draft_emitted\`, \`run_completed\`) a real run would. The
+fixture is wiped on exit unless --keep is passed.
 USAGE
         exit 0 ;;
       --) shift ;;
@@ -3069,6 +3346,11 @@ USAGE
         fi ;;
     esac
   done
+
+  if [ "$demo" = "1" ]; then
+    kickstart_demo "$demo_keep" "$demo_tail"
+    exit $?
+  fi
 
   if [ -z "$slug_arg" ] || [ -z "$phase_arg" ]; then
     echo "fleet kickstart: missing <slug> and/or <phase>" >&2

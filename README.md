@@ -90,6 +90,8 @@ flowchart LR
 
 A scheduled `launchd` job runs a shell script from `~/.local/share/agent-fleet/lib/`. The script clones your repo fresh into `~/.cache/<slug>-agent/checkout/`, runs `claude --print` with the relevant prompt, reads your repo's `AGENTS.md` to learn what's allowed, and opens / heals / reviews / merges a PR. Nothing exotic — just shell + git + gh + claude.
 
+> **Want to see it run before installing?** `bin/fleet kickstart --demo` walks a credential-less synthetic loop end-to-end in under a minute — scaffolds a fixture project under `$TMPDIR`, stubs `gh`/`claude`/`git push` in `$HOME/.local/bin`, and emits the same four event types (`run_started`, `pr_opened`, `lesson_draft_emitted`, `run_completed`) a real ship cycle would. No GitHub PAT, no Anthropic quota, no writes outside `$TMPDIR`. See [ticket 0023](docs/backlog/0023-fleet-kickstart-demo-credless-loop.md).
+
 ---
 
 ## Prerequisites
@@ -449,6 +451,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet rollback courtiq        # revert the last agent-shipped commit (revert/<id>-<slug> PR)
 ~/code/agent-fleet/bin/fleet kickstart courtiq ship             # trigger a one-shot agent-ship run
 ~/code/agent-fleet/bin/fleet kickstart courtiq ship --dry-run   # set AGENT_DRY_RUN=1 first, then kickstart
+~/code/agent-fleet/bin/fleet kickstart --demo                   # credential-less synthetic loop in $TMPDIR (ticket 0023)
 ~/code/agent-fleet/bin/fleet replay courtiq --pr 17              # replay PR #17 through CURRENT prompts in dry-run (review by default; --phase ship to ask "what would the ship runner do?")
 ```
 

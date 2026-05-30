@@ -1,7 +1,7 @@
 ---
 id: 0023
 title: fleet kickstart --demo runs a credential-less end-to-end loop in 60 seconds
-status: in-progress
+status: shipped
 priority: P2
 area: docs
 created: 2026-05-30
@@ -225,6 +225,11 @@ The dev agent will NOT do these even if they seem related.
 
 ## Implementation log
 
+- 2026-05-30 — shipped. tests/kickstart-demo.sh covers all 10 ACs
+  (the ticket prose says "eight" but the AC list has ten boxes — the
+  test maps 1:1). Local gate green: `shellcheck -S warning lib/*.sh
+  bin/fleet`, `bash -n lib/*.sh bin/fleet`, `node scripts/check-backlog.mjs`.
+  Reinstall NOT required (no `lib/` or `prompts/` edits).
 - 2026-05-30 — picked up by implementation-dev. Status → in-progress.
   Plan: `kickstart_demo()` in `bin/fleet` writes a fixture project under
   `mktemp -d -t fleet-demo`, installs `gh`/`claude`/`git-push-stub` stubs
