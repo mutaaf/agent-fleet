@@ -200,6 +200,16 @@ postcard.
     Operator graduates the project by merging PRs until the cap is met
     — there is no manual reset.
 
+**Demo path (ticket 0023).** `bin/fleet kickstart --demo` walks a
+credential-less synthetic ship cycle and emits the four core event
+types (`run_started`, `pr_opened`, `lesson_draft_emitted`,
+`run_completed`) with `phase=demo` and `slug=demo-XXXX`. No new event
+type is introduced — the demo is a CONSUMER of the existing channel
+contract, not a new channel. Consumers can filter `phase=demo` to
+exclude synthetic traffic from real-project rollups; `fleet digest`
+and `fleet weekly` already do this implicitly by discovering projects
+via `agents.config.sh` rather than scanning `$HOME/.cache` blindly.
+
 Add new event types in the same file; consumers MUST tolerate unknown types
 gracefully. Do not rename or repurpose an existing type — the contract is the
 moat.
