@@ -40,6 +40,19 @@ DOMAIN="gui/$UID"
 
 mkdir -p "$INSTALL_ROOT" "$CFG_DIR" "$LOG_DIR" "$AGENTS_DIR"
 
+# Ticket 0024: capture the previously-installed PROMPTS_SHA BEFORE the cp
+# below clobbers the installed manifest. On a re-install with no kit edits
+# this is the same value the new pin will compute → no event. On the very
+# first install there is no prior copy, so PREV is empty and we fall back
+# to the source manifest's value as the comparison anchor (see below).
+PREV_INSTALLED_PROMPTS_SHA=""
+if [ -f "$CFG_DIR/agents.config.sh" ]; then
+  PREV_INSTALLED_PROMPTS_SHA="$(
+    /usr/bin/sed -n -E 's/^PROMPTS_SHA="?([^"]*)"?$/\1/p' \
+      "$CFG_DIR/agents.config.sh" | head -n 1
+  )"
+fi
+
 # TCC-safe copy of the engine (shared by all projects) + this project's manifest.
 /bin/cp -Rf "$KIT_ROOT/lib"     "$INSTALL_ROOT/"
 /bin/cp -Rf "$KIT_ROOT/prompts" "$INSTALL_ROOT/"
@@ -68,6 +81,20 @@ if [ -d "$PROMPTS_DIR_FOR_PIN" ]; then
   PIN_SHA=$( (cd "$PROMPTS_DIR_FOR_PIN/.." && find prompts -type f -name '*.md' | sort | xargs cat) \
               | shasum -a 256 | awk '{print $1}' )
   if [ -n "$PIN_SHA" ]; then
+    # Ticket 0024: OLD is the previously-installed pin (captured before the
+    # cp above). On first install that's empty, so we fall back to whatever
+    # the source manifest brought — the value the operator believed was
+    # pinned. The comparison + emit are idempotent: a second install with
+    # no kit edits finds PREV==NEW and stays silent.
+    if [ -n "$PREV_INSTALLED_PROMPTS_SHA" ]; then
+      OLD_PROMPTS_SHA="$PREV_INSTALLED_PROMPTS_SHA"
+    else
+      OLD_PROMPTS_SHA="$(
+        /usr/bin/sed -n -E 's/^PROMPTS_SHA="?([^"]*)"?$/\1/p' \
+          "$CFG_DIR/agents.config.sh" | head -n 1
+      )"
+    fi
+
     # macOS sed needs the empty `-i ''` arg. Strip any old stamp (both lines),
     # then append the fresh pair.
     /usr/bin/sed -i '' \
@@ -78,6 +105,31 @@ if [ -d "$PROMPTS_DIR_FOR_PIN" ]; then
       printf '# PROMPTS_SHA pinned at install time: %s\n' "$PIN_SHA"
       printf 'PROMPTS_SHA="%s"\n' "$PIN_SHA"
     } >> "$CFG_DIR/agents.config.sh"
+
+    # Ticket 0024: emit prompts_pin_changed once per install when the pin
+    # actually changed. lib/common.sh's fleet_emit_event is the writer; we
+    # source it in a subshell so install.sh keeps its own env clean. The
+    # event carries phase=install so consumers can distinguish bootstrap
+    # transitions from runtime drift.
+    if [ "$OLD_PROMPTS_SHA" != "$PIN_SHA" ]; then
+      (
+        FLEET_PHASE=install
+        SLUG="$SLUG"
+        CACHE_DIR="$HOME/.cache/${SLUG}-agent"
+        mkdir -p "$CACHE_DIR" 2>/dev/null || true
+        export FLEET_PHASE SLUG CACHE_DIR
+        # shellcheck disable=SC1091
+        if [ -f "$INSTALL_ROOT/lib/common.sh" ]; then
+          source "$INSTALL_ROOT/lib/common.sh" >/dev/null 2>&1 || true
+        elif [ -f "$KIT_ROOT/lib/common.sh" ]; then
+          source "$KIT_ROOT/lib/common.sh" >/dev/null 2>&1 || true
+        fi
+        if command -v fleet_emit_event >/dev/null 2>&1; then
+          fleet_emit_event prompts_pin_changed \
+            "old=$OLD_PROMPTS_SHA" "new=$PIN_SHA" || true
+        fi
+      ) || true
+    fi
   fi
 fi
 

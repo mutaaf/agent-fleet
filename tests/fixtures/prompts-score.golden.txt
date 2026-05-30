@@ -1,0 +1,6 @@
+SHA      DATE        RUNS  PRS   SENDBACK%  DRAFTS  HEAL/PR  INFRA-FLK  $/PR
+-----------------------------------------------------------------------------
+aaaaaa1  2026-05-16     2     1     100.0%       1      1.0          0  $0.60
+bbbbbb2  2026-05-23     3     2       0.0%       0      0.5          1  $0.50
+ccccccc  2026-05-28     1     1     100.0%       1      2.0          0  $0.40  ← current
+trend: sendback +100.0pp, heal/PR +1.5, $/PR $-0.10 vs previous revision.

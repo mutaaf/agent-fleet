@@ -1472,6 +1472,458 @@ if [ "$CMD" = "digest" ]; then
   digest "$@"
 fi
 
+# --- prompts-score (ticket 0024) -----------------------------------------
+# `fleet prompts-score <slug> [--since Nh|Nd] [--json]` grades each prompt
+# revision the project ran against, using events.jsonl + runs.jsonl as the
+# rear-view mirror. Group key is the PROMPTS_SHA in effect at each run's
+# ts_start; the timeline comes from `prompts_pin_changed` events emitted
+# by lib/install.sh (this ticket) with `prompts_drift` events as the
+# fallback for projects that haven't re-installed since the new pin
+# tracking landed.
+#
+# Output (human): one header row, one row per revision, optional trend
+# line when ≥2 revisions are present. The current revision (the SHA in
+# effect at the latest event timestamp) carries a trailing `← current`
+# marker. JSON output (--json) is one JSON object per line.
+#
+# Reuses digest_parse_since / digest_iso_to_epoch from the digest helpers
+# above; the JSON-line awk patterns mirror digest_event_count_since.
+
+# Test seam: FLEET_PROMPTS_SCORE_FAKE_NOW (epoch seconds) overrides "now"
+# so the golden file's DATE column stays stable.
+prompts_score_now() {
+  echo "${FLEET_PROMPTS_SCORE_FAKE_NOW:-$(date -u +%s)}"
+}
+
+# Build the (epoch \t sha) timeline of prompt-pin transitions from
+# events.jsonl, sorted ascending by epoch. prompts_pin_changed events are
+# authoritative (the `new` field is the SHA going forward).
+# prompts_drift events are the fallback for projects that haven't yet
+# re-installed under the new code path: they carry `actual` as the SHA
+# the runner observed.
+#
+# $1 = path to events.jsonl. Emits one "EPOCH<TAB>SHA" line per
+# transition to stdout. No file = empty output.
+prompts_score_assemble_timeline() {
+  local events="$1"
+  [ -f "$events" ] || return 0
+  awk '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    function field(line, key,    s) {
+      if (match(line, "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\"")) {
+        s = substr(line, RSTART, RLENGTH)
+        sub(".*\"" key "\"[[:space:]]*:[[:space:]]*\"", "", s)
+        sub("\".*", "", s)
+        return s
+      }
+      return ""
+    }
+    {
+      type = field($0, "type"); if (type == "") next
+      ts   = field($0, "ts");   if (ts   == "") next
+      sha  = ""
+      if (type == "prompts_pin_changed") {
+        sha = field($0, "new")
+      } else if (type == "prompts_drift") {
+        sha = field($0, "actual")
+      } else {
+        next
+      }
+      if (sha == "") next
+      ep = iso2ep(ts)
+      if (ep == 0) next
+      printf("%d\t%s\n", ep, sha)
+    }
+  ' "$events" | sort -n -k1,1
+}
+
+# Resolve every event of interest (pr_opened, gate_failed,
+# lesson_draft_emitted, infra_flake_rerun) to its SHA via the timeline,
+# and aggregate per-SHA counters. Inputs:
+#   $1 = path to events.jsonl
+#   $2 = path to a tmp file containing the timeline (epoch\tsha lines)
+#   $3 = cutoff epoch (events with ts < cutoff are skipped)
+# Emits one "SHA<TAB>PRS<TAB>DRAFTS<TAB>HEAL<TAB>INFRA" line per SHA seen.
+prompts_score_aggregate_events() {
+  local events="$1" timeline="$2" cutoff="$3"
+  [ -f "$events" ] || return 0
+  awk -v cutoff="$cutoff" -v timeline="$timeline" '
+    BEGIN {
+      n = 0
+      while ((getline line < timeline) > 0) {
+        split(line, a, "\t")
+        tl_ep[n]  = a[1] + 0
+        tl_sha[n] = a[2]
+        n++
+      }
+      close(timeline)
+    }
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    function field(line, key,    s) {
+      if (match(line, "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\"")) {
+        s = substr(line, RSTART, RLENGTH)
+        sub(".*\"" key "\"[[:space:]]*:[[:space:]]*\"", "", s)
+        sub("\".*", "", s)
+        return s
+      }
+      return ""
+    }
+    function sha_at(ep,    i, found) {
+      found = ""
+      for (i = 0; i < n; i++) {
+        if (tl_ep[i] <= ep) { found = tl_sha[i] }
+        else break
+      }
+      return found
+    }
+    {
+      type = field($0, "type"); if (type == "") next
+      if (type != "pr_opened" && type != "gate_failed" \
+          && type != "lesson_draft_emitted" && type != "infra_flake_rerun") next
+      ts = field($0, "ts"); if (ts == "") next
+      ep = iso2ep(ts)
+      if (ep < cutoff + 0) next
+      sha = sha_at(ep)
+      if (sha == "") next
+      if (type == "pr_opened")            prs[sha]++
+      else if (type == "lesson_draft_emitted") drafts[sha]++
+      else if (type == "gate_failed")     heal[sha]++
+      else if (type == "infra_flake_rerun") infra[sha]++
+      seen[sha] = 1
+    }
+    END {
+      for (sha in seen) {
+        printf("%s\t%d\t%d\t%d\t%d\n",
+               sha, prs[sha]+0, drafts[sha]+0, heal[sha]+0, infra[sha]+0)
+      }
+    }
+  ' "$events"
+}
+
+# Aggregate runs.jsonl into per-SHA RUNS count + summed spend. Same
+# timeline-lookup pattern. Emits "SHA<TAB>RUNS<TAB>SPEND" per SHA.
+prompts_score_aggregate_runs() {
+  local runs="$1" timeline="$2" cutoff="$3"
+  [ -f "$runs" ] || return 0
+  awk -v cutoff="$cutoff" -v timeline="$timeline" '
+    BEGIN {
+      n = 0
+      while ((getline line < timeline) > 0) {
+        split(line, a, "\t")
+        tl_ep[n]  = a[1] + 0
+        tl_sha[n] = a[2]
+        n++
+      }
+      close(timeline)
+    }
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    function sha_at(ep,    i, found) {
+      found = ""
+      for (i = 0; i < n; i++) {
+        if (tl_ep[i] <= ep) { found = tl_sha[i] }
+        else break
+      }
+      return found
+    }
+    {
+      ts = ""; cost = 0
+      if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        c = substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", c); cost = c + 0
+      }
+      if (ts == "") next
+      ep = iso2ep(ts)
+      if (ep < cutoff + 0) next
+      sha = sha_at(ep)
+      if (sha == "") next
+      runs_n[sha]++
+      spend[sha] += cost
+      seen[sha] = 1
+    }
+    END {
+      for (sha in seen) {
+        printf("%s\t%d\t%.6f\n", sha, runs_n[sha]+0, spend[sha]+0)
+      }
+    }
+  ' "$runs"
+}
+
+# Format a row. Args: sha date runs prs sendback_pct drafts heal_per_pr
+# infra_flake spend_per_pr is_current.
+prompts_score_render_row() {
+  local sha="$1" date="$2" runs="$3" prs="$4" sendback="$5" drafts="$6"
+  local heal="$7" infra="$8" spend="$9" is_current="${10}"
+  local marker=""
+  [ "$is_current" = "1" ] && marker="  ← current"
+  # Column widths chosen to match the AC sample header:
+  # SHA(7) DATE(10) RUNS(4) PRS(4) SENDBACK%(9) DRAFTS(6) HEAL/PR(7) INFRA-FLK(9) $/PR(5)
+  printf -- '%-7s  %-10s  %4s  %4s  %9s  %6s  %7s  %9s  %5s%s\n' \
+    "$sha" "$date" "$runs" "$prs" "$sendback" "$drafts" "$heal" "$infra" "$spend" "$marker"
+}
+
+prompts_score() {
+  shift  # drop "prompts-score"
+  local slug="" since="7d" want_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)     want_json=1; shift ;;
+      --since)    since="${2:-}"; shift 2 ;;
+      --since=*)  since="${1#--since=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet prompts-score — grade each prompt revision against the event log.
+
+Usage:
+  fleet prompts-score <slug>                   default --since 7d, table
+  fleet prompts-score <slug> --since 30d       widen the window (Nh or Nd)
+  fleet prompts-score <slug> --json            one JSON object per revision
+
+Columns:
+  SHA | DATE | RUNS | PRS | SENDBACK% | DRAFTS | HEAL/PR | INFRA-FLK | \$/PR
+
+Per-revision metrics, drawn from events.jsonl + runs.jsonl under
+\$HOME/.cache/<slug>-agent/. The current revision (SHA in effect at the
+latest event timestamp) is marked with a trailing 'left-arrow current'.
+USAGE
+        exit 0 ;;
+      --)         shift ;;
+      -*)
+        echo "prompts-score: unknown flag '$1'" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$slug" ]; then slug="$1"; shift
+        else echo "prompts-score: unexpected extra argument '$1'" >&2; exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$slug" ]; then
+    echo "prompts-score: missing <slug> argument" >&2
+    exit 2
+  fi
+
+  local since_seconds
+  if ! since_seconds="$(digest_parse_since "$since")"; then
+    echo "prompts-score: invalid --since \"$since\" (use Nh or Nd)" >&2
+    exit 2
+  fi
+
+  local cache_dir="$HOME/.cache/${slug}-agent"
+  local events="$cache_dir/events.jsonl"
+  local runs="$cache_dir/runs.jsonl"
+
+  # Empty/missing events is not an error — it's a fresh project. Print the
+  # documented message to stderr and exit 0.
+  if [ ! -s "$events" ]; then
+    echo "prompts-score: no events found for $slug (cache: $events)" >&2
+    exit 0
+  fi
+
+  local now cutoff
+  now="$(prompts_score_now)"
+  cutoff=$(( now - since_seconds ))
+
+  # Assemble the full timeline (every transition ever recorded). We need
+  # the entries BEFORE the cutoff to seed each row's "what SHA was in
+  # effect when this event landed?" lookup — without them, the row that
+  # spans the cutoff would have no SHA. We pre-filter aggregation by
+  # cutoff inside the awk passes.
+  local timeline_file; timeline_file="$(mktemp -t prompts-score-tl.XXXXXX)"
+  prompts_score_assemble_timeline "$events" > "$timeline_file"
+  if [ ! -s "$timeline_file" ]; then
+    rm -f "$timeline_file"
+    echo "prompts-score: no events found for $slug (cache: $events)" >&2
+    exit 0
+  fi
+
+  # Aggregate events + runs by SHA.
+  local events_agg runs_agg
+  events_agg="$(prompts_score_aggregate_events "$events" "$timeline_file" "$cutoff")"
+  runs_agg="$(prompts_score_aggregate_runs "$runs" "$timeline_file" "$cutoff")"
+
+  # Determine the current SHA — the last entry in the timeline.
+  local current_sha
+  current_sha="$(tail -n 1 "$timeline_file" | awk -F'\t' '{print $2}')"
+
+  # Build the union of SHAs that have at least one event or one run in window.
+  # Use a temp file so we can preserve order via the timeline's epoch sort.
+  local union_file; union_file="$(mktemp -t prompts-score-u.XXXXXX)"
+  {
+    [ -n "$events_agg" ] && echo "$events_agg" | awk -F'\t' '{print $1}'
+    [ -n "$runs_agg" ]   && echo "$runs_agg"   | awk -F'\t' '{print $1}'
+  } | sort -u > "$union_file"
+
+  # If nothing fell in the window, treat that like "no events found" so a
+  # too-tight --since doesn't produce an empty table.
+  if [ ! -s "$union_file" ]; then
+    rm -f "$timeline_file" "$union_file"
+    echo "prompts-score: no events found for $slug (cache: $events)" >&2
+    exit 0
+  fi
+
+  # Order SHAs by their first-appearance epoch in the timeline. SHAs not
+  # in the timeline (data-only) sort last.
+  local ordered_shas
+  ordered_shas="$(
+    while IFS= read -r sha; do
+      [ -z "$sha" ] && continue
+      local ep
+      ep="$(awk -F'\t' -v s="$sha" '$2 == s { print $1; exit }' "$timeline_file")"
+      [ -z "$ep" ] && ep=9999999999
+      printf '%s\t%s\n' "$ep" "$sha"
+    done < "$union_file" | sort -n -k1,1 | awk -F'\t' '{print $2}'
+  )"
+
+  # Render. Human mode prints the header + a separator + one row per SHA;
+  # JSON mode skips the header and emits one JSON object per line.
+  local header sep_line
+  header='SHA      DATE        RUNS  PRS   SENDBACK%  DRAFTS  HEAL/PR  INFRA-FLK  $/PR'
+  # 77 box-drawing chars to underline the header — counts the same as the
+  # AC sample. Pure ASCII to keep `LC_ALL=C` safe.
+  sep_line="$(printf '%.0s-' $(seq 1 77))"
+
+  if [ "$want_json" != "1" ]; then
+    printf '%s\n' "$header"
+    printf '%s\n' "$sep_line"
+  fi
+
+  # Track the previous row's metrics for the trend line.
+  local rows_emitted=0
+  local prev_sendback="" prev_heal="" prev_spend=""
+  local cur_sendback="" cur_heal="" cur_spend=""
+  local sha
+  while IFS= read -r sha; do
+    [ -z "$sha" ] && continue
+    local row_prs row_drafts row_heal row_infra row_runs row_spend
+    row_prs=0; row_drafts=0; row_heal=0; row_infra=0
+    row_runs=0; row_spend=0
+    if [ -n "$events_agg" ]; then
+      local er
+      er="$(echo "$events_agg" | awk -F'\t' -v s="$sha" '$1 == s { print; exit }')"
+      if [ -n "$er" ]; then
+        row_prs="$(echo "$er" | awk -F'\t' '{print $2}')"
+        row_drafts="$(echo "$er" | awk -F'\t' '{print $3}')"
+        row_heal="$(echo "$er" | awk -F'\t' '{print $4}')"
+        row_infra="$(echo "$er" | awk -F'\t' '{print $5}')"
+      fi
+    fi
+    if [ -n "$runs_agg" ]; then
+      local rr
+      rr="$(echo "$runs_agg" | awk -F'\t' -v s="$sha" '$1 == s { print; exit }')"
+      if [ -n "$rr" ]; then
+        row_runs="$(echo "$rr" | awk -F'\t' '{print $2}')"
+        row_spend="$(echo "$rr" | awk -F'\t' '{print $3}')"
+      fi
+    fi
+
+    # DATE — the YYYY-MM-DD of this SHA's first appearance in the
+    # timeline. Falls back to "—" if the SHA never appears (shouldn't
+    # happen given the union construction, but defensive).
+    local sha_epoch row_date
+    sha_epoch="$(awk -F'\t' -v s="$sha" '$2 == s { print $1; exit }' "$timeline_file")"
+    if [ -n "$sha_epoch" ]; then
+      row_date="$(date -u -r "$sha_epoch" +%F 2>/dev/null \
+                  || date -u -d "@$sha_epoch" +%F 2>/dev/null \
+                  || echo "—")"
+    else
+      row_date="—"
+    fi
+
+    # Derived metrics. Guard against divide-by-zero when PRS=0.
+    local sendback_pct heal_per_pr spend_per_pr sendback_rate_json heal_per_pr_json spend_per_pr_json
+    if [ "$row_prs" -gt 0 ]; then
+      sendback_pct="$(awk -v d="$row_drafts" -v p="$row_prs" \
+                       'BEGIN { printf("%.1f%%", (d/p)*100) }')"
+      heal_per_pr="$(awk -v h="$row_heal" -v p="$row_prs" \
+                       'BEGIN { printf("%.1f", h/p) }')"
+      spend_per_pr="$(awk -v s="$row_spend" -v p="$row_prs" \
+                       'BEGIN { printf("$%.2f", s/p) }')"
+      sendback_rate_json="$(awk -v d="$row_drafts" -v p="$row_prs" \
+                       'BEGIN { printf("%.4f", d/p) }')"
+      heal_per_pr_json="$(awk -v h="$row_heal" -v p="$row_prs" \
+                       'BEGIN { printf("%.4f", h/p) }')"
+      spend_per_pr_json="$(awk -v s="$row_spend" -v p="$row_prs" \
+                       'BEGIN { printf("%.4f", s/p) }')"
+    else
+      sendback_pct="0.0%"
+      heal_per_pr="0.0"
+      spend_per_pr="\$0.00"
+      sendback_rate_json="0.0000"
+      heal_per_pr_json="0.0000"
+      spend_per_pr_json="0.0000"
+    fi
+
+    local is_current=0
+    [ "$sha" = "$current_sha" ] && is_current=1
+
+    if [ "$want_json" = "1" ]; then
+      local is_current_json="false"
+      [ "$is_current" = "1" ] && is_current_json="true"
+      printf '{"sha":"%s","date":"%s","runs":%s,"prs":%s,"sendback_rate":%s,"drafts":%s,"heal_per_pr":%s,"infra_flake":%s,"spend_per_pr":%s,"is_current":%s}\n' \
+        "$sha" "$row_date" "$row_runs" "$row_prs" "$sendback_rate_json" \
+        "$row_drafts" "$heal_per_pr_json" "$row_infra" "$spend_per_pr_json" \
+        "$is_current_json"
+    else
+      prompts_score_render_row "$sha" "$row_date" "$row_runs" "$row_prs" \
+        "$sendback_pct" "$row_drafts" "$heal_per_pr" "$row_infra" \
+        "$spend_per_pr" "$is_current"
+    fi
+
+    # Track for trend line (we use the LAST two rows in display order).
+    prev_sendback="$cur_sendback"
+    prev_heal="$cur_heal"
+    prev_spend="$cur_spend"
+    cur_sendback="$(echo "$sendback_pct" | sed 's/%$//')"
+    cur_heal="$heal_per_pr"
+    cur_spend="$(echo "$spend_per_pr" | sed 's/^\$//')"
+    rows_emitted=$(( rows_emitted + 1 ))
+  done <<< "$ordered_shas"
+
+  # Trend line: only when ≥2 revisions present AND we're not in JSON mode.
+  if [ "$want_json" != "1" ] && [ "$rows_emitted" -ge 2 ]; then
+    local d_sendback d_heal d_spend
+    d_sendback="$(awk -v c="$cur_sendback" -v p="$prev_sendback" \
+                    'BEGIN { printf("%+.1fpp", c - p) }')"
+    d_heal="$(awk -v c="$cur_heal" -v p="$prev_heal" \
+                'BEGIN { printf("%+.1f", c - p) }')"
+    d_spend="$(awk -v c="$cur_spend" -v p="$prev_spend" \
+                'BEGIN { printf("$%+.2f", c - p) }')"
+    printf 'trend: sendback %s, heal/PR %s, $/PR %s vs previous revision.\n' \
+      "$d_sendback" "$d_heal" "$d_spend"
+  fi
+
+  rm -f "$timeline_file" "$union_file"
+  exit 0
+}
+
+if [ "$CMD" = "prompts-score" ]; then
+  prompts_score "$@"
+fi
+
 # --- tail -----------------------------------------------------------------
 # Ticket 0015. `fleet tail` streams events.jsonl entries live, formatted for
 # human eyes. With no arg it follows every discovered project concurrently;
