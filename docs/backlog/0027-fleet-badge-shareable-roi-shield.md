@@ -1,7 +1,7 @@
 ---
 id: 0027
 title: fleet badge emits a shareable shields.io-style ROI line for a project README
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-01
@@ -295,4 +295,36 @@ Branch: `feat/0027-fleet-badge-shareable-roi-shield`. Plan:
    exercised structurally.
 4. Goldens at `tests/fixtures/badge.{md,svg,txt}.golden.txt`,
    fixture project at `tests/fixtures/badge/`.
+
+### 2026-06-01 — shipped
+
+Implementation landed exactly as planned. New helpers in `bin/fleet`:
+`badge_resolve_manifest`, `badge_url_encode`, `badge_shields_url`,
+`badge_render_{md,svg,txt}`, `badge_last_ship_age`, plus the
+`badge()` dispatcher and a one-line README "Daily ops" entry. The
+SVG template hand-rolls a flat-style shield (width = (label+value)
+× 6 + 10 each, total = label_w + value_w) so the render is fully
+local — `gh` and `curl` are stubbed to fail-on-invoke in the test
+to make that a structural property. All 13 ACs pass against
+`tests/badge.sh` (3 byte-exact goldens for md/svg/txt + 10 inline
+assertions). Local gate (`shellcheck -S warning lib/*.sh bin/fleet
+&& bash -n lib/*.sh bin/fleet && node scripts/check-backlog.mjs`)
+is green. No `lib/`, no `prompts/`, no new event types, no
+`fleet_*` signature changes — Reinstall NOT required.
+
+Deviations from engineering notes:
+- The engineering notes said `width = len(label+value)*6 + 20` for
+  the SVG. I split the constant into +10 per ribbon (label and
+  value) so each ribbon has its own pad — closer to shields.io's
+  real flat preset and the math composes cleanly. Total width
+  ends up identical (+20). Golden byte-locks the resulting layout.
+- `badge_last_ship_age` returns the full `human_age` string ("6h
+  ago") rather than stripping " ago", because the txt template
+  reads cleaner as `printf '...(last ship %s)' "$age"` than as
+  `(last ship %s ago)` with the suffix synthesised. Net result is
+  byte-identical to the golden either way.
+- LESSONS 2026-06-01 (`awk -v var=$multiline`) does not apply
+  here — every `awk` call this ticket adds is on integers / single-
+  line tokens. Defensive printing via `printf -- '%s'` covers
+  LESSONS 2026-05-28 in `badge_url_encode` and `badge_render_md`.
 
