@@ -1,7 +1,7 @@
 ---
 id: 0026
 title: fleet inbox prints the daily TODO list the operator owes the loop
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-01

@@ -44,6 +44,6 @@ ones, `review` grades them.
 | 0023 | fleet kickstart --demo runs a credential-less end-to-end loop in 60 seconds | P2 | shipped | docs |
 | 0024 | fleet prompts-score grades each prompt revision from real event history | P1 | shipped | governance |
 | 0025 | fleet weekly prints a Sunday ROI rollup with draft-promotion debt per project | P1 | shipped | observability |
-| 0026 | fleet inbox prints the daily TODO list the operator owes the loop | P1 | in-progress | observability |
+| 0026 | fleet inbox prints the daily TODO list the operator owes the loop | P1 | shipped | observability |
 | 0027 | fleet badge emits a shareable shields.io-style ROI line for a project README | P2 | groomed | observability |
 | 0028 | fleet lessons-promote curates a local lesson into the cross-project feed | P1 | groomed | engine |
