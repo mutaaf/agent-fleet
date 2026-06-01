@@ -1,7 +1,7 @@
 ---
 id: 0027
 title: fleet badge emits a shareable shields.io-style ROI line for a project README
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-01
@@ -280,4 +280,19 @@ doesn't have to re-discover the architecture.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+### 2026-06-01 — implementation-dev picked up ticket
+
+Branch: `feat/0027-fleet-badge-shareable-roi-shield`. Plan:
+1. Add `badge_resolve_manifest()`, `badge_url_encode()`, three
+   `badge_render_{md,svg,txt}` helpers, and the `badge()` dispatcher
+   next to `weekly()` in `bin/fleet`.
+2. Reuse `digest_parse_since`, `digest_spend_since`,
+   `weekly_ship_count_since`, `human_age`, `newest_log_epoch`,
+   `discover` per engineering notes.
+3. Build `tests/badge.sh` mirroring the `tests/weekly.sh` stub pattern
+   (`$HOME/.local/bin` + `FLEET_DISCOVERY_ROOT`), with fail-on-invoke
+   `gh` / `curl` stubs so the network-free assertion (AC#4) is
+   exercised structurally.
+4. Goldens at `tests/fixtures/badge.{md,svg,txt}.golden.txt`,
+   fixture project at `tests/fixtures/badge/`.
+
