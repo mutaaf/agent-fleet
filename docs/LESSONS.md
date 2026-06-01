@@ -125,6 +125,22 @@ insert `--` between the flags and the pattern. Tooling that takes
 patterns positionally and ALSO accepts double-dash options (grep,
 sed -E, awk -v, find -name) all share this footgun.
 
+## 2026-06-01 — `grep -c <pat> file || echo 0` double-prints on zero matches
+
+While shipping ticket 0026's `inbox_count_drafts` helper, the first cut
+used `grep -cF -- '<!-- DRAFT: ' "$lessons" 2>/dev/null || echo 0` to
+count DRAFT markers. POSIX says grep exits 1 when no lines match — even
+when `-c` already printed `0` to stdout — so the `|| echo 0` chain
+fires and the helper emits two lines: `0\n0`. Symptom: subsequent
+`[ "$n_drafts" -gt 0 ]` arithmetic explodes with "integer expression
+expected: 0\n0", and any later `inbox_total + n_drafts` quietly does the
+wrong thing. Fix: use awk for counting whenever the caller treats the
+result as an integer — `awk '/<!-- DRAFT: / { n++ } END { print (n+0) }'
+"$file"` always exits 0 and prints exactly one number. Same rule applies
+to `grep -c` anywhere the result feeds shell arithmetic. When you DO
+want grep's exit code as a presence signal, use `grep -qF -- pat file`
+(no `-c`, no `|| echo`).
+
 ## 2026-05-28 — `printf '- foo\n' "$bar"` treats the leading dash as a flag
 
 While shipping ticket 0021's `replay_compose_prompt`, the first cut used
