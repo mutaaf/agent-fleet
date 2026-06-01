@@ -1,7 +1,7 @@
 ---
 id: 0026
 title: fleet inbox prints the daily TODO list the operator owes the loop
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-01
@@ -299,3 +299,21 @@ doesn't have to re-discover the architecture.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+### 2026-06-01 — implementation-dev
+
+- Branch: `feat/0026-fleet-inbox-daily-operator-todo`.
+- Read AGENTS.md "Agent parameters" and LESSONS.md before starting.
+- Tests-first: wrote `tests/inbox.sh` with one assertion block per AC.
+- Implemented `inbox()` + five helpers in `bin/fleet`, mirroring the
+  `weekly()` shape: discovery via `weekly_discover`, paused via
+  `weekly_is_paused` + `weekly_paused_days`, JSON via
+  `doctor_json_escape`. Wrote inbox-state marker via temp-file + `mv`
+  per LESSONS 2026-05-27. Used `printf -- '%s\n'` and
+  `grep -F -- "<!-- DRAFT:"` everywhere a leading `-` was possible,
+  per LESSONS 2026-05-28 / 2026-05-30. The dispatcher name `inbox`
+  was confirmed clash-free via `command -v inbox` (per ticket notes).
+- No `lib/` or `prompts/` changes — purely additive subcommand, no
+  new event types (P-6), no `fleet_*` signature changes. No
+  Reinstall line, no BREAKING flag.
+- README "Daily ops" code block updated with one new line.
