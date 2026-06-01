@@ -13,6 +13,9 @@
 #                             (ticket 0025 — pure consumer of telemetry)
 #   fleet prompts-sha         print the SHA256 of the kit's prompts/ tree
 #                             (ticket 0005 — for PROMPTS_SHA pinning)
+#   fleet lessons-promote <slug> --lesson "<title>"
+#                             curate one lesson into cross-fleet
+#                             (ticket 0028 — operator's curation primitive)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -5096,6 +5099,545 @@ PY
 
 if [ "$CMD" = "lessons-sync" ]; then
   lessons_sync "$@"
+fi
+
+# --- lessons-promote ------------------------------------------------------
+# Ticket 0028. `fleet lessons-promote <slug> --lesson "<substring>"
+# [--scope <slug-or-all>] [--headline-exact "<headline>"] [--dry-run]`
+# copies ONE lesson paragraph from a source project's docs/LESSONS.md
+# and appends it under the slug's section in the shared
+# `${FLEET_CROSS_LESSONS_ROOT:-$HOME/.local/share/agent-fleet}/
+# CROSS_LESSONS.md` (when --scope=all, the default) OR writes it to
+# `<root>/projects/<scope>/CROSS_LESSONS.md.override` (when --scope is
+# a specific consumer slug).
+#
+# Why this exists alongside `fleet lessons-sync` (0009): sync rebuilds
+# CROSS_LESSONS.md wholesale on its own cadence. `lessons-promote` is
+# the operator's CURATION primitive — one explicit "this lesson
+# generalizes; push it now" action whose effect lands BEFORE the next
+# sync cycle. See the ticket for the longer rationale.
+#
+# Defences (per docs/LESSONS.md):
+#   - 2026-05-26 (`tail` shadow): the dispatcher is `lessons_promote`,
+#     not `promote` (safe by itself; we keep the prefix anyway for
+#     consistency with `lessons_sync`).
+#   - 2026-05-27 ($(cat …) strips trailing newlines): the insertion
+#     path uses `awk` + `mv -f`, never `$(cat …)`. The source
+#     paragraph is extracted via awk and written verbatim.
+#   - 2026-05-28 (printf '-…' flag trap): all printf calls with
+#     operator-controlled content use `printf -- '%s'`.
+#   - 2026-05-30 (`grep -F -- pat` flag trap): every grep against a
+#     possibly-leading-dash needle uses `grep -iF -- "$needle"`.
+#
+# Telemetry: emits `lesson_promoted {source, text_sha, scope,
+# dup_under?}` with `phase=promote` to the SOURCE project's
+# events.jsonl on every successful, non-idempotent promotion.
+# Idempotent re-runs (same body already present under same slug
+# section) are silent — no event. See AGENTS.md § Telemetry.
+
+lessons_promote_discover_dir() {
+  # $1 = slug → echoes the project dir whose agents.config.sh has
+  # SLUG=<slug>. Exit 1 if no match. Mirrors lessons_sync_discover but
+  # filtered to a single slug.
+  local want="$1"
+  local discovery_root="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local installed_root="$HOME/.local/share/agent-fleet/projects"
+  local m slug dir
+  { find "$discovery_root" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$installed_root" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    if [ "$slug" = "$want" ]; then
+      dir="$(dirname "$m")"
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Read $1 (LESSONS.md path), find the lesson whose `## YYYY-MM-DD —
+# <headline>` line case-insensitively contains $2 (substring) OR exactly
+# matches $3 (headline-exact text, if non-empty). Print:
+#   line 1: matched-headline-count
+#   line 2+: the headline lines (one per match)
+# We need the count to drive the zero/multi/one branch in the dispatcher.
+lessons_promote_match_headlines() {
+  local path="$1" substr="$2" exact="$3"
+  # Lowercase the substring once so awk only does substring compare.
+  local needle_lc
+  needle_lc=$(printf -- '%s' "$substr" | tr '[:upper:]' '[:lower:]')
+  awk -v needle="$needle_lc" -v exact="$exact" '
+    BEGIN { n = 0 }
+    /^## [0-9]{4}-[0-9]{2}-[0-9]{2} / {
+      # The headline text is everything after `## YYYY-MM-DD — `.
+      # We do not assume the em-dash byte sequence; instead split on
+      # the first run of non-space chars after the date and skip them.
+      heading = $0
+      if (exact != "") {
+        # Strip the `## YYYY-MM-DD — ` prefix (up to and including the
+        # first non-space token after the date and its surrounding spaces).
+        # Then byte-compare against the exact arg.
+        tail = heading
+        sub(/^## [0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[^[:space:]]+[[:space:]]+/, "", tail)
+        if (tail == exact) {
+          n++
+          headlines[n] = heading
+        }
+      } else {
+        lc = tolower(heading)
+        if (index(lc, needle) > 0) {
+          n++
+          headlines[n] = heading
+        }
+      }
+    }
+    END {
+      print n
+      for (i = 1; i <= n; i++) print headlines[i]
+    }
+  ' "$path"
+}
+
+# Read $1 (LESSONS.md path), extract the paragraph that starts with the
+# heading line $2 verbatim, and print it (heading + body) up to but not
+# including the next `## ` heading or EOF. The OUTPUT is fed straight
+# into the target file under the slug section — sync's demote() pass
+# converts `## ` → `### ` so the slug heading at level-2 stays distinct
+# from the lesson heading at level-3.
+lessons_promote_extract_paragraph() {
+  local path="$1" heading="$2"
+  awk -v want="$heading" '
+    BEGIN { capture = 0 }
+    {
+      if (capture && $0 ~ /^## /) {
+        # Reached the next sibling lesson — stop.
+        exit
+      }
+      if ($0 == want) { capture = 1 }
+      if (capture) {
+        # Demote `## ` to `### ` so it nests under the slug section.
+        line = $0
+        if (line ~ /^## /) sub(/^## /, "### ", line)
+        print line
+      }
+    }
+  ' "$path"
+}
+
+# SHA-8 of the normalized paragraph body. Normalization: drop the
+# heading line, strip trailing whitespace per line, drop leading AND
+# trailing blank lines, collapse runs of internal blank lines into one.
+# The dedup key is the BODY, so two identical bodies under different
+# headings dedup correctly — same convention as lessons-sync's
+# python-based dedup at line ~4972. Leading/trailing trims defend
+# against the extracted paragraph having a trailing blank line under
+# some sources and not others (it varies depending on whether the
+# next `## ` heading was present).
+lessons_promote_paragraph_sha() {
+  awk '
+    NR == 1 { next }    # drop the heading line
+    {
+      sub(/[[:space:]]+$/, "", $0)
+      lines[++n] = $0
+    }
+    END {
+      # Trim leading blanks.
+      start = 1
+      while (start <= n && lines[start] == "") start++
+      # Trim trailing blanks.
+      end = n
+      while (end >= start && lines[end] == "") end--
+      # Collapse internal blank runs.
+      last_blank = 0
+      for (i = start; i <= end; i++) {
+        if (lines[i] == "") {
+          if (last_blank) continue
+          last_blank = 1
+        } else {
+          last_blank = 0
+        }
+        print lines[i]
+      }
+    }
+  ' | shasum | awk '{print substr($1, 1, 8)}'
+}
+
+lessons_promote_target_path() {
+  # $1 = scope (`all` or a consumer slug). Echoes the absolute path to
+  # the destination file. Creates the parent dir lazily.
+  local scope="$1"
+  local root="${FLEET_CROSS_LESSONS_ROOT:-$HOME/.local/share/agent-fleet}"
+  if [ "$scope" = "all" ]; then
+    mkdir -p "$root"
+    printf -- '%s\n' "$root/CROSS_LESSONS.md"
+  else
+    mkdir -p "$root/projects/$scope"
+    printf -- '%s\n' "$root/projects/$scope/CROSS_LESSONS.md.override"
+  fi
+}
+
+# Locate the `## <slug>` section in the target file. Echoes the line
+# number of the section header on success, or 0 if absent. Used by the
+# inserter to know whether to create-at-EOF or append-within.
+lessons_promote_section_lineno() {
+  local target="$1" slug="$2"
+  [ -f "$target" ] || { echo 0; return 0; }
+  awk -v want="## $slug" '
+    BEGIN { lineno = 0 }
+    $0 == want { lineno = NR; exit }
+    END { print lineno }
+  ' "$target"
+}
+
+# Insert $paragraph BEFORE the next sibling `## ` heading after the
+# slug section, OR at EOF if the slug section is the last one. Creates
+# the section at EOF if it does not exist. Awk-based per LESSONS
+# 2026-05-27 (never $(cat …) the whole file).
+lessons_promote_insert_under_section() {
+  local target="$1" slug="$2" paragraph="$3"
+  local section_line; section_line=$(lessons_promote_section_lineno "$target" "$slug")
+  local tmp; tmp="$(mktemp -t fleet-lessons-promote.XXXXXX)"
+  # The paragraph can contain newlines — pass it through a temp file
+  # so awk reads it via getline instead of -v (which BSD awk rejects
+  # when the value contains a literal newline).
+  local para_tmp; para_tmp="$(mktemp -t fleet-lessons-promote-para.XXXXXX)"
+  printf -- '%s\n' "$paragraph" > "$para_tmp"
+  if [ "$section_line" = "0" ]; then
+    # Section does not exist → create at EOF.
+    if [ -f "$target" ]; then
+      cp "$target" "$tmp"
+      # Guarantee the existing file ends with a single trailing newline
+      # so the new section starts on its own line.
+      if [ -n "$(tail -c1 "$tmp" 2>/dev/null)" ]; then
+        printf -- '\n' >> "$tmp"
+      fi
+    else
+      : > "$tmp"
+    fi
+    printf -- '\n## %s\n\n' "$slug" >> "$tmp"
+    cat "$para_tmp" >> "$tmp"
+  else
+    # Section exists → append paragraph BEFORE the next `## ` header.
+    awk -v section_line="$section_line" -v para_file="$para_tmp" '
+      function load_para(   line) {
+        para = ""
+        while ((getline line < para_file) > 0) {
+          para = (para == "" ? line : para "\n" line)
+        }
+        close(para_file)
+      }
+      BEGIN { inserted = 0; load_para() }
+      {
+        if (!inserted && NR > section_line && /^## /) {
+          print para
+          print ""
+          inserted = 1
+        }
+        print
+      }
+      END {
+        if (!inserted) {
+          # The slug section was the last one in the file — append at EOF.
+          print para
+        }
+      }
+    ' "$target" > "$tmp"
+  fi
+  rm -f "$para_tmp"
+  mv -f "$tmp" "$target"
+}
+
+# Idempotency check: does the normalized paragraph body already appear
+# in the target file under ANY section? Echoes the slug of the section
+# the existing copy lives under, or empty if no copy exists. Used to
+# drive the no-op + dup_under branches in the dispatcher.
+#
+# Strategy: walk the file in shell, accumulating one paragraph at a
+# time into a temp file. At each paragraph boundary (next `### ` or
+# next `## <slug>` or EOF), compute the body SHA and compare to
+# $want_sha. The body extraction reuses
+# lessons_promote_paragraph_sha's normalization (heading-drop +
+# trailing-ws strip + blank-collapse).
+lessons_promote_find_existing_section() {
+  local target="$1" want_sha="$2"
+  [ -f "$target" ] || { echo ""; return 0; }
+  local cur_section="" cand_sha
+  local para_tmp; para_tmp="$(mktemp -t fleet-lessons-promote-find.XXXXXX)"
+  # awk emits a flat stream:
+  #   SECTION\t<slug>
+  #   HEAD\t<heading-line>
+  #   BODY\t<body-line>
+  # We consume that stream in shell so paragraph bodies (which may
+  # contain blank lines) are not flattened into a single record.
+  awk '
+    /^## [^#]/ && !/^## [0-9]{4}-[0-9]{2}-[0-9]{2} / {
+      printf("SECTION\t%s\n", substr($0, 4))
+      next
+    }
+    /^### [0-9]{4}-[0-9]{2}-[0-9]{2} / {
+      printf("HEAD\t%s\n", $0)
+      next
+    }
+    {
+      printf("BODY\t%s\n", $0)
+    }
+  ' "$target" > "$para_tmp"
+
+  local match=""
+  local body_file; body_file="$(mktemp -t fleet-lessons-promote-body.XXXXXX)"
+  local in_para=0
+  : > "$body_file"
+
+  finalize_para() {
+    if [ "$in_para" = "1" ] && [ -s "$body_file" ]; then
+      # Normalize identically to lessons_promote_paragraph_sha (minus
+      # the heading-skip — the find_existing_section walker already
+      # delivered only the body lines).
+      cand_sha=$(awk '
+        {
+          sub(/[[:space:]]+$/, "", $0)
+          lines[++n] = $0
+        }
+        END {
+          start = 1
+          while (start <= n && lines[start] == "") start++
+          end = n
+          while (end >= start && lines[end] == "") end--
+          last_blank = 0
+          for (i = start; i <= end; i++) {
+            if (lines[i] == "") {
+              if (last_blank) continue
+              last_blank = 1
+            } else {
+              last_blank = 0
+            }
+            print lines[i]
+          }
+        }
+      ' "$body_file" | shasum | awk '{print substr($1, 1, 8)}')
+      if [ "$cand_sha" = "$want_sha" ]; then
+        match="$cur_section"
+      fi
+    fi
+    in_para=0
+    : > "$body_file"
+  }
+
+  while IFS=$'\t' read -r kind val; do
+    case "$kind" in
+      SECTION)
+        finalize_para
+        cur_section="$val"
+        ;;
+      HEAD)
+        finalize_para
+        in_para=1
+        ;;
+      BODY)
+        if [ "$in_para" = "1" ]; then
+          printf -- '%s\n' "$val" >> "$body_file"
+        fi
+        ;;
+    esac
+    if [ -n "$match" ]; then break; fi
+  done < "$para_tmp"
+  finalize_para
+  rm -f "$para_tmp" "$body_file"
+  printf -- '%s\n' "$match"
+}
+
+lessons_promote_emit_event() {
+  # $1 = source slug, $2 = text_sha, $3 = scope, $4 = dup_under (may be "")
+  local source="$1" text_sha="$2" scope="$3" dup="$4"
+  local kit_root; kit_root="$( cd "$( dirname "$0" )/.." && pwd )"
+  [ -f "$kit_root/lib/common.sh" ] || return 0
+  local cache_dir="$HOME/.cache/${source}-agent"
+  mkdir -p "$cache_dir"
+  (
+    export SLUG="$source"
+    export CACHE_DIR="$cache_dir"
+    export FLEET_PHASE="promote"
+    # shellcheck disable=SC1090
+    source "$kit_root/lib/common.sh" >/dev/null 2>&1
+    if [ -n "$dup" ]; then
+      fleet_emit_event lesson_promoted \
+        "source=$source" "text_sha=$text_sha" "scope=$scope" "dup_under=$dup"
+    else
+      fleet_emit_event lesson_promoted \
+        "source=$source" "text_sha=$text_sha" "scope=$scope"
+    fi
+  ) || true
+}
+
+lessons_promote() {
+  shift  # drop the leading "lessons-promote"
+
+  local source_slug="" needle="" exact="" scope="all" dry_run=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<USAGE
+fleet lessons-promote — push one local lesson into the cross-project feed.
+
+Usage:
+  fleet lessons-promote <slug> --lesson "<substring>" [--scope <slug-or-all>]
+  fleet lessons-promote <slug> --headline-exact "<full headline>" [--scope ...]
+  fleet lessons-promote <slug> --lesson "..." --dry-run
+
+Reads <slug>'s docs/LESSONS.md, finds the lesson whose headline matches
+--lesson (case-insensitive substring) or --headline-exact (literal),
+and appends it under \`## <slug>\` in the cross-fleet
+CROSS_LESSONS.md (scope=all, default) or to a consumer-scoped
+override file (scope=<consumer-slug>). Idempotent: identical body
+under the same section is a no-op.
+
+Emits lesson_promoted {source, text_sha, scope, dup_under?} to the
+source project's events.jsonl with phase=promote.
+
+Defends against LESSONS 2026-05-{26,27,28,30} — see ticket 0028.
+USAGE
+        exit 0 ;;
+      --lesson)
+        needle="${2:-}"; shift 2 ;;
+      --headline-exact)
+        exact="${2:-}"; shift 2 ;;
+      --scope)
+        scope="${2:-}"; shift 2 ;;
+      --dry-run)
+        dry_run=1; shift ;;
+      --)
+        shift; break ;;
+      -*)
+        printf -- 'fleet lessons-promote: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$source_slug" ]; then
+          source_slug="$1"; shift
+        else
+          printf -- 'fleet lessons-promote: unexpected positional %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$source_slug" ]; then
+    echo "fleet lessons-promote: missing <slug> (usage: fleet lessons-promote <slug> --lesson \"<substring>\")" >&2
+    exit 2
+  fi
+  if [ -z "$needle" ] && [ -z "$exact" ]; then
+    echo "fleet lessons-promote: --lesson \"<substring>\" or --headline-exact \"<headline>\" required" >&2
+    exit 2
+  fi
+
+  # Resolve the source project's directory + docs/LESSONS.md.
+  local source_dir; source_dir=$(lessons_promote_discover_dir "$source_slug") || true
+  if [ -z "$source_dir" ]; then
+    local root="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+    printf -- 'fleet lessons-promote: no project with SLUG=%s found under %s\n' "$source_slug" "$root" >&2
+    exit 2
+  fi
+  local source_lessons="$source_dir/docs/LESSONS.md"
+  if [ ! -f "$source_lessons" ]; then
+    source_lessons="$source_dir/LESSONS.md"
+  fi
+  if [ ! -f "$source_lessons" ]; then
+    printf -- 'fleet lessons-promote: no LESSONS.md in %s/docs or %s\n' "$source_dir" "$source_dir" >&2
+    exit 2
+  fi
+
+  # Validate --scope: `all` or a discoverable slug.
+  if [ "$scope" != "all" ]; then
+    local scope_dir; scope_dir=$(lessons_promote_discover_dir "$scope") || true
+    if [ -z "$scope_dir" ]; then
+      local root="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+      printf -- 'fleet lessons-promote: no project with SLUG=%s found under %s\n' "$scope" "$root" >&2
+      exit 2
+    fi
+  fi
+
+  # Match headlines. Output: line 1 = count, lines 2..n+1 = headlines.
+  local match_out; match_out=$(lessons_promote_match_headlines "$source_lessons" "$needle" "$exact")
+  local match_count; match_count=$(printf -- '%s\n' "$match_out" | head -1)
+  local headlines; headlines=$(printf -- '%s\n' "$match_out" | tail -n +2)
+
+  if [ "$match_count" = "0" ]; then
+    if [ -n "$exact" ]; then
+      printf -- 'fleet lessons-promote: no lesson matched headline "%s" in %s\n' "$exact" "$source_lessons" >&2
+    else
+      printf -- 'fleet lessons-promote: no lesson matched "%s" in %s\n' "$needle" "$source_lessons" >&2
+    fi
+    exit 2
+  fi
+  if [ "$match_count" -gt 1 ]; then
+    printf -- 'fleet lessons-promote: %s lessons matched "%s" in %s; refine the substring or use --headline-exact "<full headline>"\n' \
+      "$match_count" "$needle" "$source_lessons" >&2
+    printf -- '%s\n' "$headlines" >&2
+    exit 2
+  fi
+
+  local heading; heading=$(printf -- '%s\n' "$headlines" | head -1)
+
+  # Extract the paragraph (heading + body, demoted to ### , up to next `## `).
+  local paragraph; paragraph=$(lessons_promote_extract_paragraph "$source_lessons" "$heading")
+  if [ -z "$paragraph" ]; then
+    printf -- 'fleet lessons-promote: failed to extract paragraph for "%s"\n' "$heading" >&2
+    exit 1
+  fi
+  local text_sha; text_sha=$(printf -- '%s\n' "$paragraph" | lessons_promote_paragraph_sha)
+
+  local target; target=$(lessons_promote_target_path "$scope")
+
+  # Dry-run: print preview, no mutation, no event.
+  if [ "$dry_run" = "1" ]; then
+    printf -- 'fleet lessons-promote: --dry-run (no file mutation, no event)\n'
+    printf -- '  source: %s\n' "$source_lessons"
+    printf -- '  target: %s (scope=%s)\n' "$target" "$scope"
+    printf -- '  text_sha: %s\n' "$text_sha"
+    printf -- '  --- proposed append ---\n'
+    printf -- '%s\n' "$paragraph"
+    printf -- '  --- end ---\n'
+    exit 0
+  fi
+
+  # Idempotency / cross-section dedup. We scan the target for any
+  # paragraph whose normalized body SHA matches text_sha.
+  local existing_section; existing_section=$(lessons_promote_find_existing_section "$target" "$text_sha" || true)
+  if [ -n "$existing_section" ]; then
+    if [ "$existing_section" = "$source_slug" ]; then
+      printf -- 'fleet lessons-promote: lesson already present in CROSS_LESSONS.md (sha=%s) — no change.\n' "$text_sha"
+      exit 0
+    else
+      # Cross-section dedup: append a reference line under source_slug's
+      # section AND emit the event with dup_under=<other-slug>.
+      local ref_line; ref_line="> Already seen under ## $existing_section"
+      lessons_promote_insert_under_section "$target" "$source_slug" "$ref_line"
+      lessons_promote_emit_event "$source_slug" "$text_sha" "$scope" "$existing_section"
+      printf -- 'fleet lessons-promote: lesson already in CROSS_LESSONS.md under ## %s; wrote reference under ## %s.\n' \
+        "$existing_section" "$source_slug"
+      printf -- 'emitted lesson_promoted source=%s text_sha=%s scope=%s dup_under=%s\n' \
+        "$source_slug" "$text_sha" "$scope" "$existing_section"
+      exit 0
+    fi
+  fi
+
+  # Normal append path.
+  lessons_promote_insert_under_section "$target" "$source_slug" "$paragraph"
+  lessons_promote_emit_event "$source_slug" "$text_sha" "$scope" ""
+
+  printf -- 'fleet lessons-promote: matched 1 lesson in %s\n' "$source_lessons"
+  printf -- '  %s\n' "$heading"
+  printf -- 'appending to %s (scope=%s)\n' "$target" "$scope"
+  printf -- 'emitted lesson_promoted source=%s text_sha=%s scope=%s\n' \
+    "$source_slug" "$text_sha" "$scope"
+  printf -- 'done — every project'\''s next PHASE 0 will read this lesson.\n'
+  exit 0
+}
+
+if [ "$CMD" = "lessons-promote" ]; then
+  lessons_promote "$@"
 fi
 
 if [ "$CMD" = "list" ]; then

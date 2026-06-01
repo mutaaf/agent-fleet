@@ -1,0 +1,5 @@
+SLUG="agent-fleet"
+PROJECT_NAME="agent-fleet"
+NAMESPACE="com.agent-fleet"
+REPO_URL="https://github.com/example/agent-fleet"
+SELF_CANCEL="20990101"
