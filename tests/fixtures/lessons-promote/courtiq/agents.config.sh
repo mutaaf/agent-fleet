@@ -1,0 +1,5 @@
+SLUG="courtiq"
+PROJECT_NAME="courtiq"
+NAMESPACE="com.courtiq"
+REPO_URL="https://github.com/example/courtiq"
+SELF_CANCEL="20990101"

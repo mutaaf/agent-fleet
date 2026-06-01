@@ -189,6 +189,23 @@ postcard.
     assemble the per-revision timeline: every transition in this channel
     becomes a row boundary in the score table. Idempotent: a re-install
     with no kit/source edits finds `old == new` and stays silent.
+  - `lesson_promoted {source, text_sha, scope, dup_under?}` — emitted by
+    `bin/fleet lessons-promote` (ticket 0028) on every successful,
+    non-idempotent promotion of a single lesson from a project's
+    `docs/LESSONS.md` into the cross-project feed. `source` is the
+    slug whose LESSONS.md was the source; `text_sha` is the 8-char
+    SHA of the normalized paragraph body; `scope` is `all` (the
+    default — appends to the shared `CROSS_LESSONS.md`) or a consumer
+    slug (writes `projects/<slug>/CROSS_LESSONS.md.override` instead).
+    `dup_under` is present ONLY when the cross-section dedup branch
+    fires: the paragraph body already exists in the target under a
+    DIFFERENT slug section, so the command writes a
+    `> Already seen under ## <other-slug>` reference line under the
+    source slug's section and carries the other slug in `dup_under`.
+    Idempotent re-runs (body already present under the SAME slug
+    section) are silent — no event emitted, no file change. Carries
+    `phase=promote` and lives in the source project's `events.jsonl`
+    (per P-6: project is the unit of telemetry, not the kit).
   - `trainee_pr_opened {number, remaining}` — emitted by the dev agent
     (driven from `prompts/ship.prompt.md`) immediately after `gh pr
     create` when `FLEET_TRAINEE_REMAINING > 0`, i.e. the project's

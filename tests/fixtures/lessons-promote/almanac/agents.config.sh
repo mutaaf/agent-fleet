@@ -1,0 +1,5 @@
+SLUG="almanac"
+PROJECT_NAME="almanac"
+NAMESPACE="com.almanac"
+REPO_URL="https://github.com/example/almanac"
+SELF_CANCEL="20990101"
