@@ -158,3 +158,22 @@ might start with `-` and gets passed positionally — quote it through `--`
 or prefix the format with a literal char (`printf '%s\n' "-$str"`). Cheap
 defensive habit: any time the FIRST byte of the format or the first
 argument is `-`, add `--` between `printf` and the format.
+
+## 2026-06-01 — `awk -v var="$val"` rejects a value containing literal newlines
+
+While shipping ticket 0028's `lessons_promote_insert_under_section`,
+the first cut passed a multi-line paragraph into awk via
+`awk -v paragraph="$paragraph" '...'`. BSD awk on macOS (also nawk
+and gawk in POSIX mode) rejects this with `awk: newline in string ...
+at source line 1` and silently drops the rest of the program — the
+target file ends up empty even though the dispatch reports success.
+Symptom in `tests/lessons-promote.sh` AC#1: the appended heading was
+missing from CROSS_LESSONS.md and stderr carried two `awk: newline
+in string` lines that were easy to miss because the implementation's
+banner printed "done — every project's next PHASE 0 will read this
+lesson." regardless. Fix: write the value to a temp file and let
+awk pull it back in via `getline line < para_file`. `awk -v` is only
+safe for single-line values; the moment a value can contain a `\n`
+the call MUST use a file. Cheap defensive habit: any `awk -v` whose
+value is built from a multi-line capture (`$(cat …)`, an extract
+function, an HTTP response body) goes through a tmp file instead.
