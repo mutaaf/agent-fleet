@@ -177,3 +177,26 @@ safe for single-line values; the moment a value can contain a `\n`
 the call MUST use a file. Cheap defensive habit: any `awk -v` whose
 value is built from a multi-line capture (`$(cat …)`, an extract
 function, an HTTP response body) goes through a tmp file instead.
+
+## 2026-06-01 — a new `bin/fleet` subcommand function MUST end with `exit 0` or the dispatcher falls through to the default `fleet status` block
+
+While shipping ticket 0027's `badge()`, the first cut of the function
+let control return normally — every `case "$format" in ... esac`
+branch echoed its output and the function exited cleanly with status
+0. The dispatcher block at the top of `bin/fleet` is
+`if [ "$CMD" = "badge" ]; then badge "$@"; fi`, NOT
+`elif … exit $?`, so control then drops out of the `if` and slides
+down through every following dispatcher block — none match, and the
+fall-through hits the default `fleet status` rendering block at the
+bottom of the file. Symptom in `tests/badge.sh` AC#1: the expected
+one-line `[![fleet](…)](…) <!-- … -->` output was followed by the
+PROJECT/INSTALLED/LAST RUN status table and `wc -l` reported 5
+instead of 1. Fix: every subcommand function MUST end with an
+explicit `exit 0` (the same convention `weekly()`, `inbox()`,
+`digest()`, `rollback()`, `kickstart()`, etc. all already follow).
+The dispatcher pattern is intentionally `if`+function-call rather
+than `case`+`break` because each block reads as a standalone unit,
+but that flexibility means the function body owns the exit. Cheap
+defensive habit when adding a new subcommand: copy a sibling
+dispatcher (`weekly` is the closest pure-reader analogue) and mirror
+its `exit 0` lines verbatim — including the one inside `-h|--help`.
