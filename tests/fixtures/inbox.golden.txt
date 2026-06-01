@@ -1,0 +1,20 @@
+FLEET INBOX — 2026-06-01 (since last run never)
+
+drafts to promote                 3 across 2 projects
+  agent-fleet    2 drafts        docs/LESSONS.md
+  digitalcraft   1 draft         docs/LESSONS.md
+
+self-cancel expiring (<=7d)       2
+  courtiq        EXPIRED         bump SELF_CANCEL in agents.config.sh
+  digitalcraft   5d              bump SELF_CANCEL in agents.config.sh
+
+paused projects                   1
+  courtiq        paused 14d ago  launchctl enable gui/$UID/com.courtiq.agent-ship
+
+budget tripped today              1
+  digitalcraft   $5.00/$5.00     bump MAX_DAILY_USD or wait for tomorrow
+
+in-flight agent PRs >24h old      1
+  agent-fleet    PR #187 2d      gh pr view 187
+
+nothing else owes you a click. last weekly: never — try `fleet weekly`.
