@@ -1,7 +1,7 @@
 ---
 id: 0028
 title: fleet lessons-promote curates a local lesson into the cross-project feed
-status: groomed
+status: in-progress
 priority: P1
 area: engine
 created: 2026-06-01
@@ -322,3 +322,13 @@ doesn't have to re-discover the architecture.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+### 2026-06-01 — implementation-dev start
+
+- Flipped status `groomed` → `in-progress` on branch
+  `feat/0028-fleet-lessons-promote-cross-project`.
+- Plan: tests-first under `tests/lessons-promote.sh` covering the 10
+  behavioral ACs (#11 is the test-file itself). Fixtures under
+  `tests/fixtures/lessons-promote/`. Implementation lands in
+  `bin/fleet` next to `lessons_sync()` (~line 4857). No `lib/` or
+  `prompts/` edits. AGENTS.md gets one new event-type line.
