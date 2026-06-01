@@ -1,7 +1,7 @@
 ---
 id: 0028
 title: fleet lessons-promote curates a local lesson into the cross-project feed
-status: in-progress
+status: shipped
 priority: P1
 area: engine
 created: 2026-06-01
@@ -332,3 +332,23 @@ doesn't have to re-discover the architecture.
   `tests/fixtures/lessons-promote/`. Implementation lands in
   `bin/fleet` next to `lessons_sync()` (~line 4857). No `lib/` or
   `prompts/` edits. AGENTS.md gets one new event-type line.
+
+### 2026-06-01 — shipped via PR #51
+
+- PR #51 merged with both gating checks (`shellcheck`, `validate`)
+  green; merge SHA `8bdbf76`. Auto-merge armed via
+  `gh pr merge 51 --auto --squash` and tripped within ~30s of CI
+  green.
+- Final shape: ~370 lines of `lessons_promote*` helpers + dispatcher
+  in `bin/fleet`, one new `AGENTS.md § Telemetry` entry, one README
+  "Daily ops" line, ~370 lines of tests/fixtures. No `fleet_*`
+  signature changes; no `lib/` or `prompts/` edits → no fleet-wide
+  reinstall.
+- Novel trap surfaced (worth a LESSON): BSD `awk -v var="$val"`
+  rejects a value containing literal newlines with `awk: newline in
+  string`. Workaround: write the value to a temp file and read it
+  back via `getline line < file`. See `lessons_promote_insert_
+  under_section` for the pattern.
+- Status flip to `shipped` via separate `chore/0028-mark-shipped`
+  branch per LESSONS#0020 — feat branch was squash-merged and is
+  gone; pushing status to main directly is forbidden.
