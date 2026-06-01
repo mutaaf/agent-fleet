@@ -1871,6 +1871,541 @@ if [ "$CMD" = "weekly" ]; then
   weekly "$@"
 fi
 
+# --- inbox (ticket 0026) -------------------------------------------------
+# `fleet inbox` answers the daily question "what does my fleet need from
+# me today?" by reading the existing telemetry channel (events.jsonl,
+# LESSONS.md draft markers, launchd disabled list, gh PR list) and
+# rendering a single ordered TODO list with remediation hints inline.
+#
+# Five sections, fixed order:
+#   1. drafts to promote          — count of `<!-- DRAFT: ` markers in
+#                                   each project's docs/LESSONS.md.
+#   2. self-cancel expiring (<=7d) — SELF_CANCEL between today and +7d,
+#                                    or already expired.
+#   3. paused projects            — agent-ship label disabled in launchctl.
+#   4. budget tripped today       — budget_block events in today's UTC day.
+#   5. in-flight agent PRs >24h old — gh pr list filtered by head ref +
+#                                     createdAt < now-24h.
+#
+# Pure consumer of telemetry — no new event types (P-6), no fleet_emit_event
+# calls, no fleet_* signature changes. Read-only side effects: writes a
+# single epoch line to $XDG_CACHE_HOME/fleet/inbox-state on each run via
+# temp-file + mv (per LESSONS 2026-05-27 — no `$(cat …)` round-trip).
+
+# Test seam: FLEET_INBOX_FAKE_NOW (epoch seconds) overrides "now" so the
+# golden file's banner DATE column stays stable.
+inbox_now() {
+  echo "${FLEET_INBOX_FAKE_NOW:-$(date -u +%s)}"
+}
+
+# Path of the inbox-state marker (one epoch-second line per run).
+inbox_state_path() {
+  local cache="${XDG_CACHE_HOME:-$HOME/.cache}/fleet"
+  mkdir -p "$cache" 2>/dev/null || true
+  echo "$cache/inbox-state"
+}
+
+# Path of the last-weekly-run marker (touched by `fleet weekly` in a
+# future patch; today, we just probe its mtime — absence = never).
+inbox_weekly_marker_path() {
+  local cache="${XDG_CACHE_HOME:-$HOME/.cache}/fleet"
+  echo "$cache/last-weekly-run"
+}
+
+# Atomic write: temp-file + `mv`. Per LESSONS 2026-05-27, never use
+# $(cat …) to round-trip content; here we just emit a single epoch line.
+inbox_write_state() {
+  local path="$1" epoch="$2"
+  local tmp; tmp="$(mktemp -t inbox-state.XXXXXX)" || return 0
+  printf '%s\n' "$epoch" > "$tmp"
+  mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp"
+}
+
+# Count <!-- DRAFT: reviewer send-back, PR #N, DATE --> markers in a
+# project's docs/LESSONS.md. v1 uses the marker count directly (the events
+# channel is the cross-check, not the source, per the AC).
+# $1 = project dir. Echoes 0 when file is absent.
+inbox_count_drafts() {
+  local proj_dir="$1"
+  local lf
+  for lf in "$proj_dir/docs/LESSONS.md" "$proj_dir/LESSONS.md"; do
+    [ -f "$lf" ] || continue
+    # LESSONS 2026-05-30: grep -F with a leading-dash-safe pattern uses --.
+    # grep -c exits 1 on zero matches, which would chain `|| echo 0` and
+    # produce "0\n0" — use awk so the exit code is always 0 and the count
+    # is the only thing on stdout.
+    awk '/<!-- DRAFT: / { n++ } END { print (n+0) }' "$lf"
+    return 0
+  done
+  echo 0
+}
+
+# Days until a YYYYMMDD self-cancel date. Echoes a possibly-negative int
+# or empty when SELF_CANCEL is unset / unparseable. Honours
+# FLEET_INBOX_FAKE_NOW so the golden file's countdown stays stable.
+inbox_self_cancel_days() {
+  local sc="$1"
+  case "$sc" in
+    ''|*[!0-9]*) echo ""; return 0 ;;
+  esac
+  local target; target=$(date -u -j -f "%Y%m%d" "$sc" +%s 2>/dev/null) || { echo ""; return 0; }
+  local now_epoch; now_epoch="$(inbox_now)"
+  local today_iso today_epoch
+  today_iso="$(date -u -r "$now_epoch" +%Y%m%d 2>/dev/null || date -u -d "@$now_epoch" +%Y%m%d)"
+  today_epoch=$(date -u -j -f "%Y%m%d" "$today_iso" +%s 2>/dev/null) \
+    || today_epoch=$(date -u -d "$today_iso" +%s 2>/dev/null) || today_epoch=0
+  echo $(( (target - today_epoch) / 86400 ))
+}
+
+# Count budget_block events in TODAY's UTC window for one project.
+# $1 = events.jsonl path. Echoes integer.
+inbox_budget_block_today() {
+  local events="$1"
+  [ -f "$events" ] || { echo 0; return 0; }
+  local now today_iso
+  now="$(inbox_now)"
+  today_iso="$(date -u -r "$now" +%Y-%m-%d 2>/dev/null || date -u -d "@$now" +%Y-%m-%d)"
+  # Match lines where type=budget_block and ts begins with today's UTC date.
+  awk -v day="$today_iso" '
+    {
+      ts=""; type=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (type != "budget_block") next
+      if (index(ts, day) != 1) next
+      n++
+    }
+    END { print (n+0) }
+  ' "$events"
+}
+
+# Pull the most recent budget_block event's spent + cap for the today
+# window. Echoes "SPENT\tCAP" or empty. Used to render "$<spent>/$<cap>".
+inbox_budget_block_today_amounts() {
+  local events="$1"
+  [ -f "$events" ] || return 0
+  local now today_iso
+  now="$(inbox_now)"
+  today_iso="$(date -u -r "$now" +%Y-%m-%d 2>/dev/null || date -u -d "@$now" +%Y-%m-%d)"
+  awk -v day="$today_iso" '
+    {
+      ts=""; type=""; spent=""; cap=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"spent"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        spent=substr($0, RSTART, RLENGTH)
+        sub(/.*"spent"[[:space:]]*:[[:space:]]*"/, "", spent); sub(/".*/, "", spent)
+      }
+      if (match($0, /"cap"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        cap=substr($0, RSTART, RLENGTH)
+        sub(/.*"cap"[[:space:]]*:[[:space:]]*"/, "", cap); sub(/".*/, "", cap)
+      }
+      if (type != "budget_block") next
+      if (index(ts, day) != 1) next
+      last_spent = spent; last_cap = cap
+    }
+    END { if (last_spent != "" || last_cap != "") printf("%s\t%s", last_spent, last_cap) }
+  ' "$events"
+}
+
+# Query open agent PRs older than 24h for one project. Echoes one
+# "NUMBER\tAGE_LABEL" line per PR. Caller is responsible for skipping
+# this section entirely when gh is unavailable.
+# $1 = REPO (owner/name), $2 = now_epoch.
+inbox_stuck_prs_for_repo() {
+  local repo="$1" now_epoch="$2"
+  [ -n "$repo" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local cutoff=$(( now_epoch - 24 * 3600 ))
+  local json
+  json=$(gh pr list --repo "$repo" --state open --base main \
+           --json headRefName,number,createdAt 2>/dev/null) || return 0
+  [ -z "$json" ] && return 0
+  printf '%s' "$json" | awk -v cutoff="$cutoff" '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    function age_label(diff,    d, h) {
+      if (diff < 0) diff = 0
+      d = int(diff / 86400)
+      if (d >= 1) return d "d"
+      h = int(diff / 3600)
+      return h "h"
+    }
+    {
+      # Tokenize the single-line JSON into PR records. The gh CLI emits a
+      # JSON array; we split on "},{" plus the brackets.
+      buf = $0
+      gsub(/^\[/, "", buf); gsub(/\]$/, "", buf)
+      n = split(buf, recs, /\},\{/)
+      for (i = 1; i <= n; i++) {
+        rec = recs[i]
+        gsub(/^\{/, "", rec); gsub(/\}$/, "", rec)
+        head=""; num=""; created=""
+        if (match(rec, /"headRefName"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          head = substr(rec, RSTART, RLENGTH)
+          sub(/.*"headRefName"[[:space:]]*:[[:space:]]*"/, "", head); sub(/".*/, "", head)
+        }
+        if (match(rec, /"number"[[:space:]]*:[[:space:]]*[0-9]+/)) {
+          num = substr(rec, RSTART, RLENGTH)
+          sub(/.*:[[:space:]]*/, "", num)
+        }
+        if (match(rec, /"createdAt"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          created = substr(rec, RSTART, RLENGTH)
+          sub(/.*"createdAt"[[:space:]]*:[[:space:]]*"/, "", created); sub(/".*/, "", created)
+        }
+        if (head == "" || num == "" || created == "") continue
+        if (head !~ /^(feat\/|chore\/gtm-|eng\/)/) continue
+        ep = iso2ep(created)
+        if (ep == 0 || ep > cutoff) continue
+        diff = cutoff + 86400 - ep  # = now - created (cutoff = now - 86400)
+        printf("%s\t%s\n", num, age_label(diff))
+      }
+    }
+  '
+}
+
+# Render one "two-column-with-hint" data row. Slug column 14ch wide (same
+# as weekly_render_row), then the descriptor + hint padded. LESSONS
+# 2026-05-28 — values starting with `-` would trip printf; we always
+# precede the format with `--`.
+inbox_render_row() {
+  local slug="$1" descriptor="$2" hint="$3"
+  # 14ch slug col, 15ch descriptor col, then hint flows.
+  printf -- '  %-14s %-15s %s\n' "$slug" "$descriptor" "$hint"
+}
+
+# Build the JSON object for one section. Echoes a single line to stdout.
+inbox_emit_json_section() {
+  local section="$1" count="$2" items_json="$3"
+  printf -- '{"section":"%s","count":%s,"items":[%s]}\n' \
+    "$section" "$count" "$items_json"
+}
+
+# Append a `{"slug":..,"count":..,"hint":..}` JSON item to a comma-joined
+# accumulator. Echoes the new accumulator value.
+inbox_append_item_json() {
+  local acc="$1" slug="$2" count="$3" hint="$4"
+  local esc_slug esc_hint
+  esc_slug="$(doctor_json_escape "$slug")"
+  esc_hint="$(doctor_json_escape "$hint")"
+  local row="{\"slug\":\"$esc_slug\",\"count\":$count,\"hint\":\"$esc_hint\"}"
+  if [ -z "$acc" ]; then printf '%s' "$row"
+  else                    printf '%s,%s' "$acc" "$row"
+  fi
+}
+
+inbox() {
+  shift  # drop the leading "inbox"
+  local want_json=0 slug_filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)    want_json=1; shift ;;
+      --slug)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "fleet inbox: --slug requires a non-empty value" >&2
+          exit 2
+        fi
+        slug_filter="$2"; shift 2 ;;
+      --slug=*)
+        slug_filter="${1#--slug=}"
+        if [ -z "$slug_filter" ]; then
+          echo "fleet inbox: --slug requires a non-empty value" >&2
+          exit 2
+        fi
+        shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet inbox — daily TODO list the operator owes the loop.
+
+Usage:
+  fleet inbox                   default human output
+  fleet inbox --slug NAME       restrict every section to one project
+  fleet inbox --json            one JSON object per section + 1 summary
+
+Sections (always in this order; renders headline count when zero):
+  drafts to promote             <!-- DRAFT: --> markers in docs/LESSONS.md
+  self-cancel expiring (<=7d)   SELF_CANCEL within today + 7d (or EXPIRED)
+  paused projects               agent-ship label disabled in launchctl
+  budget tripped today          budget_block events in today's UTC day
+  in-flight agent PRs >24h old  open feat/, chore/gtm-, eng/ PRs >24h old
+
+Read-only — no commits, no PRs, no new event types.
+Exit code: 0 always (it is a report); 2 on usage error.
+USAGE
+        exit 0 ;;
+      *) echo "fleet inbox: unknown flag '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  local now_epoch; now_epoch="$(inbox_now)"
+  local today_iso
+  today_iso="$(date -u -r "$now_epoch" +%F 2>/dev/null || date -u -d "@$now_epoch" +%F)"
+
+  # "since last run" header — read inbox-state mtime, then immediately
+  # write the marker for the NEXT invocation (atomic temp-file + mv).
+  local state_path; state_path="$(inbox_state_path)"
+  local since_label="never" since_seconds_json="null"
+  if [ -f "$state_path" ]; then
+    local prev_mtime
+    prev_mtime="$(stat -f %m "$state_path" 2>/dev/null || stat -c %Y "$state_path" 2>/dev/null)"
+    if [ -n "$prev_mtime" ]; then
+      local diff=$(( now_epoch - prev_mtime ))
+      [ "$diff" -lt 0 ] && diff=0
+      since_seconds_json="$diff"
+      if   [ "$diff" -lt 3600 ];  then since_label="$(( diff / 60 ))m ago"
+      elif [ "$diff" -lt 86400 ]; then since_label="$(( diff / 3600 ))h ago"
+      else                              since_label="$(( diff / 86400 ))d ago"
+      fi
+    fi
+  fi
+  inbox_write_state "$state_path" "$now_epoch"
+
+  # Banner (human only).
+  if [ "$want_json" != "1" ]; then
+    if [ "$since_label" = "never" ]; then
+      printf 'FLEET INBOX — %s (since last run never)\n' "$today_iso"
+    else
+      printf 'FLEET INBOX — %s (since last run %s)\n' "$today_iso" "$since_label"
+    fi
+    printf '\n'
+  fi
+
+  # ----- Aggregation pass -----------------------------------------------
+  # Discover (slug, manifest) rows. Reuse weekly_discover for consistency.
+  local drafts_total=0 drafts_proj_count=0
+  local sc_total=0 paused_total=0 budget_total=0 stuck_total=0
+  local drafts_rows="" sc_rows="" paused_rows="" budget_rows="" stuck_rows=""
+  local drafts_json="" sc_json="" paused_json="" budget_json="" stuck_json=""
+
+  local slug manifest proj_dir
+  local gh_available=1
+  command -v gh >/dev/null 2>&1 || gh_available=0
+
+  while IFS=$'\t' read -r slug manifest; do
+    [ -z "$slug" ] && continue
+    [ -n "$slug_filter" ] && [ "$slug" != "$slug_filter" ] && continue
+    proj_dir="$(dirname "$manifest")"
+
+    # Manifest probe — fetch SELF_CANCEL + NAMESPACE + REPO_URL.
+    local probe namespace self_cancel repo_url
+    probe=$(
+      # shellcheck disable=SC1090
+      ( source "$manifest" 2>/dev/null
+        echo "NAMESPACE=${NAMESPACE:-com.fleet.${SLUG:-x}}"
+        echo "SELF_CANCEL=${SELF_CANCEL:-}"
+        echo "REPO_URL=${REPO_URL:-}"
+      ) 2>/dev/null
+    ) || true
+    namespace="$(echo "$probe" | sed -n 's/^NAMESPACE=//p')"
+    self_cancel="$(echo "$probe" | sed -n 's/^SELF_CANCEL=//p')"
+    repo_url="$(echo "$probe" | sed -n 's/^REPO_URL=//p')"
+    local repo_slug
+    repo_slug="$(echo "$repo_url" | sed -E 's#https?://github.com/##; s#\.git$##')"
+
+    local cache_dir="$HOME/.cache/${slug}-agent"
+    local events="$cache_dir/events.jsonl"
+
+    # --- Section 1: drafts ---
+    local n_drafts
+    n_drafts="$(inbox_count_drafts "$proj_dir")"
+    if [ "$n_drafts" -gt 0 ]; then
+      drafts_total=$(( drafts_total + n_drafts ))
+      drafts_proj_count=$(( drafts_proj_count + 1 ))
+      local d_word="drafts"
+      [ "$n_drafts" = "1" ] && d_word="draft"
+      drafts_rows+="$slug"$'\t'"$n_drafts $d_word"$'\t'"docs/LESSONS.md"$'\n'
+      drafts_json="$(inbox_append_item_json "$drafts_json" "$slug" "$n_drafts" "docs/LESSONS.md")"
+    fi
+
+    # --- Section 2: self-cancel ---
+    local sc_days
+    sc_days="$(inbox_self_cancel_days "$self_cancel")"
+    if [ -n "$sc_days" ]; then
+      if [ "$sc_days" -lt 0 ]; then
+        sc_total=$(( sc_total + 1 ))
+        sc_rows+="$slug"$'\t'"EXPIRED"$'\t'"bump SELF_CANCEL in agents.config.sh"$'\n'
+        sc_json="$(inbox_append_item_json "$sc_json" "$slug" "$sc_days" "bump SELF_CANCEL in agents.config.sh")"
+      elif [ "$sc_days" -le 7 ]; then
+        sc_total=$(( sc_total + 1 ))
+        sc_rows+="$slug"$'\t'"${sc_days}d"$'\t'"bump SELF_CANCEL in agents.config.sh"$'\n'
+        sc_json="$(inbox_append_item_json "$sc_json" "$slug" "$sc_days" "bump SELF_CANCEL in agents.config.sh")"
+      fi
+    fi
+
+    # --- Section 3: paused ---
+    local is_paused
+    is_paused="$(weekly_is_paused "$namespace")"
+    if [ "$is_paused" = "1" ]; then
+      paused_total=$(( paused_total + 1 ))
+      local paused_days
+      paused_days="$(weekly_paused_days "$namespace")"
+      [ -z "$paused_days" ] && paused_days=0
+      paused_rows+="$slug"$'\t'"paused ${paused_days}d ago"$'\t'"launchctl enable gui/\$UID/${namespace}.agent-ship"$'\n'
+      paused_json="$(inbox_append_item_json "$paused_json" "$slug" "$paused_days" "launchctl enable gui/\$UID/${namespace}.agent-ship")"
+    fi
+
+    # --- Section 4: budget tripped today ---
+    local n_bg
+    n_bg="$(inbox_budget_block_today "$events")"
+    if [ "$n_bg" -gt 0 ]; then
+      budget_total=$(( budget_total + 1 ))
+      local amounts spent cap descriptor
+      amounts="$(inbox_budget_block_today_amounts "$events")"
+      spent="$(printf '%s' "$amounts" | cut -f1)"
+      cap="$(  printf '%s' "$amounts" | cut -f2)"
+      [ -z "$spent" ] && spent="0.00"
+      [ -z "$cap" ]   && cap="0.00"
+      descriptor="\$$spent/\$$cap"
+      budget_rows+="$slug"$'\t'"$descriptor"$'\t'"bump MAX_DAILY_USD or wait for tomorrow"$'\n'
+      budget_json="$(inbox_append_item_json "$budget_json" "$slug" "$n_bg" "bump MAX_DAILY_USD or wait for tomorrow")"
+    fi
+
+    # --- Section 5: stuck PRs (skip silently when gh unavailable) ---
+    if [ "$gh_available" = "1" ] && [ -n "$repo_slug" ]; then
+      local prs
+      prs="$(inbox_stuck_prs_for_repo "$repo_slug" "$now_epoch")"
+      if [ -n "$prs" ]; then
+        local pr_line pr_num pr_age
+        while IFS=$'\t' read -r pr_num pr_age; do
+          [ -z "$pr_num" ] && continue
+          stuck_total=$(( stuck_total + 1 ))
+          stuck_rows+="$slug"$'\t'"PR #${pr_num} ${pr_age}"$'\t'"gh pr view ${pr_num}"$'\n'
+          stuck_json="$(inbox_append_item_json "$stuck_json" "$slug" "$pr_num" "gh pr view ${pr_num}")"
+          : "$pr_line"
+        done <<EOF
+$prs
+EOF
+      fi
+    fi
+  done < <(weekly_discover)
+
+  # ----- Render --------------------------------------------------------
+  if [ "$want_json" = "1" ]; then
+    inbox_emit_json_section "drafts"      "$drafts_total"  "$drafts_json"
+    inbox_emit_json_section "self_cancel" "$sc_total"      "$sc_json"
+    inbox_emit_json_section "paused"      "$paused_total"  "$paused_json"
+    inbox_emit_json_section "budget"      "$budget_total"  "$budget_json"
+    inbox_emit_json_section "stuck_prs"   "$stuck_total"   "$stuck_json"
+    local total_items=$(( drafts_total + sc_total + paused_total + budget_total + stuck_total ))
+    printf -- '{"summary":true,"sections":5,"items":%s,"since_last_run_seconds":%s}\n' \
+      "$total_items" "$since_seconds_json"
+    exit 0
+  fi
+
+  # Human output. Each section headline always prints (even zero).
+  local headline
+  if [ "$drafts_total" -gt 0 ]; then
+    headline="$drafts_total across $drafts_proj_count project"
+    [ "$drafts_proj_count" -gt 1 ] && headline="${headline}s"
+  else
+    headline="0"
+  fi
+  printf -- '%-34s%s\n' "drafts to promote" "$headline"
+  if [ -n "$drafts_rows" ]; then
+    while IFS=$'\t' read -r slug descriptor hint; do
+      [ -z "$slug" ] && continue
+      inbox_render_row "$slug" "$descriptor" "$hint"
+    done <<EOF
+$drafts_rows
+EOF
+  fi
+  printf '\n'
+
+  printf -- '%-34s%s\n' "self-cancel expiring (<=7d)" "$sc_total"
+  if [ -n "$sc_rows" ]; then
+    while IFS=$'\t' read -r slug descriptor hint; do
+      [ -z "$slug" ] && continue
+      inbox_render_row "$slug" "$descriptor" "$hint"
+    done <<EOF
+$sc_rows
+EOF
+  fi
+  printf '\n'
+
+  printf -- '%-34s%s\n' "paused projects" "$paused_total"
+  if [ -n "$paused_rows" ]; then
+    while IFS=$'\t' read -r slug descriptor hint; do
+      [ -z "$slug" ] && continue
+      inbox_render_row "$slug" "$descriptor" "$hint"
+    done <<EOF
+$paused_rows
+EOF
+  fi
+  printf '\n'
+
+  printf -- '%-34s%s\n' "budget tripped today" "$budget_total"
+  if [ -n "$budget_rows" ]; then
+    while IFS=$'\t' read -r slug descriptor hint; do
+      [ -z "$slug" ] && continue
+      inbox_render_row "$slug" "$descriptor" "$hint"
+    done <<EOF
+$budget_rows
+EOF
+  fi
+  printf '\n'
+
+  if [ "$gh_available" = "0" ]; then
+    printf -- '%-34s%s\n' "in-flight agent PRs >24h old" "0"
+    printf -- '  (skipped: gh not available)\n'
+  else
+    printf -- '%-34s%s\n' "in-flight agent PRs >24h old" "$stuck_total"
+    if [ -n "$stuck_rows" ]; then
+      while IFS=$'\t' read -r slug descriptor hint; do
+        [ -z "$slug" ] && continue
+        inbox_render_row "$slug" "$descriptor" "$hint"
+      done <<EOF
+$stuck_rows
+EOF
+    fi
+  fi
+  printf '\n'
+
+  # Trailing "nothing else owes you a click. last weekly: <age>" line.
+  local weekly_marker; weekly_marker="$(inbox_weekly_marker_path)"
+  local weekly_age="never"
+  if [ -f "$weekly_marker" ]; then
+    local wm_mtime
+    wm_mtime="$(stat -f %m "$weekly_marker" 2>/dev/null || stat -c %Y "$weekly_marker" 2>/dev/null)"
+    if [ -n "$wm_mtime" ]; then
+      local wm_diff=$(( now_epoch - wm_mtime ))
+      [ "$wm_diff" -lt 0 ] && wm_diff=0
+      if   [ "$wm_diff" -lt 3600 ];  then weekly_age="$(( wm_diff / 60 ))m ago"
+      elif [ "$wm_diff" -lt 86400 ]; then weekly_age="$(( wm_diff / 3600 ))h ago"
+      else                                 weekly_age="$(( wm_diff / 86400 ))d ago"
+      fi
+    fi
+  fi
+  if [ "$weekly_age" = "never" ]; then
+    printf -- 'nothing else owes you a click. last weekly: never — try `fleet weekly`.\n'
+  else
+    printf -- 'nothing else owes you a click. last weekly: %s — try `fleet weekly`.\n' "$weekly_age"
+  fi
+
+  exit 0
+}
+
+if [ "$CMD" = "inbox" ]; then
+  inbox "$@"
+fi
+
 # --- prompts-score (ticket 0024) -----------------------------------------
 # `fleet prompts-score <slug> [--since Nh|Nd] [--json]` grades each prompt
 # revision the project ran against, using events.jsonl + runs.jsonl as the
