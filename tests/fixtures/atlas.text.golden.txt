@@ -1,0 +1,6 @@
+PATTERN              FIRED  LAST SEEN     PROJECTS          LESSON
+actions_silent           4  2h ago        alpha             2026-05-26
+supabase_port_bind       0  —           —               2026-05-25
+account_suspended        0  —           —               2026-05-26
+gh_graphql_502           5  1h ago        alpha,bravo       2026-05-21
+synth_pattern            1  3h ago        charlie           (no lesson)

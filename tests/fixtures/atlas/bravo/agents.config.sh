@@ -1,0 +1,5 @@
+PROJECT_NAME="Bravo"
+SLUG="bravo"
+NAMESPACE="com.bravo"
+REPO_URL="https://github.com/example/bravo"
+SELF_CANCEL="20990101"

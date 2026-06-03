@@ -1,7 +1,7 @@
 ---
 id: 0031
 title: fleet atlas prints the fleet-wide failure-mode taxonomy with per-pattern frequency
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-03
@@ -369,3 +369,10 @@ the dev doesn't have to re-discover the architecture.
   `awk … END { print n+0 }`, every code path ends with explicit
   `exit 0`/`exit 2`. No `lib/` or `prompts/` changes; no new event
   types.
+- 2026-06-03 — implementation-dev: tests/atlas.sh covers AC#1–AC#12
+  (the ticket's 12 checkboxes; the 13th was the meta "tests/atlas.sh
+  covers them all" which `tests/atlas.sh` itself satisfies by passing).
+  Local gate green: `shellcheck -S warning lib/*.sh bin/fleet` clean,
+  `bash -n` clean, `node scripts/check-backlog.mjs` ✓, `bash
+  tests/atlas.sh` 12/12 ok. Status flipped to shipped in this same PR
+  so the merge lands the feature and the index update atomically.

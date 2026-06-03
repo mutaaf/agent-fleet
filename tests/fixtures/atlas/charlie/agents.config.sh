@@ -1,0 +1,5 @@
+PROJECT_NAME="Charlie"
+SLUG="charlie"
+NAMESPACE="com.charlie"
+REPO_URL="https://github.com/example/charlie"
+SELF_CANCEL="20990101"

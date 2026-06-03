@@ -22,6 +22,8 @@
 #                             (ticket 0029 — text/md/json; network-free reader)
 #   fleet resume <slug>       re-enable a ship_paused project (safety-checked)
 #                             (ticket 0030 — --force/--reason for audited override)
+#   fleet atlas               fleet-wide infra-flake catalog with per-pattern frequency (text/json)
+#                             (ticket 0031 — --since/--slug/--json; pure reader, no new event types)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -5815,6 +5817,505 @@ USAGE
 
 if [ "$CMD" = "overview" ]; then
   overview "$@"
+fi
+
+# --- atlas ----------------------------------------------------------------
+# Ticket 0031. `fleet atlas` joins the hand-curated infra-flake catalog at
+# `lib/heal-catalog.sh` with the `infra_flake_rerun` events across every
+# discovered project's `events.jsonl` and renders one table answering
+# "which catalog patterns are actually firing in the wild, how often,
+# when, and where."
+#
+#   PATTERN              FIRED  LAST SEEN     PROJECTS         LESSON
+#   actions_silent           4  2h ago        agent-fleet      2026-05-26
+#   supabase_port_bind       0  —             —                2026-05-25
+#   ...
+#
+# Pure reader: NO new event types, NO mutation of the catalog. The catalog
+# stays hand-curated and PR-gated (per the ticket's "Out of scope" clause).
+#
+# Defensive habits (LESSONS to defend against, per the ticket):
+# - 2026-05-26 (`tail` shadow): the dispatcher is named `atlas` — no
+#   coreutils binary by that name (`command -v atlas` is empty).
+# - 2026-05-27 ($(cat) trap): every file read uses awk or cp — never
+#   `$(cat …)` for content later written back.
+# - 2026-05-28 (printf leading-dash trap): every printf of a slug or
+#   pattern token starts with `printf -- '%s'`.
+# - 2026-05-30 (grep -F -- dash trap): grep callers in the test file
+#   already use `grep -qF --`; production code here does not pattern-match
+#   on user-provided strings beyond catalog tokens (which never start
+#   with `-`), but we still use `--` where shellcheck would warn.
+# - 2026-06-01 (awk -v newline trap): every `awk -v` value below is a
+#   single-line token (slug, ISO8601 ts, pattern token); the catalog body
+#   is read by file path, not via -v.
+# - 2026-06-01 (`grep -c file || echo 0` double-print trap): counts use
+#   awk with `END { print n+0 }` — never grep -c.
+# - 2026-06-01 (dispatcher fall-through trap): every code path in atlas()
+#   ends with explicit `exit 0` or `exit 2`.
+
+ATLAS_DEFAULT_WINDOW="30d"
+
+# Resolve the catalog path the same way fleet_match_infra_flake (common.sh
+# ~1033) does — honour FLEET_HEAL_CATALOG when set, else fall back to the
+# kit's lib/heal-catalog.sh next to this script.
+atlas_catalog_path() {
+  if [ -n "${FLEET_HEAL_CATALOG:-}" ]; then
+    printf -- '%s\n' "$FLEET_HEAL_CATALOG"
+    return 0
+  fi
+  local self; self="$( cd "$( dirname "$0" )" && pwd )"
+  printf -- '%s\n' "$self/../lib/heal-catalog.sh"
+}
+
+# Parse the catalog file as text. Echoes one `<token>\t<lesson-date>` line
+# per pattern in catalog (declaration) order. <lesson-date> is the
+# YYYY-MM-DD captured from the inline `# LESSON: <repo> YYYY-MM-DD …`
+# comment immediately preceding the pattern entry — empty when no such
+# comment exists for that pattern.
+#
+# Implementation: awk walks the file linearly. On each non-comment, non-
+# blank line, we look for the trailing `"<token>|<regex>"` entry shape.
+# We buffer the LATEST `# LESSON: … YYYY-MM-DD …` date we have seen
+# since the last array close (or the array open `(`) and emit it with
+# the next pattern entry. The buffer is cleared every time we emit so a
+# pattern without its own LESSON comment renders empty.
+#
+# No `awk -v` multi-line trap (LESSONS 2026-06-01) — we pass the file
+# path, not the body.
+atlas_parse_catalog() {
+  local catalog="$1"
+  [ -f "$catalog" ] || return 0
+  awk '
+    # Buffer the most recent LESSON date we have read since emitting the
+    # last pattern. Cleared on emit.
+    {
+      line = $0
+      # Capture LESSON date from a comment line.
+      if (match(line, /^[[:space:]]*#[[:space:]]*LESSON:.*[0-9]{4}-[0-9]{2}-[0-9]{2}/)) {
+        # Pull the first YYYY-MM-DD on the line.
+        if (match(line, /[0-9]{4}-[0-9]{2}-[0-9]{2}/)) {
+          last_lesson = substr(line, RSTART, RLENGTH)
+        }
+        next
+      }
+      # Skip other comments and blank lines (they do not clear the buffer).
+      if (line ~ /^[[:space:]]*#/) next
+      if (line ~ /^[[:space:]]*$/) next
+      # Pattern entry: `"<token>|<regex>"` somewhere on the line.
+      if (match(line, /"[A-Za-z0-9_]+\|/)) {
+        entry = substr(line, RSTART + 1, RLENGTH - 2)
+        # entry currently ends with `|` — strip it.
+        gsub(/\|$/, "", entry)
+        printf("%s\t%s\n", entry, last_lesson)
+        last_lesson = ""
+      }
+    }
+  ' "$catalog"
+}
+
+# Count infra_flake_rerun events with pattern=<token> across one or more
+# events.jsonl files, restricted to ts >= cutoff_epoch. Echoes one integer.
+# Reuses the inbox_budget_block_today JSON-scan awk shape (no jq).
+#
+# Args:
+#   $1 — catalog token (single line, no newline)
+#   $2 — cutoff_epoch
+#   $3..N — events.jsonl paths (any missing files silently skipped)
+atlas_count_pattern() {
+  local token="$1" cutoff="$2"; shift 2
+  local files=()
+  local f
+  for f in "$@"; do
+    [ -f "$f" ] && files+=("$f")
+  done
+  if [ "${#files[@]}" -eq 0 ]; then
+    echo 0
+    return 0
+  fi
+  awk -v cutoff="$cutoff" -v want="$token" '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    {
+      ts=""; type=""; pat=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"pattern"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        pat=substr($0, RSTART, RLENGTH)
+        sub(/.*"pattern"[[:space:]]*:[[:space:]]*"/, "", pat); sub(/".*/, "", pat)
+      }
+      if (type != "infra_flake_rerun") next
+      if (pat != want) next
+      if (iso2ep(ts) < cutoff) next
+      n++
+    }
+    END { print (n+0) }
+  ' "${files[@]}"
+}
+
+# Emit the newest matching event's ts (ISO8601) on stdout, or empty when no
+# match. Args identical to atlas_count_pattern.
+atlas_last_seen_pattern() {
+  local token="$1" cutoff="$2"; shift 2
+  local files=()
+  local f
+  for f in "$@"; do
+    [ -f "$f" ] && files+=("$f")
+  done
+  if [ "${#files[@]}" -eq 0 ]; then
+    return 0
+  fi
+  awk -v cutoff="$cutoff" -v want="$token" '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    {
+      ts=""; type=""; pat=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"pattern"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        pat=substr($0, RSTART, RLENGTH)
+        sub(/.*"pattern"[[:space:]]*:[[:space:]]*"/, "", pat); sub(/".*/, "", pat)
+      }
+      if (type != "infra_flake_rerun") next
+      if (pat != want) next
+      ep = iso2ep(ts)
+      if (ep < cutoff) next
+      if (ep > best_ep) { best_ep = ep; best_ts = ts }
+    }
+    END { if (best_ts != "") print best_ts }
+  ' "${files[@]}"
+}
+
+# Compose the PROJECTS column. Echoes a sorted, comma-joined list of slugs
+# that contributed at least one matching event in the window. Cap at 3 and
+# append " +N" when more match (per AC#4).
+#
+# Args:
+#   $1 — token, $2 — cutoff_epoch, then tab-separated `<slug>\t<events_path>`
+#        rows on stdin (one per line). We feed in the discovered project
+#        set so this helper does not have to re-walk it.
+atlas_projects_for_pattern() {
+  local token="$1" cutoff="$2"
+  local hits=""
+  local slug events
+  while IFS=$'\t' read -r slug events; do
+    [ -z "$slug" ] && continue
+    [ -f "$events" ] || continue
+    local n
+    n="$(atlas_count_pattern "$token" "$cutoff" "$events")"
+    if [ "${n:-0}" -gt 0 ]; then
+      hits+="$slug"$'\n'
+    fi
+  done
+  # Sort, de-dup, count, truncate.
+  local sorted
+  sorted="$(printf -- '%s' "$hits" | awk 'NF { print }' | sort -u)"
+  if [ -z "$sorted" ]; then
+    return 0
+  fi
+  local total head_count overflow
+  total="$(printf -- '%s\n' "$sorted" | awk 'NF { n++ } END { print (n+0) }')"
+  if [ "$total" -le 3 ]; then
+    # Comma-join.
+    printf -- '%s' "$sorted" | awk 'NF { if (out) out = out "," $0; else out = $0 } END { print out }'
+  else
+    head_count=3
+    overflow=$(( total - head_count ))
+    printf -- '%s' "$sorted" \
+      | awk -v cap=3 -v overflow="$overflow" '
+          NF { n++; if (n <= cap) { if (out) out = out "," $0; else out = $0 } }
+          END { print out " +" overflow }
+        '
+  fi
+}
+
+# Render one row in text mode. Args:
+#   $1 token, $2 fired, $3 last_seen_label, $4 projects_label, $5 lesson_label
+atlas_render_row_text() {
+  local token="$1" fired="$2" last_seen="$3" projects="$4" lesson="$5"
+  printf -- '%-20s %5s  %-12s  %-16s  %s\n' \
+    "$token" "$fired" "$last_seen" "$projects" "$lesson"
+}
+
+# Render one row in JSON mode. Args:
+#   $1 token, $2 fired (int), $3 last_seen_ts (iso8601 or empty),
+#   $4 projects_csv (empty or "a,b,c" without overflow marker),
+#   $5 lesson_date (YYYY-MM-DD or empty)
+atlas_render_row_json() {
+  local token="$1" fired="$2" last_seen_ts="$3" projects_csv="$4" lesson_date="$5"
+  local last_seen_json="null"
+  if [ -n "$last_seen_ts" ]; then
+    last_seen_json="\"$(doctor_json_escape "$last_seen_ts")\""
+  fi
+  local lesson_json="null"
+  if [ -n "$lesson_date" ]; then
+    lesson_json="\"$(doctor_json_escape "$lesson_date")\""
+  fi
+  # projects_csv → JSON array. Split on comma; empty CSV → [].
+  local projects_json="[]"
+  if [ -n "$projects_csv" ]; then
+    projects_json="$(printf -- '%s' "$projects_csv" \
+      | awk 'BEGIN { FS = "," }
+             { for (i = 1; i <= NF; i++) {
+                 v = $i
+                 gsub(/\\/, "\\\\", v); gsub(/"/, "\\\"", v)
+                 out = (out ? out "," : "") "\"" v "\""
+               } }
+             END { print "[" out "]" }')"
+  fi
+  printf -- '{"pattern":"%s","fired":%s,"last_seen_ts":%s,"projects":%s,"lesson_date":%s}\n' \
+    "$(doctor_json_escape "$token")" "$fired" "$last_seen_json" \
+    "$projects_json" "$lesson_json"
+}
+
+# Convert an ISO8601 ts → human age relative to FLEET_ATLAS_FAKE_NOW or
+# current time. Mirrors human_age (~line 64) but starts from an ISO string.
+atlas_human_age_iso() {
+  local ts="$1"
+  [ -z "$ts" ] && { echo "—"; return 0; }
+  local now ep
+  now="${FLEET_ATLAS_FAKE_NOW:-$(date -u +%s)}"
+  ep="$(digest_iso_to_epoch "$ts")"
+  [ -z "$ep" ] && { echo "—"; return 0; }
+  local diff=$(( now - ep ))
+  [ "$diff" -lt 0 ] && diff=0
+  if   [ "$diff" -lt 3600 ];  then echo "$(( diff/60 ))m ago"
+  elif [ "$diff" -lt 86400 ]; then echo "$(( diff/3600 ))h ago"
+  else echo "$(( diff/86400 ))d ago"; fi
+}
+
+# Discover (slug, events_path) rows under FLEET_DISCOVERY_ROOT. Same
+# two-root pattern as overview_discover, de-duped by SLUG. Skips slugs
+# without an events.jsonl on disk only at the count step — the row still
+# qualifies for the survey (just contributes 0 fires).
+atlas_discover() {
+  local root="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local installed="$HOME/.local/share/agent-fleet/projects"
+  local _seen="" m slug
+  { find "$root"      -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$installed" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf -- '%s\t%s\n' "$slug" "$HOME/.cache/${slug}-agent/events.jsonl"
+  done | sort -t $'\t' -k1,1
+}
+
+atlas() {
+  shift  # drop the leading "atlas"
+  local want_json=0 slug_filter="" since="$ATLAS_DEFAULT_WINDOW"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      --slug)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "atlas: --slug requires a non-empty value" >&2
+          exit 2
+        fi
+        slug_filter="$2"; shift 2 ;;
+      --slug=*)
+        slug_filter="${1#--slug=}"
+        if [ -z "$slug_filter" ]; then
+          echo "atlas: --slug requires a non-empty value" >&2
+          exit 2
+        fi
+        shift ;;
+      --since)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "atlas: --since requires a value (use Nh or Nd)" >&2
+          exit 2
+        fi
+        since="$2"; shift 2 ;;
+      --since=*)
+        since="${1#--since=}"
+        if [ -z "$since" ]; then
+          echo "atlas: --since requires a value (use Nh or Nd)" >&2
+          exit 2
+        fi
+        shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet atlas — fleet-wide infra-flake catalog with per-pattern frequency.
+
+Usage:
+  fleet atlas                   default --since 30d, every project
+  fleet atlas --since 7d        restrict window (Nh or Nd)
+  fleet atlas --slug NAME       restrict survey to one project
+  fleet atlas --json            one JSON object per pattern + 1 summary
+  fleet atlas --help            this message
+
+Columns:
+  PATTERN     catalog token from lib/heal-catalog.sh
+  FIRED       count of infra_flake_rerun events in the window
+  LAST SEEN   human_age of newest matching event, or "—"
+  PROJECTS    comma-joined sorted slugs (capped at 3 + " +N" overflow)
+  LESSON      YYYY-MM-DD from the inline LESSON comment, or "(no lesson)"
+
+Read-only — no commits, no PRs, no new event types. The catalog file at
+lib/heal-catalog.sh is hand-curated; this command READS it. Set
+FLEET_HEAL_CATALOG=<path> to point at an alternate catalog.
+
+Exit code: 0 on success; 2 on invalid --since / unknown --slug /
+missing catalog.
+USAGE
+        exit 0 ;;
+      *)
+        echo "atlas: unknown flag '$1'" >&2
+        exit 2 ;;
+    esac
+  done
+
+  # Parse --since via the shared digest_parse_since helper (bin/fleet ~1140).
+  local window_seconds
+  if ! window_seconds="$(digest_parse_since "$since" 2>/dev/null)"; then
+    printf -- 'atlas: invalid --since "%s" (use Nh or Nd)\n' "$since" >&2
+    exit 2
+  fi
+
+  # Resolve catalog path; refuse to proceed if missing/unreadable.
+  local catalog
+  catalog="$(atlas_catalog_path)"
+  if [ ! -f "$catalog" ] || [ ! -r "$catalog" ]; then
+    printf -- 'atlas: heal catalog not found at %s (set FLEET_HEAL_CATALOG to override)\n' \
+      "$catalog" >&2
+    exit 2
+  fi
+
+  # Compute the cutoff epoch.
+  local now cutoff
+  now="${FLEET_ATLAS_FAKE_NOW:-$(date -u +%s)}"
+  cutoff=$(( now - window_seconds ))
+
+  # Discover the surveyed project set (slug, events-path) lines. If a slug
+  # filter is set, restrict; if the filter has no match under the discovery
+  # root, exit 2 with the documented stderr message.
+  local discovered
+  discovered="$(atlas_discover)"
+  if [ -n "$slug_filter" ]; then
+    local restricted
+    restricted="$(printf -- '%s\n' "$discovered" | awk -F'\t' -v want="$slug_filter" '$1 == want { print }')"
+    if [ -z "$restricted" ]; then
+      printf -- 'atlas: no project with SLUG=%s found (looked under FLEET_DISCOVERY_ROOT=%s)\n' \
+        "$slug_filter" "${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}" >&2
+      exit 2
+    fi
+    discovered="$restricted"
+  fi
+
+  # Header (text mode only).
+  if [ "$want_json" != "1" ]; then
+    printf -- '%-20s %5s  %-12s  %-16s  %s\n' \
+      "PATTERN" "FIRED" "LAST SEEN" "PROJECTS" "LESSON"
+  fi
+
+  # Walk catalog patterns in declaration order.
+  local fired_total=0
+  local token lesson_date entry
+  while IFS=$'\t' read -r token lesson_date; do
+    [ -z "$token" ] && continue
+
+    # FIRED: sum across every discovered project's events.jsonl.
+    local total_fired=0
+    local files_list=""
+    local slug events_path
+    while IFS=$'\t' read -r slug events_path; do
+      [ -z "$slug" ] && continue
+      files_list+="$events_path"$'\n'
+    done <<EOF
+$discovered
+EOF
+    # Count across files. Pass each file individually since atlas_count_pattern
+    # handles missing files internally.
+    local files_args=()
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      files_args+=("$f")
+    done <<EOF
+$files_list
+EOF
+    if [ "${#files_args[@]}" -gt 0 ]; then
+      total_fired="$(atlas_count_pattern "$token" "$cutoff" "${files_args[@]}")"
+    fi
+    [ -z "$total_fired" ] && total_fired=0
+    fired_total=$(( fired_total + total_fired ))
+
+    # LAST SEEN ts (ISO8601). Walk files; pick newest across all.
+    local last_ts="" candidate
+    if [ "${#files_args[@]}" -gt 0 ]; then
+      candidate="$(atlas_last_seen_pattern "$token" "$cutoff" "${files_args[@]}")"
+      [ -n "$candidate" ] && last_ts="$candidate"
+    fi
+
+    # PROJECTS: ask atlas_projects_for_pattern with our discovered set.
+    local projects_label="—" projects_csv=""
+    local projects_raw
+    projects_raw="$(printf -- '%s\n' "$discovered" | atlas_projects_for_pattern "$token" "$cutoff")"
+    if [ -n "$projects_raw" ]; then
+      projects_label="$projects_raw"
+      # JSON wants the slug-only CSV without the overflow marker.
+      projects_csv="$(printf -- '%s' "$projects_raw" | sed -E 's/ \+[0-9]+$//')"
+    fi
+
+    # LESSON column (text label vs date).
+    local lesson_label
+    if [ -n "$lesson_date" ]; then
+      lesson_label="$lesson_date"
+    else
+      lesson_label="(no lesson)"
+    fi
+
+    if [ "$want_json" = "1" ]; then
+      atlas_render_row_json "$token" "$total_fired" "$last_ts" "$projects_csv" "$lesson_date"
+    else
+      local last_seen_label="—"
+      if [ -n "$last_ts" ]; then
+        last_seen_label="$(atlas_human_age_iso "$last_ts")"
+      fi
+      atlas_render_row_text "$token" "$total_fired" "$last_seen_label" \
+        "$projects_label" "$lesson_label"
+    fi
+  done < <(atlas_parse_catalog "$catalog")
+
+  # Summary row (JSON only).
+  if [ "$want_json" = "1" ]; then
+    local patterns_count
+    patterns_count="$(atlas_parse_catalog "$catalog" | awk 'NF { n++ } END { print (n+0) }')"
+    printf -- '{"summary":true,"patterns":%s,"window":"%s","fired_total":%s}\n' \
+      "$patterns_count" "$since" "$fired_total"
+  fi
+
+  exit 0
+}
+
+if [ "$CMD" = "atlas" ]; then
+  atlas "$@"
 fi
 
 # --- lessons-sync ---------------------------------------------------------
