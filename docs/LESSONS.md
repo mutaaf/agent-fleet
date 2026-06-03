@@ -200,3 +200,30 @@ but that flexibility means the function body owns the exit. Cheap
 defensive habit when adding a new subcommand: copy a sibling
 dispatcher (`weekly` is the closest pure-reader analogue) and mirror
 its `exit 0` lines verbatim — including the one inside `-h|--help`.
+
+## 2026-06-03 — `doctor_json_escape` (and `_json_escape` in lib/common.sh) sign-extends multi-byte UTF-8 bytes under `LC_ALL=C`
+
+While shipping ticket 0029's `provenance_render_json`, the first cut
+reused `doctor_json_escape` (line ~702 of `bin/fleet`, byte-identical
+to `lib/common.sh`'s `_json_escape`) to escape the prompts CHANGELOG
+entry's `YYYY-MM-DD — <title>` value. The em-dash `—` is U+2014, a
+3-byte UTF-8 sequence `0xE2 0x80 0x94`. Under `LC_ALL=C` (the test
+harness's locale), bash treats `${s:i:1}` as one BYTE not one
+character, and `printf -v code '%d' "'$ch"` reads that byte through
+signed char and yields a NEGATIVE int (e.g. `-30` for `0xE2`). The
+helper's `if [ "$code" -lt 32 ]` branch then fires and emits a
+sign-extended `\u......` sequence like
+`￿ffffffffffe2￿ffffffffff80￿ffffffffff94`, which
+makes the JSON parse but renders garbage. Symptom in
+`tests/provenance.sh` AC#3: `diff -u` against the golden showed
+those `￿ffff…` runs in place of the em-dash. JSON does NOT
+require escaping of bytes ≥ 0x80 — raw UTF-8 is legal in a JSON
+string — so the fix is to short-circuit the high-byte path:
+`if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]`, otherwise pass `$ch`
+through verbatim. Same trap applies to `lib/common.sh`'s
+`_json_escape`; for now `provenance_render_json` uses its own
+`provenance_json_escape` helper while a follow-up ticket lifts the
+fix into common.sh. Cheap defensive habit: any per-byte JSON
+escape in this kit MUST guard on `code >= 0` before treating it as
+a control char, and treat negative codes (sign-extended high bytes)
+as already-safe pass-through.
