@@ -1,7 +1,7 @@
 ---
 id: 0029
 title: fleet provenance <pr> reconstructs the prompts SHA, lessons, and heal patterns behind a shipped PR
-status: groomed
+status: in-progress
 priority: P1
 area: governance
 created: 2026-06-03
@@ -343,4 +343,7 @@ doesn't have to re-discover the architecture.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-03 — implementation-dev: branch `feat/0029-fleet-provenance-pr-forensics`,
+  failing test first in `tests/provenance.sh` covering all 13 ACs, then
+  `provenance()` + helpers in `bin/fleet` (pure consumer; no `lib/` /
+  `prompts/` edits, no new event types).
