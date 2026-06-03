@@ -1,7 +1,7 @@
 ---
 id: 0030
 title: fleet resume <slug> unpauses a ship-paused project with one confirmed command
-status: in-progress
+status: shipped
 priority: P1
 area: safety
 created: 2026-06-03
@@ -337,3 +337,13 @@ dev doesn't have to re-discover the architecture.
   three helpers (`resume_label_state`, `resume_sendback_count_24h`,
   `resume_paused_for`) added to `bin/fleet`; no `lib/` or `prompts/`
   changes. AGENTS.md § Telemetry gets the new `ship_resumed` bullet.
+- 2026-06-03 — shipped via PR #58
+  (https://github.com/mutaaf/agent-fleet/pull/58). Both gating checks
+  (shellcheck + validate) green; auto-merge fired clean. No novel
+  LESSON appended — the four LESSONS the ticket flagged
+  (2026-05-{26,27,28,30} + 2026-06-01 × 2) were all already
+  documented and the implementation respected them on the first
+  cut. The only minor course-correction was the help-block content
+  (`--help` keyword was implied by `-h|--help` but the test asserts
+  the literal token, so the USAGE block now names `--help` on its
+  own line) — that's mechanics, not novel operational memory.
