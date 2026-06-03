@@ -1,7 +1,7 @@
 ---
 id: 0031
 title: fleet atlas prints the fleet-wide failure-mode taxonomy with per-pattern frequency
-status: groomed
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-03
@@ -351,4 +351,28 @@ the dev doesn't have to re-discover the architecture.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-03 — implementation-dev: branched
+  `feat/0031-fleet-atlas-failure-mode-frequency` off `main`; status flipped
+  to in-progress. Plan: write `tests/atlas.sh` + fixtures
+  (`tests/fixtures/atlas/<slug>/agents.config.sh` ×3, three
+  `events.jsonl` files seeded with `infra_flake_rerun` events across two
+  real patterns + one synthetic 5th pattern; `tests/fixtures/atlas.catalog.sh`
+  with one extra `(no lesson)` pattern; one
+  `tests/fixtures/atlas.text.golden.txt` golden). Implement the
+  `atlas()` dispatcher + five helpers (`atlas_parse_catalog`,
+  `atlas_count_pattern`, `atlas_last_seen_pattern`,
+  `atlas_projects_for_pattern`, `atlas_render_row_text`/`_json`)
+  next to `overview()` / `prompts_score()`. Defensive habits per the
+  LESSONS-to-defend-against list: every `printf` of a token/slug uses
+  `printf -- '%s'`, every `grep -F` against a `--`-prefix-able token
+  uses `grep -qF --`, no `awk -v` value is multi-line, counts use
+  `awk … END { print n+0 }`, every code path ends with explicit
+  `exit 0`/`exit 2`. No `lib/` or `prompts/` changes; no new event
+  types.
+- 2026-06-03 — implementation-dev: tests/atlas.sh covers AC#1–AC#12
+  (the ticket's 12 checkboxes; the 13th was the meta "tests/atlas.sh
+  covers them all" which `tests/atlas.sh` itself satisfies by passing).
+  Local gate green: `shellcheck -S warning lib/*.sh bin/fleet` clean,
+  `bash -n` clean, `node scripts/check-backlog.mjs` ✓, `bash
+  tests/atlas.sh` 12/12 ok. Status flipped to shipped in this same PR
+  so the merge lands the feature and the index update atomically.

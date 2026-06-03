@@ -1,0 +1,5 @@
+PROJECT_NAME="Alpha"
+SLUG="alpha"
+NAMESPACE="com.alpha"
+REPO_URL="https://github.com/example/alpha"
+SELF_CANCEL="20990101"
