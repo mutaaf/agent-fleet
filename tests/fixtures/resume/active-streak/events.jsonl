@@ -1,0 +1,4 @@
+{"ts":"2026-06-02T22:00:00Z","slug":"active-streak","phase":"ship","type":"ship_paused","reason":"sendback_streak","count":"3","prs":"77,78,79"}
+{"ts":"2026-06-02T23:10:00Z","slug":"active-streak","phase":"review","type":"lesson_draft_emitted","pr":"77","headline":"draft about flaky test"}
+{"ts":"2026-06-03T02:30:00Z","slug":"active-streak","phase":"review","type":"lesson_draft_emitted","pr":"78","headline":"draft about race condition"}
+{"ts":"2026-06-03T05:45:00Z","slug":"active-streak","phase":"review","type":"lesson_draft_emitted","pr":"79","headline":"draft about port collision"}

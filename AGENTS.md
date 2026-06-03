@@ -216,6 +216,23 @@ postcard.
     `FLEET_TRAINEE_REMAINING` value at emission time. Ticket 0014.
     Operator graduates the project by merging PRs until the cap is met
     — there is no manual reset.
+  - `ship_resumed {source, paused_for, reason, forced}` — emitted by
+    `bin/fleet resume <slug>` (ticket 0030) on every successful resume
+    of a previously `ship_paused` project. `source` is the slug whose
+    `agent-ship` launchd label was re-enabled; `paused_for` is the
+    human-formatted age ("23h", "3d", `unknown` when no `ship_paused`
+    event exists in the channel) of the most recent `ship_paused`
+    event the resume cleared; `reason` is the `--reason` value on the
+    `--force` path or the literal string `streak cleared` on the
+    default (streak-check-passed) path; `forced` is `0` on the
+    default path and `1` on `--force`. Carries `phase=resume` and
+    lives in the source project's `events.jsonl` (per P-6: project is
+    the unit of telemetry, not the kit). Idempotent no-op path
+    (label already enabled) and refusal path (streak still active,
+    no `--force`) emit NO event — only successful resumes do. Mirrors
+    the shape of `rollback_opened` (0017) and `lesson_promoted`
+    (0028): one operator-initiated action, one typed event, no
+    transcript scraping required to reconstruct the recovery.
 
 **Demo path (ticket 0023).** `bin/fleet kickstart --demo` walks a
 credential-less synthetic ship cycle and emits the four core event

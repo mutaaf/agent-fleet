@@ -20,6 +20,8 @@
 #                             (ticket 0028 — operator's curation primitive)
 #   fleet provenance <slug> <pr>  one-command audit receipt for a shipped PR
 #                             (ticket 0029 — text/md/json; network-free reader)
+#   fleet resume <slug>       re-enable a ship_paused project (safety-checked)
+#                             (ticket 0030 — --force/--reason for audited override)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -6681,6 +6683,350 @@ USAGE
 
 if [ "$CMD" = "lessons-promote" ]; then
   lessons_promote "$@"
+fi
+
+# --- resume ---------------------------------------------------------------
+# Ticket 0030. `bin/fleet resume <slug> [--reason "<one-line>"] [--force]`
+# is the operator-facing inverse of `fleet_check_sendback_streak`
+# (lib/common.sh ~330) — the helper that auto-disables the agent-ship
+# launchd label when 3+ agent-branch PRs in the last 24h were
+# request-changes'd. The pause emits `ship_paused`; this command emits
+# `ship_resumed` and re-enables the same label, BUT only after
+# re-running the streak check so an operator who never fixed the
+# underlying flake cannot stumble back into the same hole. `--force`
+# (with mandatory `--reason`) bypasses the streak check for the
+# operator who knows better — both fields land in the event payload
+# so the override is auditable.
+#
+# Hard NO: this command never touches lib/ or prompts/ — it is a pure
+# caller of fleet_emit_event (lib/common.sh ~975). Per LESSONS
+# 2026-06-01 every code path ends with explicit `exit 0`/`exit 1`/
+# `exit 2` to dodge the dispatcher fall-through trap. Per LESSONS
+# 2026-05-28 every `printf` of `$reason` (which may begin with `-`)
+# uses `printf -- '%s'`. Per LESSONS 2026-06-01 the 24h send-back
+# counter uses awk (never `grep -c … || echo 0` which double-prints).
+# Naming: `resume` does not shadow any coreutils binary on macOS or
+# Ubuntu (`command -v resume` returns nothing), so the dispatcher
+# function name is safe per LESSONS 2026-05-26.
+
+resume_resolve_manifest() {
+  # Mirrors rollback_resolve_manifest / kickstart_resolve_manifest. Two
+  # discovery roots, working-tree-first so a PR-branch manifest beats
+  # the installed copy.
+  local want="$1"
+  local roots=("${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}" "$HOME/.local/share/agent-fleet/projects")
+  local root m slug
+  for root in "${roots[@]}"; do
+    [ -d "$root" ] || continue
+    while IFS= read -r m; do
+      [ -n "$m" ] || continue
+      # shellcheck disable=SC1090
+      slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+      if [ "$slug" = "$want" ]; then
+        echo "$m"
+        return 0
+      fi
+    done < <(find "$root" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort)
+  done
+}
+
+resume_label_state() {
+  # Wraps `launchctl print gui/$UID/<ns>.agent-ship` and parses the one
+  # line we care about: `state = enabled` or `state = disabled`.
+  # Echoes `enabled` / `disabled` / empty (label not loaded at all).
+  local label="$1"
+  launchctl print "$label" 2>/dev/null \
+    | awk '/state[[:space:]]*=/ { for(i=1;i<=NF;i++) if($i=="="){print $(i+1); exit} }'
+}
+
+resume_sendback_count_24h() {
+  # Counts lesson_draft_emitted events with ts in the last 24h on the
+  # slug's events.jsonl. Reuses the awk pattern from
+  # `inbox_budget_block_today` (line ~2248). awk is mandatory here per
+  # LESSONS 2026-06-01 — `grep -c … || echo 0` double-prints on zero
+  # matches and corrupts the integer the caller compares with `-ge 3`.
+  local events="$1"
+  [ -f "$events" ] || { echo 0; return 0; }
+  local now cutoff_epoch
+  now="$(date -u +%s)"
+  cutoff_epoch=$(( now - 24 * 3600 ))
+  awk -v cutoff="$cutoff_epoch" '
+    function ts_to_epoch(ts,    yr, mo, da, hr, mi, se, t) {
+      # Parse "YYYY-MM-DDTHH:MM:SSZ" → epoch seconds. Uses mktime in
+      # UTC space (gawk supports a 6th systime arg; BSD awk does not).
+      # We approximate via per-component math against a fixed anchor
+      # so the function works under BSD awk too. Anchor: 1970-01-01
+      # 00:00:00 UTC, computed via day-count from the year.
+      if (length(ts) < 19) return 0
+      yr = substr(ts, 1, 4) + 0
+      mo = substr(ts, 6, 2) + 0
+      da = substr(ts, 9, 2) + 0
+      hr = substr(ts, 12, 2) + 0
+      mi = substr(ts, 15, 2) + 0
+      se = substr(ts, 18, 2) + 0
+      # Day-of-year by month (non-leap). Add leap-year correction at end.
+      mdays[1]=0; mdays[2]=31; mdays[3]=59; mdays[4]=90; mdays[5]=120
+      mdays[6]=151; mdays[7]=181; mdays[8]=212; mdays[9]=243
+      mdays[10]=273; mdays[11]=304; mdays[12]=334
+      doy = mdays[mo] + (da - 1)
+      if (mo > 2 && ((yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0)) doy += 1
+      # Days from 1970 to start of `yr`.
+      leaps = int((yr-1)/4) - int((yr-1)/100) + int((yr-1)/400)
+      leaps -= int(1969/4) - int(1969/100) + int(1969/400)
+      days_from_epoch = (yr - 1970) * 365 + leaps + doy
+      t = days_from_epoch * 86400 + hr * 3600 + mi * 60 + se
+      return t
+    }
+    {
+      ts=""; type=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (type != "lesson_draft_emitted") next
+      ep = ts_to_epoch(ts)
+      if (ep < cutoff) next
+      n++
+    }
+    END { print (n+0) }
+  ' "$events"
+}
+
+resume_paused_for() {
+  # Reads the slug's events.jsonl for the most recent `ship_paused` ts
+  # and returns a human-formatted age string via `human_age`. Falls
+  # back to `unknown` when no ship_paused event is present (operator
+  # disabled the label out-of-band).
+  local events="$1"
+  [ -f "$events" ] || { echo "unknown"; return 0; }
+  local last_ts
+  last_ts="$(awk '
+    {
+      ts=""; type=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (type == "ship_paused") last = ts
+    }
+    END { print last }
+  ' "$events")"
+  if [ -z "$last_ts" ]; then
+    echo "unknown"
+    return 0
+  fi
+  # Convert ISO ts → epoch via `date -j -f`. BSD date on macOS,
+  # GNU date on Ubuntu — both syntaxes tried.
+  local epoch
+  epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$last_ts" +%s 2>/dev/null \
+          || date -u -d "$last_ts" +%s 2>/dev/null)"
+  if [ -z "$epoch" ]; then
+    echo "unknown"
+    return 0
+  fi
+  # human_age (bin/fleet ~62) emits "Nm ago"/"Nh ago"/"Nd ago"; strip the
+  # trailing " ago" so the event payload reads as a duration, not a
+  # past-tense phrase.
+  local age; age="$(human_age "$epoch")"
+  age="${age% ago}"
+  echo "$age"
+}
+
+resume() {
+  shift  # drop the leading "resume"
+  local slug_arg="" want_force=0 reason=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force)
+        want_force=1; shift ;;
+      --reason)
+        reason="${2:-}"; shift 2 ;;
+      --reason=*)
+        reason="${1#--reason=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet resume — re-enable a ship_paused project's agent-ship launchd label.
+
+Usage:
+  fleet resume <slug>                              safety-checked resume
+  fleet resume <slug> --force --reason "<text>"    auditable override
+  fleet resume --help                              print this block, exit 0
+
+Default path: re-runs the same 24h send-back check that triggered the
+auto-pause (3+ \`lesson_draft_emitted\` events under
+\`fleet_check_sendback_streak\` in lib/common.sh). When the streak has
+cleared, runs \`launchctl enable gui/\$UID/<ns>.agent-ship\`, verifies
+the label state flipped via \`launchctl print\`, emits one
+\`ship_resumed {source, paused_for, reason, forced}\` event to the
+project's events.jsonl, and exits 0.
+
+Refusal path: when the streak has NOT cleared, prints the diagnose
+hint to stderr and exits 2 without touching the launchd label or
+emitting an event. \`--force\` skips the streak check but REQUIRES
+\`--reason "<one-line>"\` so the override is auditable in the event
+log.
+
+Idempotent: if the label is already enabled, prints "not paused" and
+exits 0 without calling launchctl or emitting an event.
+USAGE
+        exit 0 ;;
+      --) shift ;;
+      -*)
+        printf -- 'fleet resume: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$slug_arg" ]; then
+          slug_arg="$1"; shift
+        else
+          printf -- 'fleet resume: unexpected extra argument %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$slug_arg" ]; then
+    echo "fleet resume: missing <slug>" >&2
+    echo "usage: fleet resume <slug> [--force --reason \"<text>\"]" >&2
+    exit 2
+  fi
+
+  # AC#5: --force without --reason is rejected (auditable override).
+  if [ "$want_force" = "1" ] && [ -z "$reason" ]; then
+    echo "fleet resume: --force requires --reason \"<one-line>\" (auditable override)" >&2
+    exit 2
+  fi
+
+  # Resolve slug → manifest → SLUG + NAMESPACE + CACHE_DIR.
+  local manifest
+  manifest="$(resume_resolve_manifest "$slug_arg")"
+  if [ -z "$manifest" ]; then
+    local root="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+    printf -- 'fleet resume: no project with SLUG=%s found (looked under FLEET_DISCOVERY_ROOT=%s)\n' \
+      "$slug_arg" "$root" >&2
+    exit 2
+  fi
+  local slug namespace
+  # shellcheck disable=SC1090  # discovered at runtime
+  eval "$(
+    source "$manifest"
+    printf "slug='%s'\n"      "${SLUG:-}"
+    printf "namespace='%s'\n" "${NAMESPACE:-com.fleet.${SLUG:-$slug_arg}}"
+  )"
+  if [ -z "$slug" ] || [ -z "$namespace" ]; then
+    echo "fleet resume: could not derive SLUG/NAMESPACE from $manifest" >&2
+    exit 2
+  fi
+
+  local uid="${UID:-$(id -u)}"
+  local label="gui/${uid}/${namespace}.agent-ship"
+  local cache_dir="$HOME/.cache/${slug}-agent"
+  local events="$cache_dir/events.jsonl"
+
+  printf -- 'fleet resume: checking pause cause for %s …\n' "$slug"
+
+  # AC#2: already-enabled is an idempotent no-op.
+  local state_before
+  state_before="$(resume_label_state "$label")"
+  if [ "$state_before" = "enabled" ]; then
+    printf -- 'fleet resume: %s is not paused (agent-ship label state: enabled) — nothing to do.\n' "$slug"
+    exit 0
+  fi
+
+  # AC#3: re-run the streak check. Skipped on --force.
+  local sb_count
+  sb_count="$(resume_sendback_count_24h "$events")"
+  if [ "$want_force" != "1" ] && [ "$sb_count" -ge 3 ]; then
+    {
+      printf -- 'fleet resume: REFUSING — %s still has %s send-backs in the last 24h\n' "$slug" "$sb_count"
+      printf -- '  (the same condition that triggered ship_paused).\n'
+      printf -- '  Diagnose with: gh pr list --state closed --search '\''review:changes-requested'\''\n'
+      printf -- '  Override (only after manual triage): fleet resume %s --force --reason "…"\n' "$slug"
+    } >&2
+    exit 2
+  fi
+
+  # Render diagnostics. We always print the counts before issuing the
+  # enable so the operator's terminal trail shows WHY the resume fired.
+  printf -- '  last 24h send-backs: %s\n' "$sb_count"
+  printf -- '  agent-ship label state: %s\n' "${state_before:-not loaded}"
+  if [ "$want_force" = "1" ]; then
+    printf -- 'proceeding (--force; reason: %s).\n' "$reason"
+  else
+    printf -- 'proceeding (--force not required).\n'
+  fi
+
+  # Execute the enable. launchctl enable echoes nothing on success; we
+  # leak its stderr to the operator so unexpected failures surface.
+  if ! launchctl enable "$label"; then
+    printf -- 'fleet resume: launchctl enable %s failed\n' "$label" >&2
+    exit 1
+  fi
+  printf -- 'launchctl enable %s — OK\n' "$label"
+
+  # AC#10: verify the label state actually flipped. The two stubs sit
+  # one user-session apart (launchd is async on real systems), so a
+  # `launchctl enable` returning 0 does NOT guarantee the next
+  # `launchctl print` will read enabled. Fail loud when they disagree.
+  local state_after
+  state_after="$(resume_label_state "$label")"
+  if [ "$state_after" != "enabled" ]; then
+    {
+      printf -- 'fleet resume: launchctl enable returned 0 but agent-ship label is still disabled\n'
+      printf -- '  — diagnose with: launchctl print %s\n' "$label"
+    } >&2
+    exit 1
+  fi
+  printf -- 'verified: agent-ship label state now: %s\n' "$state_after"
+
+  # Compose the event payload. Source the kit's lib/common.sh in a
+  # subshell so SLUG/CACHE_DIR/FLEET_PHASE scope to this emit only —
+  # exact pattern rollback() uses (~line 3787). LESSONS 2026-05-28:
+  # every printf of $reason uses `printf -- '%s'`.
+  local paused_for forced reason_str
+  paused_for="$(resume_paused_for "$events")"
+  if [ "$want_force" = "1" ]; then
+    forced=1
+    reason_str="$reason"
+  else
+    forced=0
+    reason_str="streak cleared"
+  fi
+
+  local kit_root; kit_root="$( cd "$( dirname "$0" )/.." && pwd )"
+  if [ -f "$kit_root/lib/common.sh" ]; then
+    # shellcheck disable=SC1091
+    (
+      export SLUG="$slug"
+      export CACHE_DIR="$cache_dir"
+      export FLEET_PHASE="resume"
+      # shellcheck disable=SC1090
+      source "$kit_root/lib/common.sh" >/dev/null 2>&1
+      fleet_emit_event ship_resumed \
+        "source=$slug" \
+        "paused_for=$paused_for" \
+        "reason=$reason_str" \
+        "forced=$forced"
+    ) || true
+  fi
+
+  printf -- 'emitted ship_resumed source=%s paused_for=%s reason=' \
+    "$slug" "$paused_for"
+  printf -- '%s' "$reason_str"
+  printf -- ' forced=%s\n' "$forced"
+  printf -- 'fleet resume: %s will pick up its next ship cycle at the next launchd interval.\n' "$slug"
+  exit 0
+}
+
+if [ "$CMD" = "resume" ]; then
+  resume "$@"
 fi
 
 if [ "$CMD" = "list" ]; then
