@@ -1,0 +1,13 @@
+Provenance — agent-fleet PR #57
+shipped:                        2026-05-31T15:00:00Z (squash f9e8d7c6)
+ticket:                         0028 — fleet lessons-promote
+branch:                         feat/0028-fleet-lessons-promote
+prompts SHA:                    deadbeef (drift recorded at 2026-05-31T14:00:00Z)
+prompts version:                changelog entry 2026-05-31 — drift handling clarifications
+heal attempts:                  1
+infra-flake reruns:             1 (gh_graphql_502 at 2026-05-31T14:30:00Z)
+review verdict:                 --request-changes (lesson draft emitted)
+lesson drafts emitted:          1
+cross-fleet lessons at PHASE 0: 14 (sha c0ffee01)
+budget block events:            0
+spend:                          $0.92

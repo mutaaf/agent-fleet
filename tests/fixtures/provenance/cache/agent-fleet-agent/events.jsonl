@@ -1,0 +1,9 @@
+{"ts":"2026-05-30T10:00:00Z","slug":"agent-fleet","phase":"ship","type":"run_started","pid":"12345"}
+{"ts":"2026-05-30T10:00:05Z","slug":"agent-fleet","phase":"ship","type":"pr_opened","number":"51","branch":"feat/0027-fleet-badge"}
+{"ts":"2026-05-30T10:05:00Z","slug":"agent-fleet","phase":"ship","type":"run_completed","exit":"0","duration_ms":"300000","pr":"51","merge_sha":"a1b2c3d4"}
+{"ts":"2026-05-31T13:59:00Z","slug":"agent-fleet","phase":"ship","type":"run_started","pid":"23456"}
+{"ts":"2026-05-31T14:00:00Z","slug":"agent-fleet","phase":"ship","type":"prompts_drift","pinned":"7a3e1c0fcafebabe000000000000000000000000000000000000000000000000","actual":"deadbeef1234567890abcdef0000000000000000000000000000000000000000"}
+{"ts":"2026-05-31T14:00:05Z","slug":"agent-fleet","phase":"ship","type":"pr_opened","number":"57","branch":"feat/0028-fleet-lessons-promote"}
+{"ts":"2026-05-31T14:30:00Z","slug":"agent-fleet","phase":"ship","type":"infra_flake_rerun","pattern":"gh_graphql_502","run_id":"99887766","pr":"57"}
+{"ts":"2026-05-31T14:45:00Z","slug":"agent-fleet","phase":"review","type":"lesson_draft_emitted","pr":"57","headline":"awk -v var with multi-line value silently drops the rest of the program"}
+{"ts":"2026-05-31T15:00:00Z","slug":"agent-fleet","phase":"ship","type":"run_completed","exit":"0","duration_ms":"3600000","pr":"57","merge_sha":"f9e8d7c6"}

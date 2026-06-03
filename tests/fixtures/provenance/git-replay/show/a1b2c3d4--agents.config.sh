@@ -1,0 +1,5 @@
+PROJECT_NAME="Agent Fleet"
+SLUG="agent-fleet"
+NAMESPACE="com.agent-fleet"
+REPO_URL="https://github.com/mutaaf/agent-fleet"
+PROMPTS_SHA="7a3e1c0fcafebabe000000000000000000000000000000000000000000000000"
