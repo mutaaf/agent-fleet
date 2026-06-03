@@ -1,0 +1,5 @@
+SLUG="active-streak"
+PROJECT_NAME="ActiveStreak"
+NAMESPACE="com.activestreak"
+REPO_URL="https://github.com/example/active-streak"
+SELF_CANCEL="20990101"

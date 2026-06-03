@@ -1,0 +1,5 @@
+SLUG="clear-streak"
+PROJECT_NAME="ClearStreak"
+NAMESPACE="com.clearstreak"
+REPO_URL="https://github.com/example/clear-streak"
+SELF_CANCEL="20990101"
