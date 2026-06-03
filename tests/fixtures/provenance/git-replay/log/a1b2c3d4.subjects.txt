@@ -1,0 +1,2 @@
+feat: ticket 0027 — fleet badge emits a shareable shields.io-style ROI shield
+test: cover the three formats for badge

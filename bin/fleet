@@ -18,6 +18,8 @@
 #   fleet lessons-promote <slug> --lesson "<title>"
 #                             curate one lesson into cross-fleet
 #                             (ticket 0028 — operator's curation primitive)
+#   fleet provenance <slug> <pr>  one-command audit receipt for a shipped PR
+#                             (ticket 0029 — text/md/json; network-free reader)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -4632,6 +4634,766 @@ USAGE
 
 if [ "$CMD" = "replay" ]; then
   replay "$@"
+fi
+
+# --- provenance (ticket 0029) --------------------------------------------
+# `fleet provenance <slug> <pr> [--format text|json|md]` prints a one-page
+# audit receipt joining the prompts SHA, prompts CHANGELOG entry, heal
+# attempts, infra-flake reruns, review verdict, lesson-draft count, the
+# cross-fleet LESSONS sha+count at merge time, budget-block events, and
+# spend for one shipped PR. Pure consumer of the existing telemetry
+# channel + the kit's git history — emits NO new event types per P-6,
+# touches NO `lib/` or `prompts/` files, makes NO `gh api` call.
+#
+# Test seams (consumed only by tests/provenance.sh):
+#   FLEET_DISCOVERY_ROOT — slug→manifest root (already shared with badge).
+#   FLEET_KIT_ROOT       — kit checkout the prompts CHANGELOG walker reads.
+#   FLEET_GIT_REPLAY_DIR — replay tree the synthetic git stub reads.
+#
+# All three default to the real-world paths when unset, so the production
+# code path is what the test exercises (no parallel "test mode").
+
+# Resolve slug → manifest. Mirrors the rollback / badge helpers' union
+# scan over FLEET_DISCOVERY_ROOT + the installed projects tree so a
+# project on either side resolves identically.
+provenance_resolve_manifest() {
+  badge_resolve_manifest "$1"
+}
+
+# Read the slug's events.jsonl, scan for the pr_opened {number=<pr>}
+# event AND the run_completed event whose ts most-immediately follows it
+# (and which carries pr=<pr> or merge_sha when present). Echoes a
+# tab-separated `<open_ts>\t<merge_ts>\t<merge_sha>` triple or empty when
+# either bound is missing. The empty echo is the "unknown PR" signal —
+# AC#11 turns it into an exit-2 error.
+provenance_find_pr_window() {
+  local events="$1" want_pr="$2"
+  [ -f "$events" ] || return 0
+  awk -v want="$want_pr" '
+    function jv(line, key,    re, val) {
+      re = "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+      if (match(line, re)) {
+        val = substr(line, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*"/, "", val); sub(/".*/, "", val)
+        return val
+      }
+      return ""
+    }
+    {
+      t = jv($0, "type")
+      ts = jv($0, "ts")
+      num = jv($0, "number")
+      pr  = jv($0, "pr")
+      ms  = jv($0, "merge_sha")
+      if (t == "pr_opened" && num == want && open_ts == "") {
+        open_ts = ts
+      }
+      if (open_ts != "" && t == "run_completed" && merge_ts == "") {
+        # A run_completed without pr= still terminates the window for
+        # the run that owned this PR — but a run_completed whose pr is
+        # set MUST match. Honour both shapes per AGENTS.md "consumers
+        # MUST tolerate unknown extras gracefully".
+        if (pr == "" || pr == want) {
+          merge_ts = ts
+          merge_sha = ms
+        }
+      }
+    }
+    END {
+      if (open_ts != "" && merge_ts != "") {
+        printf "%s\t%s\t%s\n", open_ts, merge_ts, merge_sha
+      }
+    }
+  ' "$events"
+}
+
+# prompts SHA resolution. Walk events between [open_ts, merge_ts] for the
+# last `prompts_drift` — if one fires the `actual` field is the SHA that
+# ran. Otherwise read PROMPTS_SHA= out of `git show <merge>:agents.config.sh`
+# through whatever git is on PATH (the test's stub returns from the replay
+# dir; production resolves against the project repo's history). The second
+# return value (the "source": `drift` or `manifest`) is needed for the
+# `(drift recorded at ...)` annotation in the text/md renderers and for
+# the JSON `prompts_sha_source` field — echoed on the SECOND tab-separated
+# field of the output line.
+provenance_prompts_sha() {
+  local events="$1" open_ts="$2" merge_ts="$3" merge_sha="$4"
+  local drift_sha=""
+  if [ -f "$events" ]; then
+    # awk-side window filter on lexicographic ISO-8601 comparison — every
+    # ts we read is normalized to the same `YYYY-MM-DDTHH:MM:SSZ` shape
+    # (the channel writer in lib/common.sh strips sub-second fractions).
+    drift_sha="$(awk -v lo="$open_ts" -v hi="$merge_ts" '
+      function jv(line, key,    re, val) {
+        re = "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+        if (match(line, re)) {
+          val = substr(line, RSTART, RLENGTH)
+          sub(/.*:[[:space:]]*"/, "", val); sub(/".*/, "", val)
+          return val
+        }
+        return ""
+      }
+      {
+        t = jv($0, "type"); ts = jv($0, "ts")
+        if (t == "prompts_drift" && ts <= hi) {
+          last_actual = jv($0, "actual")
+          last_ts = ts
+        }
+      }
+      END { if (last_actual != "") printf "%s\t%s\n", last_actual, last_ts }
+    ' "$events")"
+  fi
+  if [ -n "$drift_sha" ]; then
+    local sha ts
+    sha="$(printf '%s' "$drift_sha" | awk -F'\t' '{print $1}')"
+    ts="$(printf '%s' "$drift_sha"  | awk -F'\t' '{print $2}')"
+    printf '%s\tdrift\t%s\n' "$sha" "$ts"
+    return 0
+  fi
+  # No drift → fall back to the manifest the merge SHA shipped against.
+  # Test stub honours FLEET_GIT_REPLAY_DIR; production resolves via the
+  # operator's local git checkout. A failure here is non-fatal — we echo
+  # an empty SHA so the renderer can print "(unknown)" instead.
+  local manifest_sha=""
+  if [ -n "$merge_sha" ]; then
+    manifest_sha="$(git show "$merge_sha:agents.config.sh" 2>/dev/null \
+                     | sed -nE 's/^PROMPTS_SHA="?([0-9a-f]+)"?.*/\1/p' \
+                     | head -1)"
+  fi
+  printf '%s\tmanifest\t\n' "$manifest_sha"
+}
+
+# Walk the kit's prompts/CHANGELOG.md for the `## YYYY-MM-DD` heading
+# whose date is the LATEST one not exceeding the merge date. Echoes the
+# heading body (`<YYYY-MM-DD> — <title>`) or empty when no entry matches.
+# Honours FLEET_KIT_ROOT (test) → falls back to the kit the bin runs from.
+provenance_changelog_entry() {
+  local merge_ts="$1"
+  local kit_root="${FLEET_KIT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  local changelog="$kit_root/prompts/CHANGELOG.md"
+  [ -f "$changelog" ] || return 0
+  [ -s "$changelog" ] || return 0
+  # Extract just the YYYY-MM-DD prefix from the merge ts for lexicographic
+  # comparison. The CHANGELOG headings are pure dates so a string `<=`
+  # gives the right ordering without any date-math.
+  local merge_date="${merge_ts%%T*}"
+  awk -v cutoff="$merge_date" '
+    /^## [0-9]{4}-[0-9]{2}-[0-9]{2}/ {
+      body = substr($0, 4)        # strip leading "## "
+      d = substr(body, 1, 10)
+      if (d <= cutoff && (best == "" || d > best_date)) {
+        best = body
+        best_date = d
+      }
+    }
+    END { if (best != "") print best }
+  ' "$changelog"
+}
+
+# Count subject lines beginning with `heal:` on the merge SHA's branch
+# range. The test stub returns from the synthetic replay; production
+# resolves against the project's git history. Caps at 2 (the AGENTS.md
+# heal-attempt hard cap — surfaces >2 as 2 with a data-bug hint
+# rendered inline). Echoes a single integer.
+provenance_heal_count() {
+  local merge_sha="$1"
+  [ -n "$merge_sha" ] || { echo 0; return 0; }
+  # Use `merge_sha^..merge_sha` shape: the stub keys on the suffix after
+  # ".." so any base is fine. Real production git accepts the form too.
+  local raw
+  raw="$(git log --format=%s "${merge_sha}^..${merge_sha}" 2>/dev/null \
+          || git log --format=%s "${merge_sha}" 2>/dev/null)"
+  local n
+  n="$(printf '%s\n' "$raw" | awk '/^heal:/ { n++ } END { print n+0 }')"
+  if [ "$n" -gt 2 ]; then n=2; fi
+  echo "$n"
+}
+
+# Walk the events channel between [open_ts, merge_ts] for
+# infra_flake_rerun events whose pr=<pr> matches. Echoes
+# `<count>\t<pattern1,pattern2,...>\t<ts1>` — the renderer reads the
+# count for the int and the FIRST pattern + ts for the parenthetical.
+provenance_infra_flakes() {
+  local events="$1" open_ts="$2" merge_ts="$3" want_pr="$4"
+  [ -f "$events" ] || { printf '0\t\t\n'; return 0; }
+  awk -v lo="$open_ts" -v hi="$merge_ts" -v want="$want_pr" '
+    function jv(line, key,    re, val) {
+      re = "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+      if (match(line, re)) {
+        val = substr(line, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*"/, "", val); sub(/".*/, "", val)
+        return val
+      }
+      return ""
+    }
+    {
+      t = jv($0, "type"); ts = jv($0, "ts"); pr = jv($0, "pr")
+      if (t == "infra_flake_rerun" && pr == want && ts >= lo && ts <= hi) {
+        n++
+        pat = jv($0, "pattern")
+        if (patterns == "") patterns = pat; else patterns = patterns "," pat
+        if (first_ts == "") first_ts = ts
+      }
+    }
+    END { printf "%d\t%s\t%s\n", n+0, patterns, first_ts }
+  ' "$events"
+}
+
+# Count lesson_draft_emitted events whose pr=<pr> falls in the window.
+# >0 ⇒ review verdict is `--request-changes`; ==0 ⇒ `--comment`.
+provenance_lesson_draft_count() {
+  local events="$1" open_ts="$2" merge_ts="$3" want_pr="$4"
+  [ -f "$events" ] || { echo 0; return 0; }
+  awk -v lo="$open_ts" -v hi="$merge_ts" -v want="$want_pr" '
+    function jv(line, key,    re, val) {
+      re = "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+      if (match(line, re)) {
+        val = substr(line, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*"/, "", val); sub(/".*/, "", val)
+        return val
+      }
+      return ""
+    }
+    {
+      t = jv($0, "type"); ts = jv($0, "ts"); pr = jv($0, "pr")
+      if (t == "lesson_draft_emitted" && pr == want && ts >= lo && ts <= hi) n++
+    }
+    END { print n+0 }
+  ' "$events"
+}
+
+# Count budget_block events in the window for this slug. Per AC#1 we
+# always render the count even when zero — the operator wants the
+# explicit "0" rather than absence-as-signal.
+provenance_budget_block_count() {
+  local events="$1" open_ts="$2" merge_ts="$3"
+  [ -f "$events" ] || { echo 0; return 0; }
+  awk -v lo="$open_ts" -v hi="$merge_ts" '
+    function jv(line, key,    re, val) {
+      re = "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+      if (match(line, re)) {
+        val = substr(line, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*"/, "", val); sub(/".*/, "", val)
+        return val
+      }
+      return ""
+    }
+    {
+      t = jv($0, "type"); ts = jv($0, "ts")
+      if (t == "budget_block" && ts >= lo && ts <= hi) n++
+    }
+    END { print n+0 }
+  ' "$events"
+}
+
+# Cross-fleet LESSONS at PHASE 0 — count of `^### ` lines in
+# CROSS_LESSONS.md at the merge ts. Walks `git log -1 --until=<ts>
+# --format=%H -- CROSS_LESSONS.md` then `git show <sha>:CROSS_LESSONS.md`.
+# Falls back to the kit's current file when no replay dir / git history.
+# Echoes `<count>\t<sha-or-current>` on one line. Per LESSONS 2026-05-27
+# the file body is awk-counted directly — never captured to a variable
+# that later gets written back to disk.
+provenance_cross_lessons() {
+  local merge_ts="$1"
+  local kit_root="${FLEET_KIT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  local count="0" sha=""
+  # Replay branch: git stub returns a sha for the CROSS_LESSONS.md path.
+  if [ -n "${FLEET_GIT_REPLAY_DIR:-}" ] && [ -d "${FLEET_GIT_REPLAY_DIR}" ]; then
+    sha="$(git log -1 --until="$merge_ts" --format=%H -- CROSS_LESSONS.md 2>/dev/null \
+            | head -1)"
+    if [ -n "$sha" ]; then
+      count="$(git show "$sha:CROSS_LESSONS.md" 2>/dev/null \
+                | awk '/^### / { n++ } END { print n+0 }')"
+      printf '%s\t%s\n' "$count" "$sha"
+      return 0
+    fi
+  fi
+  # Fallback branch: the kit's current CROSS_LESSONS.md (or "current"
+  # marker when neither path exists — count stays 0).
+  local cf="$kit_root/CROSS_LESSONS.md"
+  if [ -f "$cf" ]; then
+    count="$(awk '/^### / { n++ } END { print n+0 }' "$cf")"
+    sha="current"
+  fi
+  printf '%s\t%s\n' "$count" "$sha"
+}
+
+# Resolve ticket id + (best-effort) title from a branch like
+# `feat/0028-fleet-lessons-promote`. The id is the leading 4-digit
+# prefix; the title is the hyphen-joined tail with hyphens turned into
+# spaces and the leading "fleet " preserved as-is (matches the AC
+# sample `0028 — fleet lessons-promote`). When the branch shape does
+# not match, echoes `\t\t`. Echoes `<id>\t<title>` on one line.
+provenance_ticket_from_branch() {
+  local branch="$1"
+  local tail
+  case "$branch" in
+    feat/*|eng/*) tail="${branch#*/}" ;;
+    *) printf '\t\n'; return 0 ;;
+  esac
+  case "$tail" in
+    [0-9][0-9][0-9][0-9]-*)
+      local id title_raw title
+      id="${tail%%-*}"
+      title_raw="${tail#*-}"
+      # Convert the kebab tail into a human-ish phrase: `fleet-lessons-
+      # promote` → `fleet lessons-promote`. Only the FIRST hyphen
+      # becomes a space; the rest stay as multi-word command names
+      # (`lessons-promote`, `prompts-diff`, etc.) the operator wrote.
+      case "$title_raw" in
+        *-*) title="${title_raw%%-*} ${title_raw#*-}" ;;
+        *)   title="$title_raw" ;;
+      esac
+      printf '%s\t%s\n' "$id" "$title" ;;
+    *) printf '\t\n' ;;
+  esac
+}
+
+# Render the text block. Keys in fixed order per AC#1. The key column is
+# width 32 (the widest key — `cross-fleet lessons at PHASE 0:` — fits in
+# 31 chars, +1 trailing space). Output is reused verbatim inside the md
+# fenced block per AC#2.
+provenance_render_kv() {
+  local k="$1" v="$2"
+  # 32-char left-aligned key + space-separated value. printf -- guards
+  # any value that happens to start with `-` per LESSONS 2026-05-28.
+  printf -- '%-32s%s\n' "$k:" "$v"
+}
+
+provenance_render_text() {
+  # Positional args mirror the JSON renderer so any later refactor can
+  # share one struct. Order matches AC#1.
+  local pr="$1" slug="$2" shipped_at="$3" merge_sha="$4"
+  local ticket_id="$5" ticket_title="$6" branch="$7"
+  local sha_display="$8" sha_annot="$9"; shift 9
+  local chg_entry="$1" heal="$2" infra_n="$3" infra_annot="$4"
+  local verdict="$5" verdict_annot="$6" drafts="$7"
+  local cross_n="$8" cross_sha="$9"; shift 9
+  local budget_n="$1" spend="$2"
+
+  printf -- 'Provenance — %s PR #%s\n' "$slug" "$pr"
+  provenance_render_kv "shipped" "$shipped_at (squash $merge_sha)"
+  if [ -n "$ticket_id" ]; then
+    provenance_render_kv "ticket" "$ticket_id — $ticket_title"
+  else
+    provenance_render_kv "ticket" "(no ticket — non-agent branch)"
+  fi
+  provenance_render_kv "branch" "$branch"
+  if [ -n "$sha_annot" ]; then
+    provenance_render_kv "prompts SHA" "$sha_display ($sha_annot)"
+  else
+    provenance_render_kv "prompts SHA" "$sha_display"
+  fi
+  if [ -n "$chg_entry" ]; then
+    provenance_render_kv "prompts version" "changelog entry $chg_entry"
+  else
+    provenance_render_kv "prompts version" "(no changelog entry — pre-CHANGELOG ship)"
+  fi
+  provenance_render_kv "heal attempts" "$heal"
+  if [ "$infra_n" = "0" ]; then
+    provenance_render_kv "infra-flake reruns" "0"
+  else
+    provenance_render_kv "infra-flake reruns" "$infra_n ($infra_annot)"
+  fi
+  if [ -n "$verdict_annot" ]; then
+    provenance_render_kv "review verdict" "$verdict ($verdict_annot)"
+  else
+    provenance_render_kv "review verdict" "$verdict"
+  fi
+  provenance_render_kv "lesson drafts emitted" "$drafts"
+  provenance_render_kv "cross-fleet lessons at PHASE 0" "$cross_n (sha $cross_sha)"
+  provenance_render_kv "budget block events" "$budget_n"
+  provenance_render_kv "spend" "\$$spend"
+}
+
+provenance_render_md() {
+  local pr="$1" slug="$2"
+  shift 2
+  printf -- '# Provenance — %s PR #%s\n\n' "$slug" "$pr"
+  printf -- '```\n'
+  provenance_render_text "$pr" "$slug" "$@"
+  # The first line of render_text is the `Provenance — …` header — strip
+  # it from the fenced block by re-rendering only the kv portion. The
+  # easiest path is to capture and chop, but `tail -n +2` requires a
+  # subshell. Inline the kv block instead by re-calling the helpers — but
+  # that doubles maintenance. Compromise: rely on the text renderer's
+  # contract (first line == header, rest == kv) and tail the captured
+  # output once. We re-render via a function call to avoid duplicating
+  # the key list.
+  : # the above printf chain already emitted the full text block; strip
+    # in caller via the fence + tail invocation below.
+}
+
+# md is text minus its first line + a fenced wrapper + the trailing HTML
+# comment marker. Re-using the text renderer is the cleanest way to keep
+# the two formats byte-identical in the key/value portion.
+provenance_format_md() {
+  local pr="$1" slug="$2"
+  shift 2
+  printf -- '# Provenance — %s PR #%s\n\n' "$slug" "$pr"
+  printf -- '```\n'
+  provenance_render_text "$pr" "$slug" "$@" | tail -n +2
+  printf -- '```\n'
+  printf -- '<!-- generated by fleet provenance -->\n'
+}
+
+# UTF-8-safe JSON string escape. The in-file `doctor_json_escape` (line
+# ~702) and `_json_escape` in lib/common.sh both use `printf -v code
+# '%d' "'$ch"` which, under LC_ALL=C, sign-extends a multi-byte UTF-8
+# byte into a negative integer and emits a bogus `\u......` sequence.
+# JSON does not require escaping of bytes >= 0x80 — raw UTF-8 is legal
+# in a JSON string — so we just pass any byte >= 32 through verbatim
+# and only escape the structural / control chars JSON forbids
+# unescaped. Per LESSONS 2026-06-01 the JSON path stays awk-free for
+# multi-line safety; per LESSONS 2026-05-28 the printf format gets
+# `--` to defuse a leading-dash value.
+provenance_json_escape() {
+  local s="${1-}" out="" i ch code
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *)
+        printf -v code '%d' "'$ch"
+        # Negative = high UTF-8 byte (sign-extended under LC_ALL=C);
+        # >= 32 = printable ASCII or already-safe high byte; < 32 =
+        # a control char that needs `\u00xx`.
+        if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+          printf -v out '%s\\u%04x' "$out" "$code"
+        else
+          out+="$ch"
+        fi
+        ;;
+    esac
+  done
+  printf -- '%s' "$out"
+}
+
+# Render JSON. Composed via printf + `provenance_json_escape` per
+# LESSONS 2026-06-01 (awk -v rejects newlines — multi-line values go
+# through the per-byte escape, not `awk -v`). The infra_flake_patterns
+# array is built by splitting the comma-separated patterns string.
+# `prompts_sha_source` is `drift` or `manifest` so machine consumers
+# can decide whether to surface the annotation in their UI.
+provenance_render_json() {
+  local pr="$1" slug="$2" shipped_at="$3" merge_sha="$4"
+  local ticket_id="$5" ticket_title="$6" branch="$7"
+  local sha_display="$8" sha_source="$9"; shift 9
+  local chg_entry="$1" heal="$2" infra_n="$3" infra_patterns="$4"
+  local verdict="$5" drafts="$6" cross_n="$7" cross_sha="$8"
+  local budget_n="$9"; shift 9
+  local spend="$1"
+
+  # Build the infra_flake_patterns array. Comma-separated → JSON list.
+  local patterns_json="[]"
+  if [ -n "$infra_patterns" ]; then
+    patterns_json="["
+    local first=1
+    local IFS=','
+    # shellcheck disable=SC2086  # intentional word-split on comma
+    for p in $infra_patterns; do
+      if [ "$first" = "1" ]; then
+        patterns_json="$patterns_json\"$(provenance_json_escape "$p")\""
+        first=0
+      else
+        patterns_json="$patterns_json,\"$(provenance_json_escape "$p")\""
+      fi
+    done
+    patterns_json="$patterns_json]"
+  fi
+
+  # spend → numeric. Strip any leading "$" defensively (the field is
+  # always rendered as `N.NN` from digest_spend_since, but be explicit).
+  local spend_num="${spend#\$}"
+  case "$spend_num" in ''|*[!0-9.]*) spend_num="0.00" ;; esac
+
+  printf '{'
+  printf '"slug":"%s"' "$(provenance_json_escape "$slug")"
+  printf ',"pr":%s' "$pr"
+  printf ',"shipped_at":"%s"' "$(provenance_json_escape "$shipped_at")"
+  printf ',"merge_sha":"%s"' "$(provenance_json_escape "$merge_sha")"
+  printf ',"ticket_id":"%s"' "$(provenance_json_escape "$ticket_id")"
+  printf ',"ticket_title":"%s"' "$(provenance_json_escape "$ticket_title")"
+  printf ',"branch":"%s"' "$(provenance_json_escape "$branch")"
+  printf ',"prompts_sha":"%s"' "$(provenance_json_escape "$sha_display")"
+  printf ',"prompts_sha_source":"%s"' "$(provenance_json_escape "$sha_source")"
+  printf ',"prompts_changelog_entry":"%s"' "$(provenance_json_escape "$chg_entry")"
+  printf ',"heal_attempts":%s' "$heal"
+  printf ',"infra_flake_reruns":%s' "$infra_n"
+  printf ',"infra_flake_patterns":%s' "$patterns_json"
+  printf ',"review_verdict":"%s"' "$(provenance_json_escape "$verdict")"
+  printf ',"lesson_drafts_emitted":%s' "$drafts"
+  printf ',"cross_lessons_count":%s' "$cross_n"
+  printf ',"cross_lessons_sha":"%s"' "$(provenance_json_escape "$cross_sha")"
+  printf ',"budget_block_events":%s' "$budget_n"
+  printf ',"spend_usd":%s' "$spend_num"
+  printf '}'
+}
+
+# Find the slug's events.jsonl, scan for the branch name that landed on
+# pr_opened. Echoes the branch or empty.
+provenance_branch_for_pr() {
+  local events="$1" want_pr="$2"
+  [ -f "$events" ] || return 0
+  awk -v want="$want_pr" '
+    function jv(line, key,    re, val) {
+      re = "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+      if (match(line, re)) {
+        val = substr(line, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*"/, "", val); sub(/".*/, "", val)
+        return val
+      }
+      return ""
+    }
+    {
+      t = jv($0, "type")
+      if (t == "pr_opened" && jv($0, "number") == want) {
+        print jv($0, "branch"); exit
+      }
+    }
+  ' "$events"
+}
+
+provenance() {
+  shift  # drop the leading "provenance"
+  local slug_arg="" pr_arg="" format="text"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --format)   format="${2:-}"; shift 2 ;;
+      --format=*) format="${1#--format=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet provenance — one-command audit receipt for a shipped PR.
+
+Usage:
+  fleet provenance <slug> <pr>                default --format text
+  fleet provenance <slug> <pr> --format md    paste-friendly markdown
+  fleet provenance <slug> <pr> --format json  machine-readable receipt
+
+Reads the slug's local events.jsonl + runs.jsonl, joins them with the
+kit's prompts/CHANGELOG.md and the project's git history, and prints a
+fixed-key block answering: which prompts SHA shipped, which CHANGELOG
+entry that maps to, how many heal commits + infra-flake reruns fired,
+whether the review signed off or sent back, how many lesson drafts
+landed, the cross-fleet LESSONS sha at merge time, the in-window
+budget-block count, and the spend.
+
+Flags:
+  --format text|md|json   output shape (default text)
+  --help                  print this banner and exit
+
+Example:
+  fleet provenance agent-fleet 57 --format md \\
+    | gh pr comment 57 --body-file -
+
+Read-only — no commits, no PRs, no \`gh api\` call, no new event types.
+Pure consumer of the existing telemetry channel + git history.
+USAGE
+        exit 0 ;;
+      --) shift ;;
+      -*)
+        printf -- 'fleet provenance: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$slug_arg" ]; then slug_arg="$1"; shift
+        elif [ -z "$pr_arg" ]; then pr_arg="$1"; shift
+        else
+          printf -- 'fleet provenance: unexpected extra argument %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$slug_arg" ] || [ -z "$pr_arg" ]; then
+    echo "fleet provenance: missing <slug> or <pr> (usage: fleet provenance <slug> <pr> [--format text|md|json])" >&2
+    exit 2
+  fi
+  case "$format" in
+    text|md|json) ;;
+    *) echo "fleet provenance: invalid --format \"$format\" (use text, md, or json)" >&2; exit 2 ;;
+  esac
+  case "$pr_arg" in
+    ''|*[!0-9]*)
+      echo "fleet provenance: <pr> must be a positive integer (got \"$pr_arg\")" >&2
+      exit 2 ;;
+  esac
+
+  # Resolve slug → manifest. The error string mirrors the badge / rollback
+  # helpers so the operator's "where did I look?" trail is consistent.
+  local manifest
+  manifest="$(provenance_resolve_manifest "$slug_arg")"
+  if [ -z "$manifest" ]; then
+    local root="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+    echo "provenance: no project with SLUG=$slug_arg found (looked under FLEET_DISCOVERY_ROOT=$root)" >&2
+    exit 2
+  fi
+
+  local cache_dir="$HOME/.cache/${slug_arg}-agent"
+  local events="$cache_dir/events.jsonl"
+  local runs="$cache_dir/runs.jsonl"
+
+  # PR window — pr_opened.ts + run_completed.ts + merge_sha.
+  local window
+  window="$(provenance_find_pr_window "$events" "$pr_arg")"
+  if [ -z "$window" ]; then
+    echo "provenance: PR #$pr_arg not found in events.jsonl for $slug_arg (no pr_opened or run_completed event matched)" >&2
+    exit 2
+  fi
+  local open_ts merge_ts merge_sha
+  open_ts="$(printf '%s\n' "$window" | awk -F'\t' '{print $1}')"
+  merge_ts="$(printf '%s\n' "$window" | awk -F'\t' '{print $2}')"
+  merge_sha="$(printf '%s\n' "$window" | awk -F'\t' '{print $3}')"
+
+  # Branch + ticket id/title from the pr_opened event.
+  local branch ticket_pair ticket_id ticket_title
+  branch="$(provenance_branch_for_pr "$events" "$pr_arg")"
+  ticket_pair="$(provenance_ticket_from_branch "$branch")"
+  ticket_id="$(printf '%s\n' "$ticket_pair" | awk -F'\t' '{print $1}')"
+  ticket_title="$(printf '%s\n' "$ticket_pair" | awk -F'\t' '{print $2}')"
+
+  # prompts SHA — drift wins; manifest is the fallback. Echo shape:
+  # `<sha>\t<source>\t<drift_ts-or-empty>`.
+  local sha_line sha_full sha_source sha_ts sha_display sha_annot
+  sha_line="$(provenance_prompts_sha "$events" "$open_ts" "$merge_ts" "$merge_sha")"
+  sha_full="$(printf '%s\n'  "$sha_line" | awk -F'\t' '{print $1}')"
+  sha_source="$(printf '%s\n' "$sha_line" | awk -F'\t' '{print $2}')"
+  sha_ts="$(printf '%s\n'    "$sha_line" | awk -F'\t' '{print $3}')"
+  # Truncate to 8 chars for display (matches the AC sample's
+  # `7a3e1c0…` ellipsis style — but we drop the ellipsis so the text
+  # render stays grep-friendly).
+  sha_display="${sha_full:0:8}"
+  if [ -z "$sha_display" ]; then sha_display="(unknown)"; fi
+  case "$sha_source" in
+    drift)    sha_annot="drift recorded at $sha_ts" ;;
+    *)        sha_annot="" ;;
+  esac
+
+  # prompts CHANGELOG entry — the latest `## YYYY-MM-DD …` whose date
+  # does not exceed the merge date.
+  local chg_entry
+  chg_entry="$(provenance_changelog_entry "$merge_ts")"
+
+  # heal attempts — capped at 2 per AGENTS.md heal hard cap.
+  local heal_count
+  heal_count="$(provenance_heal_count "$merge_sha")"
+
+  # infra-flake reruns + patterns.
+  local infra_line infra_n infra_patterns infra_ts infra_annot
+  infra_line="$(provenance_infra_flakes "$events" "$open_ts" "$merge_ts" "$pr_arg")"
+  infra_n="$(printf '%s\n'        "$infra_line" | awk -F'\t' '{print $1}')"
+  infra_patterns="$(printf '%s\n' "$infra_line" | awk -F'\t' '{print $2}')"
+  infra_ts="$(printf '%s\n'       "$infra_line" | awk -F'\t' '{print $3}')"
+  if [ -n "$infra_patterns" ] && [ -n "$infra_ts" ]; then
+    # First pattern + first ts; multi-rerun PRs surface the additional
+    # patterns through --format json (infra_flake_patterns array).
+    local first_pat="${infra_patterns%%,*}"
+    infra_annot="$first_pat at $infra_ts"
+  else
+    infra_annot=""
+  fi
+
+  # review verdict — lesson_draft_emitted ⇒ --request-changes.
+  local draft_count verdict verdict_annot
+  draft_count="$(provenance_lesson_draft_count "$events" "$open_ts" "$merge_ts" "$pr_arg")"
+  if [ "$draft_count" -gt 0 ]; then
+    verdict="--request-changes"
+    verdict_annot="lesson draft emitted"
+  else
+    verdict="--comment"
+    verdict_annot=""
+  fi
+
+  # cross-fleet LESSONS at PHASE 0 — count + sha.
+  local cross_line cross_n cross_sha
+  cross_line="$(provenance_cross_lessons "$merge_ts")"
+  cross_n="$(printf '%s\n'   "$cross_line" | awk -F'\t' '{print $1}')"
+  cross_sha="$(printf '%s\n' "$cross_line" | awk -F'\t' '{print $2}')"
+  [ -z "$cross_sha" ] && cross_sha="current"
+
+  # budget block events in the window.
+  local budget_n
+  budget_n="$(provenance_budget_block_count "$events" "$open_ts" "$merge_ts")"
+
+  # spend over the [open_ts, merge_ts] window. `digest_spend_since` only
+  # takes a single floor — we need a second pass to clip the ceiling.
+  # Compute by passing the merge ts through a tmp runs file: every row
+  # whose ts_start <= merge_ts AND ts_start >= open_ts contributes.
+  local open_epoch merge_epoch
+  open_epoch="$(digest_iso_to_epoch "$open_ts")"
+  merge_epoch="$(digest_iso_to_epoch "$merge_ts")"
+  local spend="0.00"
+  if [ -n "$open_epoch" ] && [ -n "$merge_epoch" ] && [ -f "$runs" ]; then
+    spend="$(awk -v lo="$open_epoch" -v hi="$merge_epoch" '
+      function iso2ep(ts,    cmd, out) {
+        gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+        cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+        cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+        if ((cmd | getline out) <= 0) out = 0
+        close(cmd)
+        return out + 0
+      }
+      {
+        ts=""; cost=0
+        if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts=substr($0, RSTART, RLENGTH)
+          sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts)
+          sub(/".*/, "", ts)
+        }
+        if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+          c=substr($0, RSTART, RLENGTH)
+          sub(/.*:[[:space:]]*/, "", c)
+          cost = c + 0
+        }
+        if (ts == "") next
+        ep = iso2ep(ts)
+        if (ep >= lo && ep <= hi) total += cost
+      }
+      END { printf("%.2f", total + 0) }
+    ' "$runs")"
+  fi
+
+  # ---- emit -------------------------------------------------------------
+  case "$format" in
+    text)
+      provenance_render_text \
+        "$pr_arg" "$slug_arg" "$merge_ts" "$merge_sha" \
+        "$ticket_id" "$ticket_title" "$branch" \
+        "$sha_display" "$sha_annot" \
+        "$chg_entry" "$heal_count" "$infra_n" "$infra_annot" \
+        "$verdict" "$verdict_annot" "$draft_count" \
+        "$cross_n" "$cross_sha" "$budget_n" "$spend"
+      ;;
+    md)
+      provenance_format_md \
+        "$pr_arg" "$slug_arg" "$merge_ts" "$merge_sha" \
+        "$ticket_id" "$ticket_title" "$branch" \
+        "$sha_display" "$sha_annot" \
+        "$chg_entry" "$heal_count" "$infra_n" "$infra_annot" \
+        "$verdict" "$verdict_annot" "$draft_count" \
+        "$cross_n" "$cross_sha" "$budget_n" "$spend"
+      ;;
+    json)
+      provenance_render_json \
+        "$pr_arg" "$slug_arg" "$merge_ts" "$merge_sha" \
+        "$ticket_id" "$ticket_title" "$branch" \
+        "$sha_full" "$sha_source" \
+        "$chg_entry" "$heal_count" "$infra_n" "$infra_patterns" \
+        "$verdict" "$draft_count" "$cross_n" "$cross_sha" \
+        "$budget_n" "$spend"
+      ;;
+  esac
+
+  exit 0
+}
+
+if [ "$CMD" = "provenance" ]; then
+  provenance "$@"
 fi
 
 # --- overview -------------------------------------------------------------

@@ -1,0 +1,3 @@
+feat: ticket 0028 — fleet lessons-promote curates a local lesson
+heal: shellcheck SC2086 in lessons_promote_insert_under_section
+test: add cross-section dedup branch coverage
