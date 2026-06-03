@@ -48,5 +48,5 @@ ones, `review` grades them.
 | 0027 | fleet badge emits a shareable shields.io-style ROI line for a project README | P2 | shipped | observability |
 | 0028 | fleet lessons-promote curates a local lesson into the cross-project feed | P1 | shipped | engine |
 | 0029 | fleet provenance <pr> reconstructs the prompts SHA, lessons, and heal patterns behind a shipped PR | P1 | shipped | governance |
-| 0030 | fleet resume <slug> unpauses a ship-paused project with one confirmed command | P1 | groomed | safety |
+| 0030 | fleet resume <slug> unpauses a ship-paused project with one confirmed command | P1 | in-progress | safety |
 | 0031 | fleet atlas prints the fleet-wide failure-mode taxonomy with per-pattern frequency | P2 | groomed | observability |

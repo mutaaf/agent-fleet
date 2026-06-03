@@ -1,7 +1,7 @@
 ---
 id: 0030
 title: fleet resume <slug> unpauses a ship-paused project with one confirmed command
-status: groomed
+status: in-progress
 priority: P1
 area: safety
 created: 2026-06-03
@@ -330,4 +330,10 @@ dev doesn't have to re-discover the architecture.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-03 — implementation-dev: started; branch
+  `feat/0030-fleet-resume-paused-slug`. Tests-first; `tests/resume.sh`
+  covers all 11 AC boxes with `launchctl` stubbed under
+  `$HOME/.local/bin` per LESSONS 2026-05-26. `resume()` dispatcher +
+  three helpers (`resume_label_state`, `resume_sendback_count_24h`,
+  `resume_paused_for`) added to `bin/fleet`; no `lib/` or `prompts/`
+  changes. AGENTS.md § Telemetry gets the new `ship_resumed` bullet.
