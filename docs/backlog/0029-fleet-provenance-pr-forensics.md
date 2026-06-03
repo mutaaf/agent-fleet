@@ -1,7 +1,7 @@
 ---
 id: 0029
 title: fleet provenance <pr> reconstructs the prompts SHA, lessons, and heal patterns behind a shipped PR
-status: in-progress
+status: shipped
 priority: P1
 area: governance
 created: 2026-06-03
@@ -347,3 +347,8 @@ doesn't have to re-discover the architecture.
   failing test first in `tests/provenance.sh` covering all 13 ACs, then
   `provenance()` + helpers in `bin/fleet` (pure consumer; no `lib/` /
   `prompts/` edits, no new event types).
+- 2026-06-03 — shipped via PR #56 (squash a0e82ed). All 13 ACs green; local
+  gate green; shellcheck + validate green on CI. Lesson candidate appended:
+  `doctor_json_escape` (and `_json_escape` in `lib/common.sh`) mangles
+  UTF-8 bytes under `LC_ALL=C` — `provenance_json_escape` works around it
+  by passing high bytes through untouched.
