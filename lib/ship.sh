@@ -14,6 +14,24 @@ fleet_log_init ship
 fleet_emit_event run_started "pid=$$" || true
 fleet_self_cancel || exit 0
 fleet_check_budget || exit 0
+
+# Ticket 0033 — operator-declared local-time quiet hours. The helper emits
+# one `quiet_hours_skip` event on the first suppress per process (guarded
+# by FLEET_QUIET_HOURS_EMITTED) and writes its verdict to the exported
+# global FLEET_QUIET_HOURS_VERDICT. We call it WITHOUT `$(…)` so the side
+# effects (emit + guard) land in this shell rather than a discarded
+# subshell. Outside the window (or for `review`, which is exempt) the
+# verdict is "ok"; invalid QUIET_HOURS warns once to stderr and the
+# verdict is "invalid" (the runner treats that like "ok" and proceeds).
+# Lands BEFORE fleet_acquire_lock + fleet_checkout so the suppress path
+# never touches gh/git/launchctl.
+fleet_check_quiet_hours >/dev/null
+if [ "${FLEET_QUIET_HOURS_VERDICT:-ok}" = "suppress" ]; then
+  FLEET_QUIET_END_HHMM="${QUIET_HOURS#*-}"
+  echo "quiet hours active ($QUIET_HOURS local) — $FLEET_PHASE no-op until $FLEET_QUIET_END_HHMM"
+  exit 0
+fi
+
 fleet_check_prompts_sha || true
 fleet_acquire_lock ship || exit 0
 trap 'fleet_release_lock ship' EXIT

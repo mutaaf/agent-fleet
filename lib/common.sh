@@ -582,6 +582,227 @@ fleet_check_groom_cadence() {
   return 1
 }
 
+# --- quiet hours (ticket 0033) --------------------------------------------
+# fleet_check_quiet_hours — operator-declared local-time suppression window
+# for the worker phases (ship/groom/eng). Review is exempt by design — it
+# is a poller, not a worker, and continuing to grade in-flight PRs
+# overnight is a feature, not a bug.
+#
+# Contract (echoes one token; ALWAYS returns 0 so the caller branches on
+# the echoed string, never on the return code — same shape as
+# fleet_check_budget's calling convention):
+#   suppress — current local time falls INSIDE the window; caller should
+#              emit `quiet_hours_skip {phase, window, now_local}`, print
+#              the documented banner, and `exit 0`.
+#   invalid  — the QUIET_HOURS value is malformed (not `HH:MM-HH:MM` with
+#              both hours in 0..23 and minutes in 0..59); caller proceeds
+#              as if QUIET_HOURS were empty (do-not-suppress). A one-time
+#              stderr warning is printed by this function so the operator
+#              sees the misconfiguration without it gating the loop.
+#   ok       — proceed normally. Returned in every other case: empty
+#              QUIET_HOURS, FLEET_PHASE=review, FLEET_KICKSTART=1,
+#              FLEET_PHASE unset (kickstart_cmd path), or current time
+#              outside the window.
+#
+# Now-source:
+#   FLEET_NOW_OVERRIDE (test seam) — ISO8601 with offset, e.g.
+#     `2026-06-06T02:37:09-0700`. Parsed as a fixed-position string —
+#     chars 11..15 are HH:MM. This avoids any locale-sensitive bash
+#     ops (LESSONS 2026-06-05) and the printf leading-dash trap
+#     (LESSONS 2026-05-28: we never `printf` the override value as a
+#     format string).
+#   Otherwise `date +%H:%M` for current LOCAL time. The runner reads
+#     the OS TZ; DST is whatever `date` does natively.
+#
+# Window parse: `HH:MM-HH:MM` with both halves canonically zero-padded.
+# Out-of-range numerics (`25:00`, `12:60`), missing colons, missing dash,
+# and partial windows (`22:00`) all map to `invalid`. We strip colons and
+# compare on the 4-digit integer space (HHMM) so a window that crosses
+# midnight (`2200-0700`) is correctly modeled as `[2200, 2400) ∪ [0000, 0700)`.
+#
+# Guard FLEET_QUIET_HOURS_EMITTED: set to "1" by this function the first
+# time it returns 'suppress'. The runner's caller checks this guard before
+# emitting `quiet_hours_skip` so even an accidental double-call inside
+# the same process never produces two events. The downstream ship/groom/
+# eng paths do `exit 0` immediately after the emit, so the guard is
+# really belt-and-suspenders — but it matches the FLEET_PROMPTS_DRIFT_
+# EMITTED shape (ticket 0005) and keeps the contract uniform.
+#
+# Test seam: no other env reads. The function is pure-shell + `date`;
+# no jq, no awk -v multi-line (LESSONS 2026-06-01), no $(cat …) round-
+# trips (LESSONS 2026-05-27).
+_fleet_quiet_hours_parse_time() {
+  # Echo the 4-digit HHMM integer for the given source.
+  #   $1 = source kind: "override" or "local"
+  #   $2 = the override string (ignored when kind=local)
+  local kind="$1" raw="${2:-}"
+  if [ "$kind" = "override" ]; then
+    # ISO8601 has HH:MM at positions 11..15. Substring extraction in bash
+    # is byte-mode for ASCII so this is locale-safe (LESSONS 2026-06-05).
+    local hhmm="${raw:11:5}"
+    case "$hhmm" in
+      [0-9][0-9]:[0-9][0-9])
+        printf '%s%s' "${hhmm:0:2}" "${hhmm:3:2}"
+        return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  # local: ask `date` for HH:MM, strip the colon.
+  local hhmm
+  hhmm="$(date +%H:%M 2>/dev/null || echo "")"
+  case "$hhmm" in
+    [0-9][0-9]:[0-9][0-9])
+      printf '%s%s' "${hhmm:0:2}" "${hhmm:3:2}"
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_fleet_quiet_hours_validate_window() {
+  # Validate "HH:MM-HH:MM" → echo "HHMM-HHMM" (colon-stripped) on success,
+  # non-zero on failure. Both hours must be 00..23 and both minutes 00..59.
+  local w="${1:-}"
+  case "$w" in
+    [0-9][0-9]:[0-9][0-9]-[0-9][0-9]:[0-9][0-9]) ;;
+    *) return 1 ;;
+  esac
+  local sh="${w:0:2}" sm="${w:3:2}" eh="${w:6:2}" em="${w:9:2}"
+  # Range checks. We compare in arithmetic context, which treats `08`/`09`
+  # as decimal (the leading-zero-as-octal trap doesn't bite here because
+  # we already constrained each pair to [0-9][0-9]) — but use `10#` for
+  # safety against future format changes.
+  if [ "$((10#$sh))" -gt 23 ] || [ "$((10#$eh))" -gt 23 ]; then
+    return 1
+  fi
+  if [ "$((10#$sm))" -gt 59 ] || [ "$((10#$em))" -gt 59 ]; then
+    return 1
+  fi
+  printf '%s%s-%s%s' "$sh" "$sm" "$eh" "$em"
+  return 0
+}
+
+fleet_check_quiet_hours() {
+  # IMPORTANT calling convention. This helper has SIDE EFFECTS (emits the
+  # `quiet_hours_skip` event on first suppress, sets a process-scoped
+  # guard, writes a stderr warning on invalid config). Those side effects
+  # MUST land in the parent shell, not in a `$(…)` subshell — bash
+  # exports inside command substitution never leak back out, so calling
+  # this as `v=$(fleet_check_quiet_hours)` would silently drop the guard
+  # and a second call would re-emit. To make both call styles correct,
+  # the helper writes its verdict to BOTH stdout (so `$(…)` callers
+  # still work in single-shot tests) AND a global `FLEET_QUIET_HOURS_
+  # VERDICT` (so runner code can read the result while the side effects
+  # land in the main shell). Production runners (ship/groom/eng) MUST
+  # call this without command substitution, then branch on
+  # `$FLEET_QUIET_HOURS_VERDICT`.
+  local phase="${FLEET_PHASE:-}"
+  if [ -z "$phase" ] || [ "$phase" = "review" ] || [ "${FLEET_KICKSTART:-}" = "1" ]; then
+    FLEET_QUIET_HOURS_VERDICT="ok"; export FLEET_QUIET_HOURS_VERDICT
+    printf '%s\n' "ok"
+    return 0
+  fi
+
+  # Empty window = the manifest default = no suppression.
+  local window="${QUIET_HOURS:-}"
+  if [ -z "$window" ]; then
+    FLEET_QUIET_HOURS_VERDICT="ok"; export FLEET_QUIET_HOURS_VERDICT
+    printf '%s\n' "ok"
+    return 0
+  fi
+
+  # Validate. On a malformed value we print a one-shot stderr warning and
+  # proceed as if QUIET_HOURS were empty. Invalid config is operator
+  # error, not telemetry truth — no event is emitted, per AC#7.
+  local hhmm_range
+  if ! hhmm_range="$(_fleet_quiet_hours_validate_window "$window")"; then
+    if [ -z "${FLEET_QUIET_HOURS_INVALID_EMITTED:-}" ]; then
+      printf -- '%s\n' \
+        "${SLUG:-?} quiet_hours_invalid — QUIET_HOURS=\"$window\" is malformed (want HH:MM-HH:MM, 00..23:00..59); proceeding as if unset" >&2
+      FLEET_QUIET_HOURS_INVALID_EMITTED=1
+      export FLEET_QUIET_HOURS_INVALID_EMITTED
+    fi
+    FLEET_QUIET_HOURS_VERDICT="invalid"; export FLEET_QUIET_HOURS_VERDICT
+    printf '%s\n' "invalid"
+    return 0
+  fi
+
+  # Resolve "now" in local-time HHMM space. Override takes precedence (test
+  # seam). On a parse failure of the override, fall back to live `date` so
+  # the runner never wedges on a bad test env.
+  local now_hhmm
+  if [ -n "${FLEET_NOW_OVERRIDE:-}" ]; then
+    if ! now_hhmm="$(_fleet_quiet_hours_parse_time override "$FLEET_NOW_OVERRIDE")"; then
+      now_hhmm="$(_fleet_quiet_hours_parse_time local "" || echo "")"
+    fi
+  else
+    now_hhmm="$(_fleet_quiet_hours_parse_time local "" || echo "")"
+  fi
+  if [ -z "$now_hhmm" ]; then
+    # `date` somehow failed to give us HH:MM — be conservative and let
+    # the runner proceed. This is a "should never happen" branch.
+    FLEET_QUIET_HOURS_VERDICT="ok"; export FLEET_QUIET_HOURS_VERDICT
+    printf '%s\n' "ok"
+    return 0
+  fi
+
+  local start_hhmm="${hhmm_range%-*}"
+  local end_hhmm="${hhmm_range#*-}"
+  local now_n=$((10#$now_hhmm))
+  local start_n=$((10#$start_hhmm))
+  local end_n=$((10#$end_hhmm))
+
+  # A start == end window is degenerate; treat as no suppression. (The
+  # validator does not reject it because the operator might use it as a
+  # transient "disable for today" marker — empty is still the canonical
+  # disable.)
+  if [ "$start_n" = "$end_n" ]; then
+    FLEET_QUIET_HOURS_VERDICT="ok"; export FLEET_QUIET_HOURS_VERDICT
+    printf '%s\n' "ok"
+    return 0
+  fi
+
+  local in_window=0
+  if [ "$start_n" -lt "$end_n" ]; then
+    # Same-day window: [start, end). 09:00-17:00 catches 09:00..16:59.
+    if [ "$now_n" -ge "$start_n" ] && [ "$now_n" -lt "$end_n" ]; then
+      in_window=1
+    fi
+  else
+    # Overnight window: [start, 2400) ∪ [0000, end). 22:00-07:00 catches
+    # 22:00..23:59 AND 00:00..06:59.
+    if [ "$now_n" -ge "$start_n" ] || [ "$now_n" -lt "$end_n" ]; then
+      in_window=1
+    fi
+  fi
+
+  if [ "$in_window" = "1" ]; then
+    # First-call-in-this-process emits the typed event AND sets the guard
+    # so a defensive second call from the same runner can never produce a
+    # duplicate. Mirrors fleet_check_prompts_sha's FLEET_PROMPTS_DRIFT_
+    # EMITTED handling (ticket 0005). We compose `now_local` here from
+    # the same source the in/out-of-window decision used so the event's
+    # payload matches the policy that produced it (especially important
+    # when FLEET_NOW_OVERRIDE is in play under tests).
+    if [ -z "${FLEET_QUIET_HOURS_EMITTED:-}" ]; then
+      local now_local="${FLEET_NOW_OVERRIDE:-}"
+      if [ -z "$now_local" ]; then
+        now_local="$(date +%FT%T%z 2>/dev/null || date -u +%FT%TZ)"
+      fi
+      fleet_emit_event quiet_hours_skip \
+        "phase=$phase" "window=$window" "now_local=$now_local" || true
+      FLEET_QUIET_HOURS_EMITTED=1
+      export FLEET_QUIET_HOURS_EMITTED
+    fi
+    FLEET_QUIET_HOURS_VERDICT="suppress"; export FLEET_QUIET_HOURS_VERDICT
+    printf '%s\n' "suppress"
+    return 0
+  fi
+
+  FLEET_QUIET_HOURS_VERDICT="ok"; export FLEET_QUIET_HOURS_VERDICT
+  printf '%s\n' "ok"
+  return 0
+}
+
 # --- logging --------------------------------------------------------------
 # $1 = phase (ship/groom/review/eng). Redirects all output to a timestamped log.
 fleet_log_init() {

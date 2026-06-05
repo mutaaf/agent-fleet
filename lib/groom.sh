@@ -14,6 +14,19 @@ fleet_log_init groom
 fleet_emit_event run_started "pid=$$" || true
 fleet_self_cancel || exit 0
 fleet_check_budget || exit 0
+
+# Ticket 0033 — operator-declared local-time quiet hours. See lib/common.sh
+# § quiet hours and lib/ship.sh for the contract. The helper owns the emit
+# + guard; the runner just reads $FLEET_QUIET_HOURS_VERDICT (set by the
+# helper as a global so its side effects land in this shell), prints the
+# banner, and exits 0. Suppress IS the no-op path.
+fleet_check_quiet_hours >/dev/null
+if [ "${FLEET_QUIET_HOURS_VERDICT:-ok}" = "suppress" ]; then
+  FLEET_QUIET_END_HHMM="${QUIET_HOURS#*-}"
+  echo "quiet hours active ($QUIET_HOURS local) — $FLEET_PHASE no-op until $FLEET_QUIET_END_HHMM"
+  exit 0
+fi
+
 fleet_check_prompts_sha || true
 fleet_acquire_lock groom || exit 0
 trap 'fleet_release_lock groom' EXIT

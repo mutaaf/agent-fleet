@@ -1,0 +1,6 @@
+SLUG="quiethourstest"
+PROJECT_NAME="quiethourstest"
+NAMESPACE="com.fleet.quiethourstest"
+REPO_URL="https://github.com/example/quiethourstest.git"
+SELF_CANCEL="20990101"
+QUIET_HOURS="09:00-17:00"
