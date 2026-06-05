@@ -240,6 +240,27 @@ postcard.
     `ship_resumed` (0030): one operator-declared policy, one typed
     event, no transcript scraping required to reconstruct why a
     run no-op'd at 2am.
+  - `prompts_reverted {from, to, pr, reason}` — emitted by
+    `bin/fleet prompts-revert` (ticket 0035) once per successful
+    revert of the kit's `prompts/` tree to a known-good SHA. `from`
+    is the prompts SHA on disk BEFORE the checkout (per `fleet
+    prompts-sha`'s formula); `to` is the target full 40-char SHA
+    the operator pinned back to (resolved from a full SHA, ≥7-char
+    short SHA, or `YYYY-MM-DD` CHANGELOG date stamp); `pr` is the
+    revert PR's number; `reason` is the mandatory `--reason
+    "<one-line>"` value, recorded verbatim. Carries `phase=revert`
+    and lives in the AGENT-FLEET kit-as-project `events.jsonl`
+    (per the `lesson_promoted` pattern from ticket 0028 — the kit
+    IS a project for telemetry purposes). Idempotent no-op path
+    (target's prompts/ tree byte-identical to current) emits NO
+    event; refusal paths (dirty tree, unknown SHA, missing
+    `--reason`, non-ASCII `--reason`) emit NO event — only
+    successful revert PRs do. Mirrors the shape of
+    `rollback_opened` (0017) and `ship_resumed` (0030): one
+    operator-initiated action, one typed event, no transcript
+    scraping required to reconstruct the recovery. Consumed by
+    `fleet prompts-score` as a revision boundary alongside
+    `prompts_pin_changed` (0024).
   - `ship_resumed {source, paused_for, reason, forced}` — emitted by
     `bin/fleet resume <slug>` (ticket 0030) on every successful resume
     of a previously `ship_paused` project. `source` is the slug whose
