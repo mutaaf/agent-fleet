@@ -15,6 +15,9 @@
 #                             (ticket 0027 — md/svg/txt; network-free)
 #   fleet prompts-sha         print the SHA256 of the kit's prompts/ tree
 #                             (ticket 0005 — for PROMPTS_SHA pinning)
+#   fleet prompts-revert <sha> --reason "<text>"
+#                             pin prompts/ back to a known-good SHA (opens revert/ PR)
+#                             (ticket 0035 — full/short SHA or YYYY-MM-DD date stamp)
 #   fleet lessons-promote <slug> --lesson "<title>"
 #                             curate one lesson into cross-fleet
 #                             (ticket 0028 — operator's curation primitive)
@@ -411,6 +414,330 @@ USAGE
 
 if [ "$CMD" = "prompts-diff" ]; then
   prompts_diff_cmd "$@"
+fi
+
+# --- prompts-revert -------------------------------------------------------
+# Ticket 0035. `fleet prompts-revert <sha> --reason "<one-line>"` is the
+# operator's one-command undo for a bad prompts merge — the parallel of
+# `fleet rollback` (ticket 0017) for code. Resolves <sha> against the
+# kit's git history (full SHA, ≥7-char short SHA, or YYYY-MM-DD CHANGELOG
+# date stamp), runs `git checkout <sha> -- prompts/`, commits, pushes a
+# `revert/prompts-<short-sha>` branch, opens a PR with the
+# `Reinstall: all projects` trailer (LESSONS 2026-05-25), and emits one
+# `prompts_reverted {from, to, pr, reason}` event to the kit-as-project
+# events.jsonl (per the lessons_promote pattern from ticket 0028).
+#
+# Hard NO: this command never touches lib/ or AGENTS.md — it is strictly
+# for prompts SHA pinning. Mixing in lib/ reverts is `fleet rollback`'s
+# job (per-PR), not this command's.
+#
+# Defends against (per ticket 0035 § LESSONS-to-defend list):
+#   * 2026-05-25 — Reinstall: all projects trailer is auto-added to PR body
+#   * 2026-05-26 — naming `prompts_revert` does not shadow any binary
+#   * 2026-05-26 — tests put stubs under $HOME/.local/bin (out-of-band)
+#   * 2026-05-27 — no `$(cat)` round-trips (PR body is composed via tmp file)
+#   * 2026-05-28 — `printf -- '%s'` for every $reason render (leading-dash)
+#   * 2026-05-30 — help text grep uses `grep -qF --` in tests (out-of-band)
+#   * 2026-06-01 — multi-line bodies pass through tmp files, not `--body`
+#                  (`gh pr create --body-file`) and not `awk -v`
+#   * 2026-06-01 — every code path exits explicitly (no dispatcher fall-through)
+#   * 2026-06-03 — reason is restricted to ASCII for v1 (UTF-8 sign-extension)
+#   * 2026-06-05 — every helper this function calls is defined ABOVE the
+#                  dispatcher block; specifically `fleet_prompts_sha` (line
+#                  ~142) and the local helpers below. `fleet_emit_event` is
+#                  sourced inside a subshell from lib/common.sh.
+
+# Resolve <sha> argument into a full 40-char SHA. Accepts:
+#   * a full 40-char hex SHA   → `git rev-parse <sha>` echoes the same
+#   * a ≥7-char short SHA      → `git rev-parse` resolves to full
+#   * a YYYY-MM-DD date stamp  → `git log -G "^## $date" -- prompts/CHANGELOG.md`
+# Echoes the resolved full SHA, or empty on failure (caller emits the
+# "not a valid git ref" error + exits 2).
+prompts_revert_resolve_sha() {
+  local kit_root="$1" arg="$2" full=""
+  # Date stamp branch: YYYY-MM-DD.
+  if [[ "$arg" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    full="$( cd "$kit_root" \
+             && git log --format=%H -G "^## $arg" -- prompts/CHANGELOG.md 2>/dev/null \
+                | head -1 )"
+    [ -n "$full" ] && echo "$full"
+    return 0
+  fi
+  # Hex SHA branch (full or short).
+  if [[ "$arg" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+    full="$( cd "$kit_root" && git rev-parse --verify "$arg" 2>/dev/null )"
+    [ -n "$full" ] && echo "$full"
+    return 0
+  fi
+  return 0
+}
+
+# Echo the prompts/ tree object SHA at <sha>. Used to short-circuit AC#5
+# (target byte-identical to current).
+prompts_revert_compute_target_tree_sha() {
+  local kit_root="$1" sha="$2"
+  ( cd "$kit_root" && git rev-parse --verify "$sha:prompts" 2>/dev/null )
+}
+
+# Compose the PR body to a tmp file and echo its path. Per LESSONS
+# 2026-06-01 we NEVER pass a multi-line value via `--body "$body"` (the
+# awk -v family trap); the file goes through `gh pr create --body-file`.
+# Per LESSONS 2026-05-28 every $reason render uses `printf -- '%s'`.
+prompts_revert_compose_pr_body() {
+  local from="$1" to="$2" reason="$3"
+  local body_file; body_file="$(mktemp -t fleet-prompts-revert-body.XXXXXX)"
+  {
+    printf -- '[FLEET prompts-revert] pin prompts/ back to %s\n\n' "$to"
+    printf -- 'from: %s\n' "$from"
+    printf -- 'to:   %s\n' "$to"
+    printf -- 'reason: '
+    printf -- '%s' "$reason"
+    printf -- '\n\n'
+    printf -- 'Reinstall: all projects\n'
+    printf -- '\n'
+    printf -- 'Emitted prompts_reverted {from, to, pr, reason} to the kit-as-project\n'
+    printf -- 'events.jsonl on open. See AGENTS.md § Telemetry for the contract.\n'
+  } > "$body_file"
+  echo "$body_file"
+}
+
+# Compose the commit message to a tmp file and echo its path. The
+# multi-line message is passed via `git commit -F <file>` — same
+# defensive shape as the PR body (LESSONS 2026-06-01).
+prompts_revert_compose_commit_msg() {
+  local to="$1" reason="$2"
+  local msg_file; msg_file="$(mktemp -t fleet-prompts-revert-msg.XXXXXX)"
+  {
+    printf -- 'revert: pin prompts/ back to %s\n\n' "$to"
+    printf -- 'reason: '
+    printf -- '%s' "$reason"
+    printf -- '\n\n'
+    printf -- 'Reinstall: all projects\n'
+    printf -- '\n'
+    printf -- 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>\n'
+  } > "$msg_file"
+  echo "$msg_file"
+}
+
+# Emit the prompts_reverted event into the AGENT-FLEET project's
+# events.jsonl. Mirrors lessons_promote_emit_event (line ~7988).
+# Sources lib/common.sh in a subshell so SLUG/CACHE_DIR/FLEET_PHASE
+# scope to this emit only.
+prompts_revert_emit_event() {
+  local from="$1" to="$2" pr="$3" reason="$4"
+  local kit_root; kit_root="$( cd "$( dirname "$0" )/.." && pwd )"
+  [ -f "$kit_root/lib/common.sh" ] || return 0
+  local cache_dir="$HOME/.cache/agent-fleet-agent"
+  mkdir -p "$cache_dir"
+  (
+    export SLUG="agent-fleet"
+    export CACHE_DIR="$cache_dir"
+    export FLEET_PHASE="revert"
+    # shellcheck disable=SC1090
+    source "$kit_root/lib/common.sh" >/dev/null 2>&1
+    fleet_emit_event prompts_reverted \
+      "from=$from" "to=$to" "pr=$pr" "reason=$reason"
+  ) || true
+}
+
+prompts_revert() {
+  shift  # drop the leading "prompts-revert"
+  local sha_arg="" reason=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason)
+        reason="${2:-}"; shift 2 ;;
+      --reason=*)
+        reason="${1#--reason=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet prompts-revert — pin the kit's prompts/ tree back to a known-good SHA.
+
+Usage:
+  fleet prompts-revert <sha> --reason "<one-line>"
+  fleet prompts-revert --help
+
+Arguments:
+  <sha>       full 40-char SHA, short SHA (>=7 chars), OR a YYYY-MM-DD
+              CHANGELOG date stamp (resolved via
+              git log --format=%H -G "^## <date>" -- prompts/CHANGELOG.md).
+  --reason    MANDATORY one-line operator rationale (ASCII; v1 limit).
+              Recorded verbatim in the PR body, the commit message,
+              AND the prompts_reverted event payload.
+
+On success: runs git checkout <sha> -- prompts/, commits on branch
+revert/prompts-<short-sha>, pushes, opens a PR via gh, emits one
+prompts_reverted {from, to, pr, reason} event with phase=revert
+to the kit-as-project events.jsonl, and exits 0.
+
+The PR body carries 'Reinstall: all projects' so the post-merge
+fleet-wide reinstall is unambiguous (LESSONS 2026-05-25).
+
+Idempotent: a target whose prompts/ tree is byte-identical to the
+current working tree is a no-op (no commit, no push, no event).
+USAGE
+        exit 0 ;;
+      --)
+        shift ;;
+      -*)
+        printf -- 'prompts-revert: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$sha_arg" ]; then
+          sha_arg="$1"; shift
+        else
+          printf -- 'prompts-revert: unexpected extra argument %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+
+  # AC#1 / general: require <sha>.
+  if [ -z "$sha_arg" ]; then
+    echo "prompts-revert: missing <sha> (usage: fleet prompts-revert <sha> --reason \"<one-line>\")" >&2
+    exit 2
+  fi
+
+  # AC#3: --reason is MANDATORY.
+  if [ -z "$reason" ]; then
+    echo "prompts-revert: --reason \"<one-line>\" is required (auditable override)" >&2
+    exit 2
+  fi
+
+  # AC: reason is restricted to ASCII for v1 (LESSONS 2026-06-03 —
+  # _json_escape sign-extends multi-byte UTF-8 under LC_ALL=C). The
+  # check is a single bash pattern: any byte > 0x7F triggers refusal.
+  if LC_ALL=C printf -- '%s' "$reason" | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
+    echo "prompts-revert: --reason must be ASCII for v1 (see ticket 0035 note)" >&2
+    exit 2
+  fi
+
+  # Resolve the kit root. Same shape as prompts_diff_cmd: $FLEET_KIT_ROOT
+  # wins; else bin/fleet → ..
+  local kit_root; kit_root="$(prompts_diff_kit_root)"
+
+  # AC#7: resolve <sha> → full SHA via the three-form helper.
+  local target_full
+  target_full="$(prompts_revert_resolve_sha "$kit_root" "$sha_arg")"
+  if [ -z "$target_full" ]; then
+    printf -- 'prompts-revert: %s is not a valid git ref in this kit checkout\n' "$sha_arg" >&2
+    exit 2
+  fi
+  local target_short="${target_full:0:7}"
+
+  # AC#6: refuse on a dirty working tree.
+  local porc
+  porc="$( cd "$kit_root" && git status --porcelain 2>/dev/null )"
+  if [ -n "$porc" ]; then
+    echo "prompts-revert: working tree has uncommitted changes — commit, stash, or discard them first" >&2
+    exit 2
+  fi
+
+  # Compute the current prompts SHA on disk (the kit's
+  # `find prompts -type f -name '*.md' | sort | xargs cat | shasum -a 256`
+  # formula). This is the value pinned in PROMPTS_SHA= manifests and the
+  # value the prompts_reverted event records as `from`.
+  local from_sha; from_sha="$(fleet_prompts_sha)"
+  if [ -z "$from_sha" ]; then
+    echo "prompts-revert: could not compute current prompts SHA" >&2
+    exit 1
+  fi
+
+  # AC#5: byte-identical target → idempotent no-op. We compare the
+  # tree-object SHA at the target commit's prompts/ against the
+  # tree-object SHA at HEAD's prompts/. When git can resolve both AND
+  # they match, the working tree (which we just verified is clean) is
+  # byte-identical to what the checkout would produce — no work to do.
+  local target_tree current_tree
+  target_tree="$(prompts_revert_compute_target_tree_sha "$kit_root" "$target_full")"
+  current_tree="$(prompts_revert_compute_target_tree_sha "$kit_root" "HEAD")"
+  if [ -n "$target_tree" ] && [ -n "$current_tree" ] \
+     && [ "$target_tree" = "$current_tree" ]; then
+    printf -- "prompts-revert: %s's prompts/ tree is identical to the current working tree (sha=%s) — nothing to do.\n" \
+      "$target_full" "$from_sha"
+    exit 0
+  fi
+
+  # --- Execute the revert. ---------------------------------------------
+  printf -- 'fleet prompts-revert: checking out prompts/ at %s …\n' "$target_full"
+  printf -- '  current prompts_sha: %s\n' "$from_sha"
+  printf -- '  target prompts_sha:  %s\n' "$target_full"
+
+  # `git checkout <sha> -- prompts/` writes the historical tree into the
+  # working tree's prompts/ dir. Errors here are hard-fail (network
+  # is N/A — this is a local-history checkout).
+  if ! ( cd "$kit_root" && git checkout "$target_full" -- prompts/ ) >/dev/null 2>&1; then
+    echo "prompts-revert: git checkout $target_full -- prompts/ failed" >&2
+    exit 1
+  fi
+
+  # Stage and commit. Multi-line message goes through a tmp file via
+  # `git commit -F` (LESSONS 2026-06-01 family).
+  local revert_branch="revert/prompts-$target_short"
+  if ! ( cd "$kit_root" && git checkout -b "$revert_branch" ) >/dev/null 2>&1; then
+    # Branch may already exist from a prior aborted run; try a plain checkout.
+    if ! ( cd "$kit_root" && git checkout "$revert_branch" ) >/dev/null 2>&1; then
+      echo "prompts-revert: could not create or switch to branch $revert_branch" >&2
+      exit 1
+    fi
+  fi
+  if ! ( cd "$kit_root" && git add prompts/ ) >/dev/null 2>&1; then
+    echo "prompts-revert: git add prompts/ failed" >&2
+    exit 1
+  fi
+  local msg_file; msg_file="$(prompts_revert_compose_commit_msg "$target_full" "$reason")"
+  if ! ( cd "$kit_root" && git commit -F "$msg_file" ) >/dev/null 2>&1; then
+    rm -f "$msg_file"
+    echo "prompts-revert: git commit failed" >&2
+    exit 1
+  fi
+  rm -f "$msg_file"
+
+  if ! ( cd "$kit_root" && git push -u origin "$revert_branch" ) >/dev/null 2>&1; then
+    echo "prompts-revert: git push -u origin $revert_branch failed" >&2
+    exit 1
+  fi
+
+  # Compose the PR body via tmp file and open the PR.
+  local body_file; body_file="$(prompts_revert_compose_pr_body "$from_sha" "$target_full" "$reason")"
+  local create_out new_pr_number=""
+  create_out="$(gh pr create \
+                  --repo mutaaf/agent-fleet \
+                  --head "mutaaf:$revert_branch" \
+                  --base main \
+                  --title "[FLEET prompts-revert] pin prompts/ back to $target_short" \
+                  --body-file "$body_file" \
+                  2>&1 || true)"
+  rm -f "$body_file"
+  echo "$create_out"
+  new_pr_number="$(echo "$create_out" | sed -nE 's#.*/pull/([0-9]+).*#\1#p' | head -1)"
+  if [ -z "$new_pr_number" ]; then
+    echo "prompts-revert: could not parse new PR number from 'gh pr create' output" >&2
+    exit 1
+  fi
+
+  printf -- '\nopening revert PR …\n'
+  printf -- '  branch:  %s\n' "$revert_branch"
+  printf -- '  PR:      #%s\n' "$new_pr_number"
+  printf -- '  reason:  '
+  printf -- '%s' "$reason"
+  printf -- '\n'
+
+  # Emit the prompts_reverted event.
+  prompts_revert_emit_event "$from_sha" "$target_full" "$new_pr_number" "$reason"
+
+  printf -- '\nemitted prompts_reverted from=%s to=%s pr=%s reason=' \
+    "$from_sha" "$target_full" "$new_pr_number"
+  printf -- '%s' "$reason"
+  printf -- '\n'
+  printf -- '\nNEXT: the review subagent will grade this PR like any other.\n'
+  printf -- '      After merge, run install.sh across every project per the\n'
+  printf -- "      'Reinstall: all projects' convention (LESSONS 2026-05-25).\n"
+  exit 0
+}
+
+if [ "$CMD" = "prompts-revert" ]; then
+  prompts_revert "$@"
 fi
 
 # --- onboard --------------------------------------------------------------

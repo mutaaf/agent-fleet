@@ -453,6 +453,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet badge agent-fleet       # one-line ROI badge for the project's README (md/svg/txt; network-free)
 ~/code/agent-fleet/bin/fleet tail                    # stream live events from every project (Ctrl-C to stop)
 ~/code/agent-fleet/bin/fleet rollback courtiq        # revert the last agent-shipped commit (revert/<id>-<slug> PR)
+~/code/agent-fleet/bin/fleet prompts-revert ee94b3a --reason "8a20547 regression"  # pin prompts/ back to a known-good SHA (opens revert/prompts-<short> PR)
 ~/code/agent-fleet/bin/fleet resume courtiq          # re-enable a ship_paused project (--force --reason "…" for audited override)
 ~/code/agent-fleet/bin/fleet atlas                   # fleet-wide infra-flake catalog with per-pattern frequency (text/json)
 ~/code/agent-fleet/bin/fleet kickstart courtiq ship             # trigger a one-shot agent-ship run
