@@ -1,11 +1,11 @@
 ---
 id: 0035
 title: fleet prompts-revert pins the kit's prompts/ tree back to a known-good SHA
-status: groomed
+status: in-progress
 priority: P2
 area: governance
 created: 2026-06-05
-owner: gtm-innovation
+owner: implementation-dev
 ---
 
 ## User story
@@ -377,7 +377,4 @@ doesn't have to re-discover the architecture.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD — branch `feat/0035-...` opened
-- YYYY-MM-DD — failing test added in `tests/prompts-revert.sh`
-- YYYY-MM-DD — PR #N opened, CI [state]
-- YYYY-MM-DD — merged to main
+- 2026-06-05 — branch `feat/0035-prompts-revert-pin-to-sha` opened from `main`; ticket flipped `groomed` → `in-progress`.
