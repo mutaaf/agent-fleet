@@ -286,3 +286,33 @@ does call the helper via `$(...)` for output-only assertions, it
 must NOT also assert on the guard env or downstream side-effect
 count — those checks belong in the no-substitution call path (which
 mirrors production).
+
+## 2026-06-05 — a new helper in `bin/fleet` cannot call a function defined LATER in the file when reached via the inline `if [ "$CMD" = "<sub>" ]` dispatcher
+
+While shipping ticket 0034's `replay_one_pr_json_line`, the first cut
+called `provenance_json_escape` (defined at line ~6044) to escape the
+PR title and rationale into the per-PR JSON line. The new helper sits
+near `replay()` (~line 4986) and is invoked through the dispatcher
+block `if [ "$CMD" = "replay" ]; then replay "$@"; fi` at ~line 5597
+— which runs AT EXECUTION TIME, not at parse time. When the user runs
+`fleet replay --batch …`, bash has only parsed up to line 5597 by the
+time the dispatcher fires; everything between 5597 and 6044 (including
+`provenance_json_escape`) is not yet a known function. Symptom in
+`tests/replay-batch.sh` AC#7: stderr carried
+`bin/fleet: line 5091: provenance_json_escape: command not found` and
+the JSON renderer emitted broken rows. AC#1-#6 passed because they
+never reached the JSON-escape codepath (text-mode `replay_batch_
+render_text` doesn't escape values). Fix: inline a local copy of the
+helper (`replay_batch_json_escape`) defined BEFORE the helper that
+needs it. The copy is bit-for-bit identical so the LESSONS 2026-06-03
+UTF-8 sign-extension guard remains in force. Cheap defensive habit:
+any new helper added near the top of `bin/fleet` that needs a JSON
+escaper / parser / formatter from further down the file must either
+(a) be moved below the dependency, (b) use one of the
+already-early-defined helpers (`preflight_json_escape` at ~line 726
+is a safe choice), or (c) duplicate the helper inline with a comment
+pointing at the canonical copy. The "use the existing later helper"
+shortcut works ONLY when the subcommand dispatcher block sits at the
+very bottom of the file — `bin/fleet`'s dispatcher is interleaved
+with the function bodies (one inline `if [ "$CMD" = "<sub>" ]` block
+per subcommand), so the forward-reference window is narrow but real.
