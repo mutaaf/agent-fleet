@@ -1,7 +1,7 @@
 ---
 id: 0034
 title: fleet replay --batch <since> grades current prompts against the last N merged PRs
-status: in-progress
+status: shipped
 priority: P2
 area: governance
 created: 2026-06-05
@@ -341,5 +341,5 @@ doesn't have to re-discover the architecture.
   added in `bin/fleet`; `replay()` got a `--batch` pre-pass that routes
   early. Single-PR path is byte-identical (regression-tested via
   `tests/replay.sh`). Local gate + both tests green.
-- YYYY-MM-DD — PR #N opened, CI [state]
-- YYYY-MM-DD — merged to main
+- 2026-06-05 — PR #68 opened, CI green (shellcheck + validate pass)
+- 2026-06-05 — merged to main via auto-merge squash
