@@ -1,0 +1,7 @@
+PR    TITLE                                              PAST      DRY-RUN   DELTA
+#17   ticket 0017: shipped                               merged    sign-off  =
+#18   ticket 0018: principles                            merged    reject    !
+#19   ticket 0019: overview                              rejected  sign-off  !
+
+summary: 1/3 unchanged, 2 DELTA
+verdict: FAIL — 67% of past good PRs would now flip.
