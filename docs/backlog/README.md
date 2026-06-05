@@ -53,4 +53,4 @@ ones, `review` grades them.
 | 0032 | fleet preflight <repo> dry-adopts a project and prints what install.sh would do | P1 | shipped | docs |
 | 0033 | QUIET_HOURS manifest knob suppresses ship/groom/eng during operator-declared windows | P1 | shipped | governance |
 | 0034 | fleet replay --batch <since> grades current prompts against the last N merged PRs | P2 | shipped | governance |
-| 0035 | fleet prompts-revert pins the kit's prompts/ tree back to a known-good SHA | P2 | in-progress | governance |
+| 0035 | fleet prompts-revert pins the kit's prompts/ tree back to a known-good SHA | P2 | shipped | governance |

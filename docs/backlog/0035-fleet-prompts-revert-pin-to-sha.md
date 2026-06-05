@@ -1,7 +1,7 @@
 ---
 id: 0035
 title: fleet prompts-revert pins the kit's prompts/ tree back to a known-good SHA
-status: in-progress
+status: shipped
 priority: P2
 area: governance
 created: 2026-06-05
@@ -380,3 +380,4 @@ doesn't have to re-discover the architecture.
 - 2026-06-05 — branch `feat/0035-prompts-revert-pin-to-sha` opened from `main`; ticket flipped `groomed` → `in-progress`.
 - 2026-06-05 — failing tests-first added at `tests/prompts-revert.sh` (11 ACs, stubbed `git`/`gh` under `$HOME/.local/bin` per LESSONS 2026-05-26); ran red against `bin/fleet` baseline.
 - 2026-06-05 — `prompts_revert()` + 4 helpers + AGENTS.md telemetry bullet + README "Daily ops" line landed; all 11 ACs green, `shellcheck -S warning` + `bash -n` + `check-backlog.mjs` + `check-prompts-changelog.mjs` PASS.
+- 2026-06-05 — PR #71 opened (auto-merge armed via `gh pr merge --auto --squash`); both gating checks (`shellcheck`, `validate`) green; merged at 2026-06-05T23:55:57Z (commit `2af93b23`).
