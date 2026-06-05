@@ -1,7 +1,7 @@
 ---
 id: 0033
 title: QUIET_HOURS manifest knob suppresses ship/groom/eng during operator-declared windows
-status: in-progress
+status: shipped
 priority: P1
 area: governance
 created: 2026-06-05
@@ -308,6 +308,5 @@ doesn't have to re-discover the architecture.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-05 — branch `feat/0033-quiet-hours-suppress-launchd-runs` opened; status flipped to in-progress.
-- YYYY-MM-DD — failing test added in `tests/quiet-hours.sh`
-- YYYY-MM-DD — PR #N opened, CI [state]
-- YYYY-MM-DD — merged to main
+- 2026-06-05 — failing test added in `tests/quiet-hours.sh` (11 scenarios, one per AC); helper + runner wiring + manifest example + AGENTS.md bullet land green locally.
+- 2026-06-05 — PR #65 opened, CI green (shellcheck + validate), auto-merge armed, merged to main.
