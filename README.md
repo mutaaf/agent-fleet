@@ -112,6 +112,8 @@ The fleet doesn't need API keys — it drives the local `claude` CLI, which talk
 
 This assumes your repo already has tests, a CI workflow, and at least the start of a backlog (`docs/backlog/`). For a repo with none of that, jump to [Onboarding a brand-new repo](#onboarding-a-brand-new-repo-the-long-form).
 
+> **Preview the install first.** Once the kit is cloned, `bin/fleet preflight ~/code/your-repo` dry-adopts the candidate: it reads the manifest, AGENTS.md, backlog scaffolding, subagent prompts, gh auth state, claude CLI path, share-dir writability, launchd namespace, and SELF_CANCEL horizon, then prints a 10-row PASS/WARN/FAIL table plus a one-line verdict — without writing a single file under `~/.local/share/agent-fleet`, `~/Library/LaunchAgents`, or `~/.cache/<slug>-agent`. Exit 0 = safe to install; exit 1 = at least one FAIL, fix that first. `--json` emits NDJSON for chained tooling. See [ticket 0032](docs/backlog/0032-fleet-preflight-dry-adoption-check.md).
+
 **1. Clone the engine somewhere stable**
 
 ```bash
