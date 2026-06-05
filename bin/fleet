@@ -24,6 +24,8 @@
 #                             (ticket 0030 — --force/--reason for audited override)
 #   fleet atlas               fleet-wide infra-flake catalog with per-pattern frequency (text/json)
 #                             (ticket 0031 — --since/--slug/--json; pure reader, no new event types)
+#   fleet preflight <repo>    dry-adopt a candidate project; print what install.sh would do (read-only)
+#                             (ticket 0032 — 10 PASS/WARN/FAIL rows + verdict; --json; never writes)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -699,6 +701,514 @@ USAGE
 
 if [ "$CMD" = "onboard" ]; then
   onboard "$@"
+fi
+
+# --- preflight ------------------------------------------------------------
+# Ticket 0032. `fleet preflight <repo-path>` dry-adopts a candidate project
+# and prints a 10-row PASS/WARN/FAIL table + a one-line verdict, mirroring
+# `doctor`'s shape but running BEFORE install.sh against ONE candidate path
+# (not all discovered projects). The command writes ZERO files outside the
+# candidate repo's working tree and never invokes a `launchctl` mutation
+# verb — only read-only `print` / `print-disabled` / `list`. Exit codes:
+#   0 → zero FAILs (safe to install)
+#   1 → at least one FAIL
+#   2 → usage error (bad path, unknown flag, missing argument)
+#
+# Per LESSONS 2026-06-03 the JSON renderer uses its own UTF-8-safe escape
+# (`preflight_json_escape`), NOT `doctor_json_escape`. Per LESSONS
+# 2026-06-01 every code path ends with an explicit `exit N`. Per LESSONS
+# 2026-05-28 every printf of a path or slug uses `printf -- '%s'`.
+
+# UTF-8-safe JSON string escape — copy of provenance_json_escape's fix
+# (LESSONS 2026-06-03): guard the control-char branch on `code >= 0` so
+# sign-extended high bytes (negative codes under LC_ALL=C) pass through
+# unescaped rather than emitting `￿ffffff…` garbage.
+preflight_json_escape() {
+  local s="${1-}" out="" i ch code
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *)
+        printf -v code '%d' "'$ch"
+        if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+          printf -v out '%s\\u%04x' "$out" "$code"
+        else
+          out+="$ch"
+        fi
+        ;;
+    esac
+  done
+  printf -- '%s' "$out"
+}
+
+# Each check helper echoes `STATUS<TAB>DETAIL` on a single line. Renderer
+# turns that into either a human row or a JSON object. Independent — no
+# shared mutable state — so the renderer can call them in fixed order.
+
+# check 1: manifest (agents.config.sh) exists + parses + sets the required
+# vars. Reads SLUG and NAMESPACE in a subshell so vars don't leak.
+preflight_check_manifest() {
+  local proj_dir="$1"
+  local manifest="$proj_dir/agents.config.sh"
+  if [ ! -f "$manifest" ]; then
+    printf 'FAIL\tno agents.config.sh at %s\n' "$proj_dir"
+    return 0
+  fi
+  local slug ns
+  # shellcheck disable=SC1090  # discovered at runtime
+  slug="$( ( source "$manifest" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )"
+  # shellcheck disable=SC1090
+  ns="$( ( source "$manifest" 2>/dev/null; printf -- '%s' "${NAMESPACE:-}" ) )"
+  if [ -z "$slug" ]; then
+    printf 'FAIL\tagents.config.sh sets no SLUG\n'
+    return 0
+  fi
+  if [ -z "$ns" ]; then
+    printf 'FAIL\tagents.config.sh sets no NAMESPACE\n'
+    return 0
+  fi
+  printf 'PASS\tSLUG=%s, NAMESPACE=%s\n' "$slug" "$ns"
+}
+
+# check 2: AGENTS.md has the contract anchor heading the runners read.
+preflight_check_agents_md_section() {
+  local proj_dir="$1"
+  local am="$proj_dir/AGENTS.md"
+  if [ ! -f "$am" ]; then
+    printf 'FAIL\tAGENTS.md not found at %s\n' "$am"
+    return 0
+  fi
+  if ! grep -qE '^##[[:space:]]+Agent parameters' "$am"; then
+    printf 'FAIL\tAGENTS.md missing %s section\n' "'## Agent parameters'"
+    return 0
+  fi
+  printf 'PASS\tgating section present\n'
+}
+
+# check 3: docs/backlog/README.md exists + has at least one ticket row.
+preflight_check_backlog_scaffolding() {
+  local proj_dir="$1"
+  local readme="$proj_dir/docs/backlog/README.md"
+  if [ ! -f "$readme" ]; then
+    printf 'FAIL\tdocs/backlog/README.md not found at %s\n' "$readme"
+    return 0
+  fi
+  # Count ticket rows (lines beginning with `| NNNN |`). Per LESSONS
+  # 2026-06-01 we count with awk so `grep -c | || echo 0` cannot
+  # double-print on zero matches.
+  local n
+  n="$(awk '/^\|[[:space:]]*[0-9]{4}[[:space:]]*\|/ { n++ } END { print (n+0) }' "$readme")"
+  printf 'PASS\tdocs/backlog/README.md, %s tickets\n' "$n"
+}
+
+# check 4: scripts/check-backlog.mjs exists (kit-wide convention).
+preflight_check_backlog_validator() {
+  local proj_dir="$1"
+  local validator="$proj_dir/scripts/check-backlog.mjs"
+  if [ ! -f "$validator" ]; then
+    printf 'WARN\tscripts/check-backlog.mjs missing — install.sh template will scaffold it\n'
+    return 0
+  fi
+  printf 'PASS\tscripts/check-backlog.mjs exists\n'
+}
+
+# check 5: .claude/agents/ holds the three required subagent prompts
+# (implementation-dev, gtm-innovation, review). eng-dev is optional unless
+# ENG_ENABLED=1.
+preflight_check_subagents() {
+  local proj_dir="$1" eng_enabled="${2:-0}"
+  local agents_dir="$proj_dir/.claude/agents"
+  if [ ! -d "$agents_dir" ]; then
+    printf 'WARN\t.claude/agents/ missing — install.sh template will scaffold it\n'
+    return 0
+  fi
+  local missing="" req
+  for req in implementation-dev gtm-innovation review; do
+    if [ ! -f "$agents_dir/$req.md" ]; then
+      missing="$missing $req.md"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    printf 'FAIL\tmissing required subagents:%s\n' "$missing"
+    return 0
+  fi
+  # eng-dev: WARN if missing AND ENG_ENABLED=1; informational WARN
+  # otherwise (matches the ticket's golden output for the happy path).
+  if [ ! -f "$agents_dir/eng-dev.md" ]; then
+    if [ "$eng_enabled" = "1" ]; then
+      printf 'FAIL\teng-dev.md missing but ENG_ENABLED=1 in manifest\n'
+    else
+      printf 'WARN\teng-dev.md missing — ENG_ENABLED=0 in manifest, OK\n'
+    fi
+    return 0
+  fi
+  printf 'PASS\tall four subagents present\n'
+}
+
+# check 6: gh auth status — readable (best-effort scope extract).
+preflight_check_gh_auth() {
+  if ! command -v gh >/dev/null 2>&1; then
+    printf 'FAIL\tgh CLI not installed (https://cli.github.com/)\n'
+    return 0
+  fi
+  local raw
+  raw="$(gh auth status 2>&1 || true)"
+  if ! printf -- '%s' "$raw" | grep -qE 'Logged in to'; then
+    printf 'FAIL\tgh auth status failed — run gh auth login\n'
+    return 0
+  fi
+  # Extract account + scopes one-liner. BSD grep + sed for portability.
+  local account scopes
+  account="$(printf -- '%s' "$raw" | sed -n 's/.*account \([A-Za-z0-9_-]\{1,\}\).*/\1/p' | head -1)"
+  scopes="$(printf -- '%s' "$raw" | sed -n 's/.*Token scopes: //p' | head -1)"
+  if [ -n "$account" ] && [ -n "$scopes" ]; then
+    printf 'PASS\t%s, scopes: %s\n' "$account" "$scopes"
+  elif [ -n "$account" ]; then
+    printf 'PASS\t%s\n' "$account"
+  else
+    printf 'PASS\tauthenticated\n'
+  fi
+}
+
+# check 7: claude CLI present on PATH.
+preflight_check_claude_on_path() {
+  local cpath
+  cpath="$(command -v claude 2>/dev/null || true)"
+  if [ -z "$cpath" ]; then
+    printf 'FAIL\tclaude CLI not on PATH (https://docs.anthropic.com/claude/docs/claude-code)\n'
+    return 0
+  fi
+  printf 'PASS\t%s\n' "$cpath"
+}
+
+# check 8: ~/.local/share/agent-fleet writable (where install.sh copies
+# the TCC-safe engine). The dir may not exist yet; we test by attempting
+# to mkdir + a tmpfile inside it, then removing the tmpfile only.
+preflight_check_share_writable() {
+  local share="$HOME/.local/share/agent-fleet"
+  if [ ! -d "$share" ]; then
+    if ! mkdir -p "$share" 2>/dev/null; then
+      printf 'FAIL\tcannot create %s (parent unwritable?)\n' "$share"
+      return 0
+    fi
+  fi
+  local probe="$share/.preflight-probe.$$"
+  if : > "$probe" 2>/dev/null; then
+    rm -f "$probe"
+    printf 'PASS\t%s\n' "$share"
+  else
+    printf 'FAIL\t%s not writable\n' "$share"
+  fi
+}
+
+# check 9: launchd namespace not already claimed by ANOTHER slug. We look
+# for any loaded label of the form `<ns>.agent-{ship,groom,review,eng}`
+# via read-only `launchctl print` against gui/$UID. If any of those four
+# resolve AND the candidate has not yet been installed (no manifest in
+# the installed copy with the same SLUG), the namespace is claimed by
+# someone else.
+preflight_check_launchd_namespace() {
+  local ns="$1" slug="$2"
+  if [ -z "$ns" ]; then
+    printf 'WARN\tNAMESPACE unset — skipped\n'
+    return 0
+  fi
+  local uid="${UID:-$(id -u)}"
+  local domain="gui/$uid"
+  local job conflict=""
+  for job in ship groom review eng; do
+    if launchctl print "$domain/$ns.agent-$job" >/dev/null 2>&1; then
+      conflict="$conflict $ns.agent-$job"
+    fi
+  done
+  if [ -z "$conflict" ]; then
+    printf 'PASS\tno existing %s.* labels\n' "$ns"
+    return 0
+  fi
+  # Determine whether the conflict is THIS slug (already-installed, fine)
+  # or ANOTHER slug. We check the installed manifest tree for a matching
+  # SLUG with the same NAMESPACE.
+  local installed_slug=""
+  local m
+  for m in "$HOME/.local/share/agent-fleet/projects/"*/agents.config.sh; do
+    [ -f "$m" ] || continue
+    # shellcheck disable=SC1090
+    local m_ns m_slug
+    m_ns="$( ( source "$m" 2>/dev/null; printf -- '%s' "${NAMESPACE:-}" ) )"
+    m_slug="$( ( source "$m" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )"
+    if [ "$m_ns" = "$ns" ]; then
+      installed_slug="$m_slug"
+      break
+    fi
+  done
+  if [ -n "$installed_slug" ] && [ "$installed_slug" = "$slug" ]; then
+    printf 'WARN\t%s.* already loaded for this slug (re-install will refresh)\n' "$ns"
+    return 0
+  fi
+  local other="${installed_slug:-another project}"
+  printf 'FAIL\tlaunchd namespace %s.* already claimed by %s\n' "$ns" "$other"
+}
+
+# check 10: SELF_CANCEL is at least 7 days in the future. WARN < 7d
+# (preflight is meant for NEW projects; the operator likely set
+# SELF_CANCEL too tight). FAIL if expired (would make ship_paused fire
+# on first run). PASS otherwise. Reuses the top-of-file `days_until`.
+preflight_check_self_cancel_horizon() {
+  local sc="$1"
+  if [ -z "$sc" ]; then
+    printf 'FAIL\tSELF_CANCEL unset — agents will refuse to run\n'
+    return 0
+  fi
+  local days
+  days="$(days_until "$sc")"
+  case "$days" in
+    ''|*[!0-9-]*) printf 'FAIL\tSELF_CANCEL=%s does not parse as YYYYMMDD\n' "$sc"; return 0 ;;
+  esac
+  if [ "$days" -lt 0 ]; then
+    printf 'FAIL\tSELF_CANCEL=%s expired %sd ago\n' "$sc" "${days#-}"
+    return 0
+  fi
+  if [ "$days" -lt 7 ]; then
+    printf 'WARN\tSELF_CANCEL=%s — only %sd; consider 30d+ for a new project\n' "$sc" "$days"
+    return 0
+  fi
+  printf 'PASS\tSELF_CANCEL=%s\n' "$sc"
+}
+
+# Visible width of a UTF-8 string — counts code points, not bytes, so the
+# `§` in "AGENTS.md § Agent parameters:" pads correctly across locales.
+# Forces LC_ALL=C inside the function so `${#s}` returns BYTE count
+# regardless of the caller's LANG, then walks the byte stream and counts:
+#   - 0x00-0x7F (ASCII): one display column
+#   - 0xC0-0xFF (UTF-8 lead byte): one display column
+#   - 0x80-0xBF (UTF-8 continuation byte): zero (already counted by lead)
+# Cheap; good enough for the kit's ASCII + a-few-punct label set.
+preflight_visible_width() {
+  # Bash 3.2 caches its locale-sensitive operations at startup, so flipping
+  # LC_ALL=C mid-script does not always flip `${#s}` from char-count to
+  # byte-count — under en_US.UTF-8 the loop sees ONE character "§" with
+  # code 167 (the trailing continuation byte) and misses the +1 entirely.
+  # Side-step the locale dance: take the byte count via `wc -c`, then
+  # subtract the UTF-8 continuation-byte count (0x80..0xBF) via awk under
+  # LC_ALL=C so the substring extraction is guaranteed byte-mode.
+  local s="${1-}" total cont
+  total="$(printf -- '%s' "$s" | LC_ALL=C wc -c | tr -d ' ')"
+  cont="$(printf -- '%s' "$s" | LC_ALL=C awk '
+    BEGIN {
+      for (k=0; k<256; k++) ord[sprintf("%c", k)] = k
+      n = 0
+    }
+    {
+      for (i=1; i<=length($0); i++) {
+        v = ord[substr($0, i, 1)]
+        if (v >= 128 && v < 192) n++
+      }
+    }
+    END { print n+0 }
+  ')"
+  printf '%d' "$(( total - cont ))"
+}
+
+# Pad $1 to display width $2 with trailing spaces. Used instead of
+# `printf %-Ns` because that pads on BYTE length, which over-counts
+# multi-byte chars like the section sign §.
+preflight_pad_right() {
+  local s="$1" target="$2" cur pad
+  cur="$(preflight_visible_width "$s")"
+  pad=$(( target - cur ))
+  if [ "$pad" -lt 0 ]; then pad=0; fi
+  printf -- '%s' "$s"
+  if [ "$pad" -gt 0 ]; then
+    printf -- '%*s' "$pad" ""
+  fi
+}
+
+# Human renderer. Reads a stream of `LABEL|STATUS|DETAIL` lines on stdin
+# and emits the table + verdict + next-line. Returns exit code via stdout
+# `__PREFLIGHT_EXIT__<TAB>N` sentinel so the dispatcher can act.
+preflight_render_text() {
+  local repo="$1"
+  printf -- 'fleet preflight: dry-adopting %s …\n\n' "$repo"
+  local pass=0 warn=0 fail=0
+  local label status detail padded
+  while IFS='|' read -r label status detail; do
+    [ -z "$label" ] && continue
+    case "$status" in
+      PASS) pass=$(( pass + 1 )) ;;
+      WARN) warn=$(( warn + 1 )) ;;
+      FAIL) fail=$(( fail + 1 )) ;;
+    esac
+    padded="$(preflight_pad_right "  $label" 40)"
+    if [ -n "$detail" ]; then
+      printf -- '%s%s  (%s)\n' "$padded" "$status" "$detail"
+    else
+      printf -- '%s%s\n' "$padded" "$status"
+    fi
+  done
+  printf -- '\n'
+  local verdict_msg
+  if [ "$fail" -gt 0 ]; then
+    verdict_msg="DO NOT install yet."
+  else
+    verdict_msg="safe to install."
+  fi
+  printf -- 'verdict: %s PASS, %s WARN, %s FAIL — %s\n' "$pass" "$warn" "$fail" "$verdict_msg"
+  printf -- 'next:   bash lib/install.sh %s\n' "$repo"
+  if [ "$fail" -gt 0 ]; then
+    printf '__PREFLIGHT_EXIT__\t1\n'
+  else
+    printf '__PREFLIGHT_EXIT__\t0\n'
+  fi
+}
+
+# JSON renderer. Reads same stream and emits one JSON object per row
+# (NDJSON-style — same shape as fleet inbox --json / atlas --json) plus
+# a final summary row. Per LESSONS 2026-06-03 the escape is UTF-8-safe.
+preflight_render_json() {
+  local pass=0 warn=0 fail=0
+  local label status detail
+  while IFS='|' read -r label status detail; do
+    [ -z "$label" ] && continue
+    case "$status" in
+      PASS) pass=$(( pass + 1 )) ;;
+      WARN) warn=$(( warn + 1 )) ;;
+      FAIL) fail=$(( fail + 1 )) ;;
+    esac
+    printf -- '{"check":"%s","status":"%s","detail":"%s"}\n' \
+      "$(preflight_json_escape "$label")" \
+      "$(preflight_json_escape "$status")" \
+      "$(preflight_json_escape "$detail")"
+  done
+  local verdict
+  if [ "$fail" -gt 0 ]; then verdict="do_not_install"; else verdict="safe"; fi
+  printf -- '{"summary":true,"pass":%s,"warn":%s,"fail":%s,"verdict":"%s"}\n' \
+    "$pass" "$warn" "$fail" "$verdict"
+  if [ "$fail" -gt 0 ]; then
+    printf '__PREFLIGHT_EXIT__\t1\n'
+  else
+    printf '__PREFLIGHT_EXIT__\t0\n'
+  fi
+}
+
+preflight() {
+  shift  # drop the leading "preflight"
+  local want_json=0 repo_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet preflight — dry-adopt a candidate project before running install.sh.
+
+Usage:
+  fleet preflight <repo-path>          print 10 PASS/WARN/FAIL rows + verdict
+  fleet preflight --json <repo-path>   one JSON object per row + summary row
+  fleet preflight --help               this banner
+
+Read-only by definition: never writes a file under ~/.local/share/agent-fleet,
+~/Library/LaunchAgents, or ~/.cache/<slug>-agent; never calls a launchctl
+mutation verb. Exit codes: 0 = zero FAILs, 1 = at least one FAIL, 2 = usage.
+USAGE
+        exit 0 ;;
+      --) shift; repo_arg="${1:-}"; shift || true; break ;;
+      -*) echo "fleet preflight: unknown flag '$1'" >&2; exit 2 ;;
+      *)
+        if [ -z "$repo_arg" ]; then repo_arg="$1"; shift
+        else echo "fleet preflight: unexpected extra argument '$1'" >&2; exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$repo_arg" ]; then
+    echo "fleet preflight: missing <repo-path>" >&2
+    echo "usage: fleet preflight [--json] <repo-path>" >&2
+    exit 2
+  fi
+  if [ ! -d "$repo_arg" ]; then
+    printf -- 'fleet preflight: no such directory %s\n' "$repo_arg" >&2
+    exit 2
+  fi
+
+  local proj_dir; proj_dir="$( cd "$repo_arg" && pwd )"
+
+  # Resolve manifest values once (eng_enabled, namespace, slug, sc) so
+  # downstream checks can reuse them without re-sourcing.
+  local slug="" ns="" sc="" eng="0"
+  if [ -f "$proj_dir/agents.config.sh" ]; then
+    # shellcheck disable=SC1090
+    local probe
+    probe="$(
+      ( source "$proj_dir/agents.config.sh" 2>/dev/null
+        printf 'SLUG=%s\n' "${SLUG:-}"
+        printf 'NAMESPACE=%s\n' "${NAMESPACE:-}"
+        printf 'SELF_CANCEL=%s\n' "${SELF_CANCEL:-}"
+        printf 'ENG_ENABLED=%s\n' "${ENG_ENABLED:-0}"
+      ) 2>/dev/null
+    )"
+    slug="$(printf -- '%s' "$probe" | sed -n 's/^SLUG=//p')"
+    ns="$(printf -- '%s' "$probe" | sed -n 's/^NAMESPACE=//p')"
+    sc="$(printf -- '%s' "$probe" | sed -n 's/^SELF_CANCEL=//p')"
+    eng="$(printf -- '%s' "$probe" | sed -n 's/^ENG_ENABLED=//p')"
+  fi
+
+  # Build the row stream. Each check emits `STATUS<TAB>DETAIL`; we prepend
+  # the human label to form `LABEL|STATUS|DETAIL`. Stable order, ten rows.
+  local stream=""
+  local row label out s d
+  # The tilde in "~/.local/share/agent-fleet writable:" is a LITERAL label
+  # for the operator, not a path; the actual writability check resolves
+  # `$HOME/.local/share/agent-fleet` inside `preflight_check_share_writable`.
+  # shellcheck disable=SC2088  # tilde is part of a display label, not a path
+  for spec in \
+    "manifest (agents.config.sh):|preflight_check_manifest $(printf '%q' "$proj_dir")" \
+    "AGENTS.md § Agent parameters:|preflight_check_agents_md_section $(printf '%q' "$proj_dir")" \
+    "backlog scaffolding:|preflight_check_backlog_scaffolding $(printf '%q' "$proj_dir")" \
+    "backlog validator:|preflight_check_backlog_validator $(printf '%q' "$proj_dir")" \
+    "subagents under .claude/agents/:|preflight_check_subagents $(printf '%q' "$proj_dir") $(printf '%q' "$eng")" \
+    "gh auth status:|preflight_check_gh_auth" \
+    "claude CLI on PATH:|preflight_check_claude_on_path" \
+    "~/.local/share/agent-fleet writable:|preflight_check_share_writable" \
+    "launchd namespace free:|preflight_check_launchd_namespace $(printf '%q' "$ns") $(printf '%q' "$slug")" \
+    "SELF_CANCEL >= today + 7d:|preflight_check_self_cancel_horizon $(printf '%q' "$sc")" \
+  ; do
+    label="${spec%%|*}"
+    row="${spec#*|}"
+    # Run the helper; capture STATUS<TAB>DETAIL.
+    out="$(eval "$row")"
+    # Split on the first tab without invoking awk -v (LESSONS 2026-06-01).
+    s="${out%%	*}"
+    d="${out#*	}"
+    [ "$s" = "$d" ] && d=""
+    stream+="$label|$s|$d"$'\n'
+  done
+
+  # Renderer prints + emits `__PREFLIGHT_EXIT__<TAB>N` sentinel; we strip
+  # the sentinel and propagate the exit code. Per LESSONS 2026-06-01,
+  # every code path ends in an explicit exit.
+  local rendered exit_code
+  if [ "$want_json" = "1" ]; then
+    rendered="$(printf -- '%s' "$stream" | preflight_render_json)"
+  else
+    rendered="$(printf -- '%s' "$stream" | preflight_render_text "$proj_dir")"
+  fi
+  exit_code="$(printf -- '%s' "$rendered" | awk -F'\t' '/^__PREFLIGHT_EXIT__/ { print $2 }')"
+  printf -- '%s' "$rendered" | grep -v '^__PREFLIGHT_EXIT__'
+  case "$exit_code" in
+    0) exit 0 ;;
+    1) exit 1 ;;
+    *) exit 1 ;;
+  esac
+}
+
+if [ "$CMD" = "preflight" ]; then
+  preflight "$@"
 fi
 
 # Hand-rolled JSON string escape — same intent as common.sh _json_escape but

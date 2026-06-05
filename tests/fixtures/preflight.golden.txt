@@ -1,0 +1,15 @@
+fleet preflight: dry-adopting __REPO__ …
+
+  manifest (agents.config.sh):          PASS  (SLUG=widgets, NAMESPACE=com.widgets)
+  AGENTS.md § Agent parameters:         PASS  (gating section present)
+  backlog scaffolding:                  PASS  (docs/backlog/README.md, 3 tickets)
+  backlog validator:                    PASS  (scripts/check-backlog.mjs exists)
+  subagents under .claude/agents/:      WARN  (eng-dev.md missing — ENG_ENABLED=0 in manifest, OK)
+  gh auth status:                       PASS  (mutaaf, scopes: 'repo', 'read:org')
+  claude CLI on PATH:                   PASS  (__CLAUDE__)
+  ~/.local/share/agent-fleet writable:  PASS  (__SHARE__)
+  launchd namespace free:               PASS  (no existing com.widgets.* labels)
+  SELF_CANCEL >= today + 7d:            PASS  (SELF_CANCEL=20990101)
+
+verdict: 9 PASS, 1 WARN, 0 FAIL — safe to install.
+next:   bash lib/install.sh __REPO__

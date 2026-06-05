@@ -1,7 +1,7 @@
 ---
 id: 0032
 title: fleet preflight <repo> dry-adopts a project and prints what install.sh would do
-status: groomed
+status: in-progress
 priority: P1
 area: docs
 created: 2026-06-05
@@ -304,7 +304,7 @@ doesn't have to re-discover the architecture.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD — branch `feat/0032-...` opened
+- 2026-06-05 — branch `feat/0032-fleet-preflight-dry-adoption-check` opened
 - YYYY-MM-DD — failing test added in `tests/preflight.sh`
 - YYYY-MM-DD — PR #N opened, CI [state]
 - YYYY-MM-DD — merged to main
