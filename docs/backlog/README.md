@@ -50,7 +50,7 @@ ones, `review` grades them.
 | 0029 | fleet provenance <pr> reconstructs the prompts SHA, lessons, and heal patterns behind a shipped PR | P1 | shipped | governance |
 | 0030 | fleet resume <slug> unpauses a ship-paused project with one confirmed command | P1 | shipped | safety |
 | 0031 | fleet atlas prints the fleet-wide failure-mode taxonomy with per-pattern frequency | P2 | shipped | observability |
-| 0032 | fleet preflight <repo> dry-adopts a project and prints what install.sh would do | P1 | groomed | docs |
+| 0032 | fleet preflight <repo> dry-adopts a project and prints what install.sh would do | P1 | in-progress | docs |
 | 0033 | QUIET_HOURS manifest knob suppresses ship/groom/eng during operator-declared windows | P1 | groomed | governance |
 | 0034 | fleet replay --batch <since> grades current prompts against the last N merged PRs | P2 | groomed | governance |
 | 0035 | fleet prompts-revert pins the kit's prompts/ tree back to a known-good SHA | P2 | groomed | governance |
