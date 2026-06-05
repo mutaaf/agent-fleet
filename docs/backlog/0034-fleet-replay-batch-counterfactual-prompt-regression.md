@@ -1,7 +1,7 @@
 ---
 id: 0034
 title: fleet replay --batch <since> grades current prompts against the last N merged PRs
-status: groomed
+status: in-progress
 priority: P2
 area: governance
 created: 2026-06-05
@@ -333,7 +333,7 @@ doesn't have to re-discover the architecture.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD — branch `feat/0034-...` opened
+- 2026-06-05 — branch `feat/0034-replay-batch-counterfactual-prompt-regression` opened
 - YYYY-MM-DD — failing test added in `tests/replay-batch.sh`
 - YYYY-MM-DD — PR #N opened, CI [state]
 - YYYY-MM-DD — merged to main
