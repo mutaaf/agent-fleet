@@ -4898,8 +4898,483 @@ replay_append_runs() {
   fi
 }
 
+# --- ticket 0034: counterfactual prompt regression over the last N PRs ----
+#
+# `replay --batch` enumerates the slug's agent-merged + closed-with-changes-
+# requested PRs in the --since window, replays each through the kit's
+# current prompts in dry-run, and renders a matrix of past vs. dry-run
+# verdicts. Exit code encodes the % delta: 0 OK (<10%), 1 WARN (<30%),
+# 2 FAIL (≥30%). Pure consumer — no new event types, no signature
+# changes to common.sh, no prompts/ edits.
+#
+# LESSONS we explicitly defend against here:
+#   2026-05-28 — every printf of a title/branch/slug uses `printf -- '%s'`
+#                so a value beginning with `-` is not treated as a flag.
+#   2026-05-30 — any grep -F over a value that might start with `-` uses
+#                the POSIX `--` end-of-options marker.
+#   2026-06-01 — rationale values (which CAN be multi-line) go through a
+#                tmp file, never `awk -v rationale=`. The JSON renderer
+#                escapes them via provenance_json_escape (the UTF-8-safe
+#                per-byte path from ticket 0029; LESSONS 2026-06-03).
+#   2026-06-01 — counts use `awk ... END { print n+0 }` instead of
+#                `grep -c file || echo 0` (which double-prints on zero).
+#   2026-06-01 — every code path in this function ends with explicit
+#                exit 0/1/2 so a fall-through never hits the default
+#                fleet status block.
+
+# UTF-8-safe JSON escaper. Byte-identical clone of provenance_json_escape
+# (defined further down in the file). We can't call that function from
+# here because the dispatcher `if [ "$CMD" = "replay" ]; then replay
+# "$@"; fi` block at the end of the replay() definition fires BEFORE
+# provenance_json_escape is parsed — bash parses top-to-bottom and the
+# dispatcher runs as a top-level statement. Per LESSONS 2026-06-03 the
+# `code -ge 0` guard defuses the sign-extended UTF-8 high-byte trap.
+replay_batch_json_escape() {
+  local s="${1-}" out="" i ch code
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *)
+        printf -v code '%d' "'$ch"
+        if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+          printf -v out '%s\\u%04x' "$out" "$code"
+        else
+          out+="$ch"
+        fi
+        ;;
+    esac
+  done
+  printf -- '%s' "$out"
+}
+
+# Parse one PR record out of the `gh pr list --json` payload. The JSON
+# is an array of flat objects with `number, title, headRefName, state,
+# closedAt, mergedAt`. We split on `},{` boundaries (safe — no nested
+# objects in this projection) and emit one TSV line per PR:
+#   number<TAB>title<TAB>headRefName<TAB>past
+# where `past` is `merged` (state=MERGED) or `rejected` (state=CLOSED
+# with mergedAt=null — i.e. closed without merging, which in practice
+# means a request-changes review the operator did not override).
+replay_batch_parse_list() {
+  local list_json="$1"
+  # Empty or `[]` → emit nothing.
+  case "$list_json" in
+    ""|"[]"|"[ ]") return 0 ;;
+  esac
+  printf '%s' "$list_json" \
+    | tr -d '\n' \
+    | sed -E 's/^[[:space:]]*\[[[:space:]]*//; s/[[:space:]]*\][[:space:]]*$//; s/\}[[:space:]]*,[[:space:]]*\{/}@@PRSPLIT@@{/g' \
+    | awk 'BEGIN{RS="@@PRSPLIT@@"} { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print }' \
+    | while IFS= read -r obj; do
+        [ -z "$obj" ] && continue
+        local n t h state merged_at past
+        n="$(printf '%s' "$obj" | sed -nE 's/.*"number"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -1)"
+        t="$(printf '%s' "$obj" | sed -nE 's/.*"title"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)"
+        h="$(printf '%s' "$obj" | sed -nE 's/.*"headRefName"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)"
+        state="$(printf '%s' "$obj" | sed -nE 's/.*"state"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)"
+        merged_at="$(printf '%s' "$obj" | sed -nE 's/.*"mergedAt"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)"
+        [ -z "$n" ] && continue
+        if [ "$state" = "MERGED" ] || [ -n "$merged_at" ]; then
+          past="merged"
+        else
+          past="rejected"
+        fi
+        # Filter to agent branch prefixes only.
+        case "$h" in
+          feat/*|eng/*|chore/gtm-*) ;;
+          *) continue ;;
+        esac
+        printf '%s\t%s\t%s\t%s\n' "$n" "$t" "$h" "$past"
+      done
+}
+
+# Replay one PR through claude in dry-run and echo a single JSON line:
+#   {"pr":N,"title":"...","past":"merged|rejected","dry_run":"sign-off|reject",
+#    "delta":"=|!","rationale":"<first-200-chars>"}
+#
+# The function reuses the same prompt-compose + claude-call pattern as
+# the single-PR replay() body, but condenses it into one JSON-line emit
+# so the batch loop can accumulate without intermediate scratch files.
+#
+# Args: $1 phase, $2 checkout dir, $3 repo (owner/name for `gh pr view`),
+# $4 pr_number, $5 pr_title, $6 head_ref, $7 past (`merged`|`rejected`),
+# $8 cache_dir, $9 slug, $10 model.
+# Echoes ONE JSON line on stdout. Returns 0 on success, non-zero only
+# on a fatal error (claude exec failure); caller treats non-zero as a
+# skip and continues the loop.
+replay_one_pr_json_line() {
+  local phase="$1" checkout="$2" repo="$3"
+  local pr_number="$4" pr_title="$5" head_ref="$6" past="$7"
+  local cache_dir="$8" slug="$9" model="${10}"
+
+  # Pull PR body + mergedAt from gh pr view — fields the composed prompt
+  # uses to mirror the single-PR replay body's call shape.
+  local pr_view_json pr_body merged_at branch_tail ticket_id ticket_path
+  pr_view_json="$(gh pr view "$pr_number" \
+                    --repo "$repo" \
+                    --json number,title,headRefName,body,mergeCommit,mergedAt,files,state \
+                    2>/dev/null || true)"
+  pr_body="$(rollback_json_string "$pr_view_json" "body")"
+  merged_at="$(rollback_json_string "$pr_view_json" "mergedAt")"
+
+  branch_tail="$(replay_branch_tail "$head_ref")"
+  if [ -z "$branch_tail" ]; then
+    # Non-agent prefix slipped through — skip silently.
+    return 1
+  fi
+  ticket_id="${branch_tail%%-*}"
+  ticket_path=""
+  local cand
+  for cand in "$checkout/docs/backlog/${ticket_id}-"*.md; do
+    if [ -f "$cand" ]; then
+      ticket_path="$cand"
+      break
+    fi
+  done
+
+  local diff_path="$cache_dir/replay-batch-pr${pr_number}.diff"
+  if [ "$phase" = "review" ]; then
+    gh pr diff "$pr_number" --repo "$repo" > "$diff_path" 2>/dev/null || true
+  fi
+
+  local prompt_file claude_out_json
+  prompt_file="$(mktemp -t fleet-replay-batch-prompt.XXXXXX)"
+  claude_out_json="$(mktemp -t fleet-replay-batch-claude.XXXXXX)"
+  replay_compose_prompt \
+    "$phase" "$checkout" "$ticket_path" "$diff_path" \
+    "$pr_number" "$pr_title" "$head_ref" "$pr_body" "$merged_at" \
+    > "$prompt_file"
+
+  local ts_start ts_end claude_exit
+  ts_start="$(date -u +%FT%TZ)"
+  AGENT_DRY_RUN=1 claude \
+    --print \
+    --output-format json \
+    --dangerously-skip-permissions \
+    --model "$model" \
+    --allowedTools none \
+    < "$prompt_file" \
+    > "$claude_out_json" 2>/dev/null
+  claude_exit=$?
+  ts_end="$(date -u +%FT%TZ)"
+
+  local result_text=""
+  if command -v jq >/dev/null 2>&1 && jq -e . "$claude_out_json" >/dev/null 2>&1; then
+    result_text="$(jq -r '.result // empty' "$claude_out_json")"
+  else
+    result_text="$(cat "$claude_out_json")"
+  fi
+
+  # Append a runs.jsonl row per AC#5 (one row per replayed PR).
+  replay_append_runs \
+    "$cache_dir/runs.jsonl" "$claude_out_json" \
+    "$slug" "replay" "$ts_start" "$ts_end" "$model" "$claude_exit"
+
+  # Persist the rationale to a tmp file (per LESSONS 2026-06-01 — multi-
+  # line values must NEVER be passed through `awk -v`). The JSON
+  # rendering reads from disk and escapes via the UTF-8-safe per-byte
+  # path.
+  local rationale_file
+  rationale_file="$(mktemp -t fleet-replay-batch-rationale.XXXXXX)"
+  printf '%s' "$result_text" > "$rationale_file"
+
+  # Classify dry-run verdict.
+  local dry_run="unknown"
+  case "$phase" in
+    review)
+      if grep -qE '^VERDICT:[[:space:]]+sign-off' "$rationale_file"; then
+        dry_run="sign-off"
+      elif grep -qE '^VERDICT:[[:space:]]+request-changes' "$rationale_file"; then
+        dry_run="reject"
+      fi
+      ;;
+    ship)
+      if grep -qE '^ACTION:[[:space:]]+(ship|heal)' "$rationale_file"; then
+        dry_run="sign-off"
+      elif grep -qE '^ACTION:[[:space:]]+(wait|noop)' "$rationale_file"; then
+        dry_run="reject"
+      fi
+      ;;
+  esac
+
+  # Compute delta.
+  local delta="="
+  case "$past:$dry_run" in
+    merged:sign-off|rejected:reject)   delta="=" ;;
+    merged:reject|rejected:sign-off)   delta="!" ;;
+    *)                                  delta="!" ;;  # unknown verdict counts as a delta
+  esac
+
+  # Render the JSON line. First-200-chars of rationale via head -c (byte-
+  # accurate; no bash ${s:0:200} which would be locale-sensitive per
+  # LESSONS 2026-06-05).
+  local rationale_head
+  rationale_head="$(LC_ALL=C head -c 200 "$rationale_file")"
+  rm -f "$rationale_file" "$prompt_file" "$claude_out_json"
+
+  local title_esc rationale_esc
+  title_esc="$(replay_batch_json_escape "$pr_title")"
+  rationale_esc="$(replay_batch_json_escape "$rationale_head")"
+  # Use `printf '%s'` (no `--`) for the final assembled JSON line; the
+  # format string starts with a literal `{`, no leading dash trap.
+  printf '{"pr":%s,"title":"%s","past":"%s","dry_run":"%s","delta":"%s","rationale":"%s"}\n' \
+    "$pr_number" "$title_esc" "$past" "$dry_run" "$delta" "$rationale_esc"
+  return 0
+}
+
+# Render the matrix table per the User-lens example. Reads JSON lines on
+# stdin (one per PR plus optional trailing summary metadata via $@). We
+# do not pass any per-row JSON value through `awk -v` — the rationale
+# field stays in the line and is never extracted on the text path.
+replay_batch_render_text() {
+  local rows_file="$1" verdict="$2" replayed="$3" deltas="$4" window="$5"
+  local unchanged=$(( replayed - deltas ))
+  printf 'PR    TITLE                                              PAST      DRY-RUN   DELTA\n'
+  # Print one row per JSON line. Extract `pr`, `title`, `past`, `dry_run`,
+  # `delta` via sed regex — locked to the explicit field positions our
+  # renderer emits, so the parse is deterministic.
+  local line pr title past dry_run delta
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    pr="$(printf '%s' "$line" | sed -nE 's/.*"pr":([0-9]+).*/\1/p')"
+    title="$(printf '%s' "$line" | sed -nE 's/.*"title":"([^"]*)".*/\1/p')"
+    past="$(printf '%s' "$line" | sed -nE 's/.*"past":"([^"]*)".*/\1/p')"
+    dry_run="$(printf '%s' "$line" | sed -nE 's/.*"dry_run":"([^"]*)".*/\1/p')"
+    delta="$(printf '%s' "$line" | sed -nE 's/.*"delta":"([^"]*)".*/\1/p')"
+    # Truncate title to a fixed width for readability.
+    local title_trim="$title"
+    if [ "${#title_trim}" -gt 48 ]; then
+      title_trim="${title_trim:0:45}..."
+    fi
+    # `printf -- '%s'` per LESSONS 2026-05-28 (title may begin with `-`).
+    printf -- '#%-4s %-50s %-9s %-9s %s\n' "$pr" "$title_trim" "$past" "$dry_run" "$delta"
+  done < "$rows_file"
+  printf '\n'
+  printf 'summary: %d/%d unchanged, %d DELTA\n' "$unchanged" "$replayed" "$deltas"
+  local pct=0
+  if [ "$replayed" -gt 0 ]; then
+    pct=$(( deltas * 100 / replayed ))
+  fi
+  case "$verdict" in
+    OK)   printf 'verdict: OK — %d%% delta is within the noise floor.\n' "$pct" ;;
+    WARN) printf 'verdict: WARN — %d%% of past good PRs would now flip.\n' "$pct" ;;
+    FAIL) printf 'verdict: FAIL — %d%% of past good PRs would now flip.\n' "$pct" ;;
+  esac
+  # Suppress unused-var warning — window is part of the summary contract
+  # and consumed by the JSON renderer; the text path doesn't print it.
+  : "$window"
+}
+
+# Render the JSON output: one line per PR row + one summary object on the
+# trailing line. Reads pre-built per-PR JSON lines from $rows_file and
+# appends a summary object.
+replay_batch_render_json() {
+  local rows_file="$1" verdict="$2" replayed="$3" deltas="$4" window="$5"
+  cat "$rows_file"
+  printf '{"summary":true,"replayed":%d,"deltas":%d,"verdict":"%s","window":"%s"}\n' \
+    "$replayed" "$deltas" "$verdict" "$(replay_batch_json_escape "$window")"
+}
+
+# `replay_batch` — the dispatcher entrypoint. Owns arg parsing for the
+# batch path, the `gh pr list` enumeration, the per-PR loop, the matrix
+# render, and the OK/WARN/FAIL exit code. Mirrors the single-PR replay()
+# in style and reuses every existing helper.
+replay_batch() {
+  local slug_arg="" since="" limit=20 phase="review" want_json=0
+  local _saw_batch=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --batch)     _saw_batch=1; shift ;;
+      --since)     since="${2:-}"; shift 2 ;;
+      --since=*)   since="${1#--since=}"; shift ;;
+      --limit)     limit="${2:-20}"; shift 2 ;;
+      --limit=*)   limit="${1#--limit=}"; shift ;;
+      --phase)     phase="${2:-review}"; shift 2 ;;
+      --phase=*)   phase="${1#--phase=}"; shift ;;
+      --json)      want_json=1; shift ;;
+      --dry)       shift ;;
+      --) shift ;;
+      -*) printf 'replay --batch: unknown flag %s\n' "$1" >&2; exit 2 ;;
+      *)
+        if [ -z "$slug_arg" ]; then slug_arg="$1"; shift
+        else printf 'replay --batch: unexpected extra argument %s\n' "$1" >&2; exit 2
+        fi ;;
+    esac
+  done
+
+  : "$_saw_batch"  # quiet the linter; the pre-pass already guaranteed it
+
+  if [ -z "$slug_arg" ] || [ -z "$since" ]; then
+    echo "replay --batch: missing <slug> or --since <Nh|Nd>" >&2
+    echo "usage: fleet replay <slug> --batch --since <Nh|Nd> [--limit N] [--phase review|ship] [--json]" >&2
+    exit 2
+  fi
+  case "$phase" in
+    review|ship) ;;
+    *)
+      printf 'replay --batch: --phase must be review or ship (got %s)\n' "$phase" >&2
+      exit 2 ;;
+  esac
+
+  # --since via the shared digest_parse_since helper.
+  local window_seconds
+  if ! window_seconds="$(digest_parse_since "$since" 2>/dev/null)"; then
+    printf -- 'replay --batch: invalid --since "%s" (use Nh or Nd)\n' "$since" >&2
+    exit 2
+  fi
+  : "$window_seconds"
+
+  # Clamp --limit. Default 20; max 50 (per AC#4).
+  case "$limit" in
+    ''|*[!0-9]*) limit=20 ;;
+  esac
+  if [ "$limit" -lt 1 ]; then limit=1; fi
+  if [ "$limit" -gt 50 ]; then limit=50; fi
+
+  # Resolve slug → manifest → REPO_URL + CACHE_DIR.
+  local manifest
+  manifest="$(replay_resolve_manifest "$slug_arg")"
+  if [ -z "$manifest" ]; then
+    printf -- 'replay --batch: no project with SLUG=%s found\n' "$slug_arg" >&2
+    exit 2
+  fi
+  local slug repo_url repo cache_dir model
+  # shellcheck disable=SC1090
+  eval "$(
+    source "$manifest"
+    echo "slug='${SLUG:-}'"
+    echo "repo_url='${REPO_URL:-}'"
+    echo "model='${MODEL:-claude-opus-4-7}'"
+  )"
+  repo="$(echo "$repo_url" | sed -E 's#https?://github.com/##; s#\.git$##')"
+  cache_dir="$HOME/.cache/${slug}-agent"
+  mkdir -p "$cache_dir"
+
+  # ----------------------------------------------------------------
+  # Enumerate candidate PRs. We ask `gh pr list` for ALL state in
+  # one shot and let replay_batch_parse_list filter to merged +
+  # closed-unmerged on agent prefixes. Limit×2 keeps the query
+  # within budget even when half the window is rejected PRs.
+  # ----------------------------------------------------------------
+  local list_json fetch_limit=$(( limit * 2 ))
+  if [ "$fetch_limit" -lt 4 ]; then fetch_limit=4; fi
+  list_json="$(gh pr list \
+                 --repo "$repo" \
+                 --state all \
+                 --base main \
+                 --limit "$fetch_limit" \
+                 --search "head:feat/ OR head:chore/gtm- OR head:eng/" \
+                 --json number,title,headRefName,state,closedAt,mergedAt \
+                 2>/dev/null || true)"
+
+  # Parse into a TSV stream of (pr<TAB>title<TAB>head<TAB>past).
+  local prs_tsv
+  prs_tsv="$(mktemp -t fleet-replay-batch-prs.XXXXXX)"
+  replay_batch_parse_list "$list_json" > "$prs_tsv"
+  local n_prs
+  n_prs="$(awk 'END { print NR+0 }' "$prs_tsv")"
+
+  if [ "$n_prs" -eq 0 ]; then
+    rm -f "$prs_tsv"
+    printf -- 'replay --batch: no PRs matched in the last %s for slug=%s\n' "$since" "$slug" >&2
+    exit 0
+  fi
+
+  # Cap to --limit (most-recent first; gh pr list already returns
+  # closedAt-desc when --search includes no order hint).
+  if [ "$n_prs" -gt "$limit" ]; then
+    head -n "$limit" "$prs_tsv" > "$prs_tsv.cap" && mv "$prs_tsv.cap" "$prs_tsv"
+    n_prs="$limit"
+  fi
+
+  # Fresh checkout once (shared across all per-PR replays — this
+  # mirrors the single-PR replay() pattern but amortizes the clone).
+  local checkout="$cache_dir/replay-batch-checkout"
+  rm -rf "$checkout"
+  mkdir -p "$(dirname "$checkout")"
+  if ! git clone --depth 1 "$repo_url" "$checkout" >/dev/null 2>&1; then
+    rm -f "$prs_tsv"
+    printf -- 'replay --batch: git clone %s failed\n' "$repo_url" >&2
+    exit 1
+  fi
+
+  # Accumulate per-PR JSON lines.
+  local rows_file
+  rows_file="$(mktemp -t fleet-replay-batch-rows.XXXXXX)"
+  : > "$rows_file"
+  local line pr title head past
+  while IFS=$'\t' read -r pr title head past; do
+    [ -z "$pr" ] && continue
+    line="$(replay_one_pr_json_line \
+              "$phase" "$checkout" "$repo" \
+              "$pr" "$title" "$head" "$past" \
+              "$cache_dir" "$slug" "$model" || true)"
+    if [ -n "$line" ]; then
+      printf '%s\n' "$line" >> "$rows_file"
+    fi
+  done < "$prs_tsv"
+  rm -f "$prs_tsv"
+
+  # Count deltas (LESSONS 2026-06-01: awk for counts, never `grep -c
+  # … || echo 0`).
+  local replayed deltas
+  replayed="$(awk 'END { print NR+0 }' "$rows_file")"
+  deltas="$(awk '/"delta":"!"/ { n++ } END { print n+0 }' "$rows_file")"
+
+  # Verdict.
+  local verdict pct=0
+  if [ "$replayed" -gt 0 ]; then
+    pct=$(( deltas * 100 / replayed ))
+  fi
+  if [ "$pct" -ge 30 ]; then
+    verdict="FAIL"
+  elif [ "$pct" -ge 10 ]; then
+    verdict="WARN"
+  else
+    verdict="OK"
+  fi
+
+  # Render.
+  if [ "$want_json" = "1" ]; then
+    replay_batch_render_json "$rows_file" "$verdict" "$replayed" "$deltas" "$since"
+  else
+    replay_batch_render_text "$rows_file" "$verdict" "$replayed" "$deltas" "$since"
+  fi
+  rm -f "$rows_file"
+
+  # OK / WARN / FAIL → 0 / 1 / 2.
+  case "$verdict" in
+    OK)   exit 0 ;;
+    WARN) exit 1 ;;
+    FAIL) exit 2 ;;
+  esac
+  exit 0  # unreachable; defensive per LESSONS 2026-06-01.
+}
+
 replay() {
   shift  # drop the leading "replay"
+  # ----------------------------------------------------------------
+  # Ticket 0034: `--batch` pre-pass. Scan the remaining args; if
+  # `--batch` is present, route to replay_batch() and return — the
+  # single-PR code path below is intentionally untouched so its
+  # byte-identical regression (tests/replay.sh) keeps passing.
+  # ----------------------------------------------------------------
+  local _arg
+  for _arg in "$@"; do
+    if [ "$_arg" = "--batch" ]; then
+      # replay_batch always exits; defensive return 0 below is unreachable
+      # but satisfies shellcheck SC2319 (avoids reading $? after a test).
+      replay_batch "$@"
+      return 0
+    fi
+  done
   local slug_arg="" pr_number="" phase="review" out_path="" want_rc_ok=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -4920,13 +5395,18 @@ Usage:
   fleet replay <slug> --pr <N> --phase ship             phase=ship
   fleet replay <slug> --pr <N> --request-changes-ok     succeed iff verdict is request-changes
   fleet replay <slug> --pr <N> --out FILE               write the full claude result to FILE
+  fleet replay <slug> --batch --since <Nh|Nd>           grade current prompts against the last N merged PRs (ticket 0034)
+  fleet replay <slug> --batch --since <Nh|Nd> --limit N cap the number of replayed PRs (default 20, max 50)
+  fleet replay <slug> --batch --since <Nh|Nd> --json    machine-readable JSON-Lines output (consumed by fleet prompts-score)
 
 Composes a prompt input from the PR's metadata + diff (review) or just
 metadata + ticket (ship), the AGENTS.md and docs/LESSONS.md from a fresh
 kit checkout, then invokes claude with --allowedTools none so no
 side-effects land. Prints the parsed verdict line (VERDICT: ... for
 review, ACTION: ... for ship); exit 0 on success, 1 on a missing/wrong
-verdict, 2 on usage error.
+verdict, 2 on usage error. --batch wraps the same primitive in a loop
+over agent-merged PRs in the window and exits 0/1/2 by OK/WARN/FAIL
+delta thresholds (<10% / <30% / ≥30%).
 USAGE
         exit 0 ;;
       --) shift ;;

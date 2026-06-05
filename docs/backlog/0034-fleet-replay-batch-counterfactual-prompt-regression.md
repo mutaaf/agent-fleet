@@ -334,6 +334,12 @@ doesn't have to re-discover the architecture.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-05 — branch `feat/0034-replay-batch-counterfactual-prompt-regression` opened
-- YYYY-MM-DD — failing test added in `tests/replay-batch.sh`
+- 2026-06-05 — failing test added in `tests/replay-batch.sh` (11 ACs); confirmed
+  failing for the right reason (`unknown flag '--batch'`) before any impl.
+- 2026-06-05 — impl: `replay_batch`, `replay_one_pr_json_line`, `replay_batch_
+  render_text/json`, `replay_batch_parse_list`, `replay_batch_json_escape`
+  added in `bin/fleet`; `replay()` got a `--batch` pre-pass that routes
+  early. Single-PR path is byte-identical (regression-tested via
+  `tests/replay.sh`). Local gate + both tests green.
 - YYYY-MM-DD — PR #N opened, CI [state]
 - YYYY-MM-DD — merged to main
