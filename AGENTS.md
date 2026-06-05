@@ -216,6 +216,30 @@ postcard.
     `FLEET_TRAINEE_REMAINING` value at emission time. Ticket 0014.
     Operator graduates the project by merging PRs until the cap is met
     — there is no manual reset.
+  - `quiet_hours_skip {phase, window, now_local}` — emitted by
+    `lib/ship.sh`, `lib/groom.sh`, and `lib/eng.sh` (ticket 0033) on
+    every fire that lands INSIDE the operator-declared `QUIET_HOURS`
+    window in the project's `agents.config.sh`. `phase` is the runner
+    that suppressed (`ship` | `groom` | `eng`); `window` is the raw
+    manifest value (`HH:MM-HH:MM` local time); `now_local` is the
+    runner's wall-clock at decision time as ISO8601 with offset
+    (e.g. `2026-06-06T02:37:09-0700`). The runner emits exactly one
+    event per process (guarded by `FLEET_QUIET_HOURS_EMITTED`, same
+    shape as `FLEET_PROMPTS_DRIFT_EMITTED` from ticket 0005) and
+    `exit 0`s immediately after — no claude, no gh, no git, no
+    `heal:` counter advance. `review` is exempt by design (it is a
+    poller, not a worker, and continuing to grade in-flight PRs
+    overnight is a feature, not a bug) so this event NEVER carries
+    `phase=review`. `FLEET_KICKSTART=1` and unset `FLEET_PHASE`
+    paths are also exempt — an explicit operator-initiated
+    `bin/fleet kickstart` bypasses the schedule by design. Invalid
+    manifest values (out-of-range hours, missing colons, partial
+    windows) are operator config errors, not telemetry truth, so
+    they print a one-time stderr warning AND DO NOT emit this
+    event. Mirrors the shape of `lesson_promoted` (0028) and
+    `ship_resumed` (0030): one operator-declared policy, one typed
+    event, no transcript scraping required to reconstruct why a
+    run no-op'd at 2am.
   - `ship_resumed {source, paused_for, reason, forced}` — emitted by
     `bin/fleet resume <slug>` (ticket 0030) on every successful resume
     of a previously `ship_paused` project. `source` is the slug whose

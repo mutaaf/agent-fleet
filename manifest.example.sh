@@ -37,6 +37,16 @@ SELF_CANCEL="20260628"
 # from the first PR (current behavior). Ticket 0014.
 # TRAINEE_PR_COUNT=5
 
+# --- quiet hours ---
+# Local time (the runner reads the OS TZ). Workers (ship/groom/eng) no-op
+# during this window — one `quiet_hours_skip` event is emitted, then exit 0;
+# `review` keeps grading PRs. Format: HH:MM-HH:MM (24h, zero-padded). A
+# window that crosses midnight is supported (e.g. "22:00-07:00" covers
+# 22:00..23:59 plus 00:00..06:59). Set empty (the default) to disable.
+# Invalid values (out-of-range hours, missing colons) are treated as if
+# empty and a one-time stderr warning is printed. Ticket 0033.
+# QUIET_HOURS=""
+
 # --- cadence --------------------------------------------------------------
 SHIP_MINUTE=41              # ship fires at this minute
 SHIP_HOURS=""               # OPTIONAL. When set (e.g. "0 6 12 18"), ship fires only
