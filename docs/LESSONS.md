@@ -257,3 +257,32 @@ byte-mode, unlike bash). The result is locale-stable across both
 "visible width" computation in this kit's macOS-targeted shell code
 MUST go through `wc -c` + `awk` (or python3), NOT bash's `${#s}` /
 `${s:i:1}`, when the input might contain multi-byte UTF-8.
+
+## 2026-06-05 — an `export` inside `$(...)` never leaks to the parent shell; helpers that own an at-most-once guard MUST be called without command substitution
+
+While shipping ticket 0033's `fleet_check_quiet_hours`, the first cut wired
+the helper into `lib/ship.sh` as `FLEET_QUIET_VERDICT="$(fleet_check_quiet_
+hours)"`. The helper's contract included a process-scoped `FLEET_QUIET_
+HOURS_EMITTED=1; export FLEET_QUIET_HOURS_EMITTED` set on the first
+"suppress" so a second call could short-circuit the `fleet_emit_event
+quiet_hours_skip ...` line — same shape as `FLEET_PROMPTS_DRIFT_EMITTED`
+(ticket 0005). Symptom in `tests/quiet-hours.sh` AC#8: after calling the
+helper twice in the SAME outer shell, the test asserted
+`[ -n "$FLEET_QUIET_HOURS_EMITTED" ]` and saw an empty value. Cause:
+bash command substitution `$(...)` runs the body in a FORK; any `export`
+inside the fork mutates only the child's environment, then exits. The
+parent shell sees the captured stdout but not the export. The helper
+would have emitted twice in two consecutive ship runs across the same
+process because the guard never persisted. Fix: redesign the helper to
+write its verdict to BOTH stdout (so single-shot tests can use `$(...)`)
+AND an exported global `FLEET_QUIET_HOURS_VERDICT`; call the helper
+from production runners WITHOUT command substitution
+(`fleet_check_quiet_hours >/dev/null; case $FLEET_QUIET_HOURS_VERDICT
+in ...`) so the emit/guard exports land in the runner's shell. Cheap
+defensive habit: any helper whose contract includes "fires at most
+once per process" (guard env var) MUST NOT be called via `$(...)`
+from the path that relies on the guard. Test seam: when a unit test
+does call the helper via `$(...)` for output-only assertions, it
+must NOT also assert on the guard env or downstream side-effect
+count — those checks belong in the no-substitution call path (which
+mirrors production).
