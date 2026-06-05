@@ -227,3 +227,33 @@ fix into common.sh. Cheap defensive habit: any per-byte JSON
 escape in this kit MUST guard on `code >= 0` before treating it as
 a control char, and treat negative codes (sign-extended high bytes)
 as already-safe pass-through.
+
+## 2026-06-05 — bash 3.2 does not honor mid-script `LC_ALL=C` for `${#s}` / `${s:i:1}` string-length operations
+
+While shipping ticket 0032's `preflight_visible_width`, the first cut
+tried to side-step the test harness's variable locale (sometimes
+`LC_ALL=C`, sometimes `LANG=en_US.UTF-8` depending on how the runner
+spawned) by wrapping the byte-walk in a subshell that did `export
+LC_ALL=C` BEFORE iterating: `(  export LC_ALL=C; for (( i=0;
+i<${#s}; i++ )); do ch="${s:i:1}"; … )`. macOS ships bash 3.2, which
+caches its locale-sensitive operations (`${#}` length, `${s:i:1}`
+substring) at SHELL STARTUP — flipping `LC_ALL` mid-script via a
+subshell `export` does not actually flip `${#}` from char-count to
+byte-count. Symptom in `tests/preflight.sh` AC#1: the function
+returned 30 under the host's UTF-8 locale (counting the § as one
+character with code 167, the trailing UTF-8 continuation byte, and
+skipping it) instead of the expected 31; the golden table's `AGENTS.md
+§ Agent parameters:` row landed one space short and `diff -u` flagged
+the mismatch. The bash -x trace was particularly misleading because
+turning on `set -x` re-evaluates some locale state and the function
+THEN returned 31, so the bug only showed up in the gateless test path.
+Fix: do not rely on bash's locale-sensitive ops for width counting at
+all. Use `printf -- '%s' "$s" | LC_ALL=C wc -c` to get the byte count
+(always bytes regardless of the parent locale), then subtract the
+UTF-8 continuation-byte count via `LC_ALL=C awk` with a 256-entry
+`ord[]` lookup table (awk substring under explicit `LC_ALL=C` env IS
+byte-mode, unlike bash). The result is locale-stable across both
+`LC_ALL=C` and `LANG=en_US.UTF-8`. Cheap defensive habit: any
+"visible width" computation in this kit's macOS-targeted shell code
+MUST go through `wc -c` + `awk` (or python3), NOT bash's `${#s}` /
+`${s:i:1}`, when the input might contain multi-byte UTF-8.
