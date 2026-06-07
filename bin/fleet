@@ -29,6 +29,8 @@
 #                             (ticket 0031 — --since/--slug/--json; pure reader, no new event types)
 #   fleet preflight <repo>    dry-adopt a candidate project; print what install.sh would do (read-only)
 #                             (ticket 0032 — 10 PASS/WARN/FAIL rows + verdict; --json; never writes)
+#   fleet morning             one-command daily briefing (digest + inbox [+ Sunday weekly])
+#                             (ticket 0036 — composes existing readers; --no-weekly/--weekly/--json/--slug)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -7633,6 +7635,520 @@ EOF
 
 if [ "$CMD" = "atlas" ]; then
   atlas "$@"
+fi
+
+# --- morning (ticket 0036) ----------------------------------------------
+# `fleet morning` composes the daily briefing: digest + inbox + (Sunday-only)
+# weekly + atlas top-3, with a single VERDICT line and a NEXT footer hint.
+# Pure composition — no new readers, no new event types, no manifest fields.
+# The body sits BELOW digest(), inbox(), weekly(), atlas() (LESSONS 2026-06-05
+# dispatcher forward-reference trap) and inlines `morning_json_escape` as a
+# bit-for-bit copy of `provenance_json_escape` (which is defined LATER in
+# the file at ~line 6371) — same workaround ticket 0034 used for
+# `replay_batch_json_escape`. Every code path exits explicitly (LESSONS
+# 2026-06-01 dispatcher fall-through trap).
+
+# Test seam: morning_clock_now reads FLEET_NOW_OVERRIDE if set, else the
+# current UTC clock. Format: "YYYY-MM-DD HH:MM". Same shape as
+# weekly's FLEET_WEEKLY_FAKE_NOW (epoch) but a friendlier string for the
+# verdict line.
+morning_clock_now() {
+  if [ -n "${FLEET_NOW_OVERRIDE:-}" ]; then
+    printf -- '%s\n' "$FLEET_NOW_OVERRIDE"
+  else
+    date -u '+%Y-%m-%d %H:%M'
+  fi
+}
+
+# Day-of-week from a "YYYY-MM-DD HH:MM" or "YYYY-MM-DD" string.
+# Uses BSD `date -j -f` on macOS and falls back to GNU `date -d` on Linux.
+morning_dow() {
+  local s="$1"
+  local datepart="${s%% *}"
+  date -j -f '%Y-%m-%d' "$datepart" '+%a' 2>/dev/null \
+    || date -d "$datepart" '+%a' 2>/dev/null \
+    || echo '?'
+}
+
+# UTF-8-safe JSON escaper (LESSONS 2026-06-03 sign-extension guard).
+# Bit-for-bit copy of `provenance_json_escape` (defined later in this file
+# at ~line 6371). Inlining is the workaround for the dispatcher forward-
+# reference trap (LESSONS 2026-06-05); ticket 0034's
+# replay_batch_json_escape uses the same shape.
+morning_json_escape() {
+  local s="${1-}" out="" i ch code
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *)
+        printf -v code '%d' "'$ch"
+        if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+          printf -v out '%s\\u%04x' "$out" "$code"
+        else
+          out+="$ch"
+        fi
+        ;;
+    esac
+  done
+  printf -- '%s' "$out"
+}
+
+# Count the inbox rows that "owe the operator a click" by reading
+# `inbox --json` (one JSON object per section + 1 summary). Returns N
+# as a plain integer. Uses `awk … END { print n+0 }` per LESSONS
+# 2026-06-01 (`grep -c file || echo 0` double-print trap).
+#
+# Optional $1: slug filter, passed through to inbox.
+morning_count_owes_click() {
+  local slug_filter="${1-}"
+  local n
+  if [ -n "$slug_filter" ]; then
+    n="$(
+      ( inbox inbox --json --slug "$slug_filter" 2>/dev/null ) \
+        | awk -F'"items":' '/"summary":true/ { sub(/[^0-9].*$/, "", $2); print $2+0; exit }'
+    )"
+  else
+    n="$(
+      ( inbox inbox --json 2>/dev/null ) \
+        | awk -F'"items":' '/"summary":true/ { sub(/[^0-9].*$/, "", $2); print $2+0; exit }'
+    )"
+  fi
+  [ -z "$n" ] && n=0
+  printf -- '%s\n' "$n"
+}
+
+# Count paused projects (verdict P value). Same source as the inbox's
+# `paused projects` section: the count of section objects with section=paused.
+morning_count_paused() {
+  local slug_filter="${1-}"
+  local n
+  if [ -n "$slug_filter" ]; then
+    n="$(
+      ( inbox inbox --json --slug "$slug_filter" 2>/dev/null ) \
+        | awk -F'"count":' '/"section":"paused"/ { sub(/[^0-9].*$/, "", $2); print $2+0; exit }'
+    )"
+  else
+    n="$(
+      ( inbox inbox --json 2>/dev/null ) \
+        | awk -F'"count":' '/"section":"paused"/ { sub(/[^0-9].*$/, "", $2); print $2+0; exit }'
+    )"
+  fi
+  [ -z "$n" ] && n=0
+  printf -- '%s\n' "$n"
+}
+
+# Discover at least one project under FLEET_DISCOVERY_ROOT (the cheap
+# "is the fleet empty?" check). Same root convention as digest/weekly/inbox.
+morning_any_projects() {
+  local root="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  find "$root" -maxdepth 2 -name agents.config.sh 2>/dev/null | head -1
+}
+
+# Build the NEXT footer hint per the priority ordering in AC#7:
+#   paused → fleet resume <slug>
+#   draft  → fleet lessons-promote
+#   self-cancel ≤7d → bump SELF_CANCEL in <slug>/agents.config.sh
+#   budget tripped today → inspect <slug>'s spend or raise MAX_DAILY_USD
+#   stuck PR >24h → gh pr view <N> --comment
+#   else → nothing else owes you a click. enjoy your day.
+#
+# Reads the same `inbox --json` stream the verdict counts use. First match
+# wins; we walk the sections in priority order.
+morning_next_hint() {
+  local slug_filter="${1-}"
+  # Capture the JSON stream once; subsequent passes are file reads.
+  local inbox_json
+  if [ -n "$slug_filter" ]; then
+    inbox_json="$( ( inbox inbox --json --slug "$slug_filter" 2>/dev/null ) )"
+  else
+    inbox_json="$( ( inbox inbox --json 2>/dev/null ) )"
+  fi
+  local first_slug
+  # paused — first item under section=paused.
+  first_slug="$(printf -- '%s\n' "$inbox_json" \
+    | awk -F'"section":"paused"' '/"section":"paused"/ { print $2; exit }' \
+    | awk -F'"slug":"' 'NF>1 { sub(/".*$/, "", $2); print $2; exit }')"
+  if [ -n "$first_slug" ]; then
+    printf -- 'fleet resume %s\n' "$first_slug"
+    return 0
+  fi
+  # draft — first item under section=drafts.
+  first_slug="$(printf -- '%s\n' "$inbox_json" \
+    | awk -F'"section":"drafts"' '/"section":"drafts"/ { print $2; exit }' \
+    | awk -F'"slug":"' 'NF>1 { sub(/".*$/, "", $2); print $2; exit }')"
+  if [ -n "$first_slug" ]; then
+    printf -- 'fleet lessons-promote %s\n' "$first_slug"
+    return 0
+  fi
+  # self-cancel — first item under section=self_cancel.
+  first_slug="$(printf -- '%s\n' "$inbox_json" \
+    | awk -F'"section":"self_cancel"' '/"section":"self_cancel"/ { print $2; exit }' \
+    | awk -F'"slug":"' 'NF>1 { sub(/".*$/, "", $2); print $2; exit }')"
+  if [ -n "$first_slug" ]; then
+    printf -- 'bump SELF_CANCEL in %s/agents.config.sh\n' "$first_slug"
+    return 0
+  fi
+  # budget — first item under section=budget.
+  first_slug="$(printf -- '%s\n' "$inbox_json" \
+    | awk -F'"section":"budget"' '/"section":"budget"/ { print $2; exit }' \
+    | awk -F'"slug":"' 'NF>1 { sub(/".*$/, "", $2); print $2; exit }')"
+  if [ -n "$first_slug" ]; then
+    printf -- "inspect %s's spend or raise MAX_DAILY_USD\n" "$first_slug"
+    return 0
+  fi
+  # stuck PR — first item under section=stuck_prs.
+  local first_pr
+  first_pr="$(printf -- '%s\n' "$inbox_json" \
+    | awk -F'"section":"stuck_prs"' '/"section":"stuck_prs"/ { print $2; exit }' \
+    | awk -F'"count":' 'NF>1 { sub(/[^0-9].*$/, "", $2); print $2; exit }')"
+  if [ -n "$first_pr" ] && [ "$first_pr" != "0" ]; then
+    printf -- 'gh pr view %s --comment\n' "$first_pr"
+    return 0
+  fi
+  printf -- 'nothing else owes you a click. enjoy your day.\n'
+}
+
+# Pull the top-3 atlas patterns (text mode) from an atlas --json invocation.
+# We use --since 7d to mirror the WEEKLY block's window. Returns a one-line
+# `pattern (count)  pattern (count)  pattern (count)` string or empty when
+# nothing fired.
+morning_atlas_top3() {
+  local atlas_json
+  atlas_json="$( ( atlas atlas --since 7d --json 2>/dev/null ) )"
+  # Each non-summary line: {"pattern":"...","fired":N,...}. Sort desc by
+  # fired, take top 3 with fired>0. Use awk for the parse.
+  printf -- '%s\n' "$atlas_json" \
+    | awk -F'"pattern":"' '
+        /"summary":true/ { next }
+        NF>1 {
+          patt = $2; sub(/".*$/, "", patt);
+          fired_idx = index($0, "\"fired\":")
+          if (fired_idx == 0) next
+          rest = substr($0, fired_idx + length("\"fired\":"))
+          n = rest + 0
+          if (n > 0) printf("%d\t%s\n", n, patt)
+        }' \
+    | sort -t $'\t' -k1,1nr \
+    | head -3 \
+    | awk -F'\t' '{ printf("%s%s (%s)", (NR==1?"":"  "), $2, $1) } END { if (NR>0) printf("\n") }'
+}
+
+morning() {
+  shift  # drop "morning"
+  local want_json=0 slug_filter=""
+  local weekly_mode="auto"   # auto | force | suppress
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)       want_json=1; shift ;;
+      --no-weekly)  weekly_mode="suppress"; shift ;;
+      --weekly)     weekly_mode="force"; shift ;;
+      --slug)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "fleet morning: --slug requires a non-empty value" >&2
+          exit 2
+        fi
+        slug_filter="$2"; shift 2 ;;
+      --slug=*)
+        slug_filter="${1#--slug=}"
+        if [ -z "$slug_filter" ]; then
+          echo "fleet morning: --slug requires a non-empty value" >&2
+          exit 2
+        fi
+        shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet morning — one-command daily briefing (digest + inbox [+ Sunday weekly]).
+
+Usage:
+  fleet morning                   default: verdict + digest + inbox
+                                  (+ WEEKLY block + atlas top-3 on Sunday)
+  fleet morning --no-weekly       suppress the WEEKLY block even on Sunday
+  fleet morning --weekly          force the WEEKLY block on a non-Sunday
+  fleet morning --slug NAME       narrow digest + inbox to one project
+  fleet morning --json            machine-readable composed object
+
+Output (text mode):
+  MORNING — YYYY-MM-DD <Dow> · N owes you a click · P paused · fleet <band>
+
+  DIGEST (24h)
+    <one row per project — same as 'fleet digest'>
+
+  INBOX
+    <five sections — same as 'fleet inbox'>
+
+  WEEKLY (Sunday-only — last 7d)        # suppressed on non-Sunday
+    <summary line + top-3 atlas patterns>
+
+  NEXT: <one concrete next action, or 'nothing else owes you a click.'>
+
+Verdict band: OK when N==0 AND P==0; WARN when N>=1 AND P==0;
+              FAIL when P>=1.
+
+Composition only — calls digest(), inbox(), weekly(), atlas() in process
+(no bin/fleet subprocesses). No new event types. Read-only.
+
+Exit code: 0 on success; 2 on usage error.
+USAGE
+        exit 0 ;;
+      *) echo "fleet morning: unknown flag '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  # Empty fleet — exit 0 with a stderr hint (matches AC#8 + replay --batch).
+  if [ -z "$(morning_any_projects)" ]; then
+    local root="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+    printf -- 'morning: no projects found under FLEET_DISCOVERY_ROOT=%s — run install.sh on at least one repo first.\n' \
+      "$root" >&2
+    exit 0
+  fi
+
+  local now date_part dow
+  now="$(morning_clock_now)"
+  date_part="${now%% *}"
+  dow="$(morning_dow "$now")"
+
+  # Decide whether the WEEKLY block prints.
+  local show_weekly=0
+  case "$weekly_mode" in
+    suppress) show_weekly=0 ;;
+    force)    show_weekly=1 ;;
+    auto)     [ "$dow" = "Sun" ] && show_weekly=1 ;;
+  esac
+
+  # Compute the verdict counters once (cheap; both helpers read inbox --json
+  # in subshells — no extra subprocess churn from re-invoking bin/fleet).
+  local n_owes n_paused band
+  n_owes="$(morning_count_owes_click "$slug_filter")"
+  n_paused="$(morning_count_paused "$slug_filter")"
+  if [ "$n_paused" -ge 1 ]; then
+    band="FAIL"
+  elif [ "$n_owes" -ge 1 ]; then
+    band="WARN"
+  else
+    band="OK"
+  fi
+
+  # Pre-render the section bodies. Each reader exits at the end of its
+  # function, so we call them in subshells to capture stdout without
+  # killing morning(). LESSONS 2026-06-01 (awk -v multiline trap): the
+  # bodies can carry newlines; we accumulate to a tmp file and read back.
+  local tmp_dir
+  tmp_dir="$(mktemp -d -t fleet-morning.XXXXXX)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  local digest_body="$tmp_dir/digest.txt"
+  local inbox_body="$tmp_dir/inbox.txt"
+  local weekly_body="$tmp_dir/weekly.txt"
+  local atlas_top="$tmp_dir/atlas.txt"
+
+  # digest — `digest --since 24h` (default) so the column is consistent
+  # with the heading. Exit is captured but ignored (digest exits 1 if any
+  # project is in a red state; morning doesn't bubble that up because the
+  # verdict line already encodes posture).
+  if [ -n "$slug_filter" ]; then
+    ( digest digest --slug "$slug_filter" ) > "$digest_body" 2>/dev/null || true
+    ( inbox  inbox  --slug "$slug_filter" ) > "$inbox_body"  2>/dev/null || true
+  else
+    ( digest digest ) > "$digest_body" 2>/dev/null || true
+    ( inbox  inbox  ) > "$inbox_body"  2>/dev/null || true
+  fi
+
+  if [ "$show_weekly" = "1" ]; then
+    ( weekly weekly --since 7d ) > "$weekly_body" 2>/dev/null || true
+    morning_atlas_top3 > "$atlas_top" 2>/dev/null || true
+  else
+    : > "$weekly_body"
+    : > "$atlas_top"
+  fi
+
+  local next_hint
+  next_hint="$(morning_next_hint "$slug_filter")"
+
+  if [ "$want_json" = "1" ]; then
+    morning_render_json "$date_part" "$dow" "$band" "$n_owes" "$n_paused" \
+      "$show_weekly" "$slug_filter" "$digest_body" "$inbox_body" \
+      "$weekly_body" "$atlas_top" "$next_hint"
+    exit 0
+  fi
+
+  morning_render_text "$date_part" "$dow" "$band" "$n_owes" "$n_paused" \
+    "$show_weekly" "$digest_body" "$inbox_body" "$weekly_body" "$atlas_top" \
+    "$next_hint"
+  exit 0
+}
+
+# Text renderer. All printfs use `printf -- '...'` per LESSONS 2026-05-28
+# (printf leading-dash trap) since the format strings start with literals
+# but the values may start with `-`.
+morning_render_text() {
+  local date_part="$1" dow="$2" band="$3" n_owes="$4" n_paused="$5"
+  local show_weekly="$6"
+  local digest_body="$7" inbox_body="$8" weekly_body="$9"
+  local atlas_top="${10}" next_hint="${11}"
+
+  printf -- 'MORNING — %s %s · %s owes you a click · %s paused · fleet %s\n' \
+    "$date_part" "$dow" "$n_owes" "$n_paused" "$band"
+  printf -- '\n'
+
+  printf -- 'DIGEST (24h)\n'
+  if [ -s "$digest_body" ]; then
+    # Indent two spaces so the digest output reads as a sub-block.
+    sed 's/^/  /' "$digest_body"
+  else
+    printf -- '  (no projects in window)\n'
+  fi
+  printf -- '\n'
+
+  printf -- 'INBOX\n'
+  if [ -s "$inbox_body" ]; then
+    # Strip inbox's own banner (first 2 lines: "FLEET INBOX — ..." + blank)
+    # and trailing footer ("nothing else owes you a click. last weekly: ..."
+    # line) since morning has its own verdict header and NEXT footer.
+    # Per LESSONS 2026-06-01 (awk -v multiline trap) we read the file
+    # directly with awk, not via -v.
+    awk '
+      NR <= 2 { next }
+      /^nothing else owes you a click\. last weekly:/ { next }
+      { print "  " $0 }
+    ' "$inbox_body"
+  else
+    printf -- '  (no inbox items)\n'
+  fi
+  printf -- '\n'
+
+  if [ "$show_weekly" = "1" ]; then
+    printf -- 'WEEKLY (Sunday-only — last 7d)\n'
+    if [ -s "$weekly_body" ]; then
+      sed 's/^/  /' "$weekly_body"
+    fi
+    if [ -s "$atlas_top" ]; then
+      printf -- '  top atlas patterns: '
+      cat "$atlas_top"
+    fi
+    printf -- '\n'
+  fi
+
+  printf -- 'NEXT: %s\n' "$next_hint"
+}
+
+# JSON renderer — one composed object. Per LESSONS 2026-06-01 (awk -v
+# multiline trap), digest/inbox text bodies are NOT passed inline; instead
+# we surface a structural summary (digest = parsed slug:state pairs from
+# the text body, inbox = section counts). For a fully machine-readable
+# digest/inbox payload, callers can still invoke `fleet digest --json` /
+# `fleet inbox --json` directly. This composed object's goal is the
+# at-a-glance verdict, not the full per-row data.
+morning_render_json() {
+  local date_part="$1" dow="$2" band="$3" n_owes="$4" n_paused="$5"
+  local show_weekly="$6" slug_filter="$7"
+  local digest_body="$8" inbox_body="$9" weekly_body="${10}"
+  local atlas_top="${11}" next_hint="${12}"
+
+  # digest JSON array — call digest --json directly (it already escapes).
+  local digest_json
+  if [ -n "$slug_filter" ]; then
+    digest_json="$( ( digest digest --slug "$slug_filter" --json ) 2>/dev/null || true )"
+  else
+    digest_json="$( ( digest digest --json ) 2>/dev/null || true )"
+  fi
+  [ -z "$digest_json" ] && digest_json="[]"
+
+  # inbox JSON object — bundle the per-section objects into one object
+  # keyed by section name.
+  local inbox_raw
+  if [ -n "$slug_filter" ]; then
+    inbox_raw="$( ( inbox inbox --slug "$slug_filter" --json ) 2>/dev/null || true )"
+  else
+    inbox_raw="$( ( inbox inbox --json ) 2>/dev/null || true )"
+  fi
+  local inbox_obj
+  inbox_obj="$(printf -- '%s\n' "$inbox_raw" | awk '
+    BEGIN { first = 1; printf("{") }
+    /"summary":true/ {
+      sub(/^\{/, "", $0); sub(/\}[ \t]*$/, "", $0);
+      if (!first) printf(","); printf("%s", $0); first = 0; next
+    }
+    /"section":/ {
+      match($0, /"section":"[^"]+"/); sname = substr($0, RSTART+11, RLENGTH-12);
+      if (!first) printf(","); first = 0;
+      printf("\"%s\":%s", sname, $0)
+    }
+    END { printf("}") }')"
+  [ -z "$inbox_obj" ] && inbox_obj="{}"
+
+  # weekly JSON — null on non-Sunday/no-weekly; else the streamed objects.
+  local weekly_json="null"
+  if [ "$show_weekly" = "1" ]; then
+    local weekly_raw
+    weekly_raw="$( ( weekly weekly --since 7d --json ) 2>/dev/null || true )"
+    # Normalize the streamed JSON lines into an array.
+    weekly_json="$(printf -- '%s\n' "$weekly_raw" | awk '
+      BEGIN { first = 1; printf("[") }
+      NF { if (!first) printf(","); printf("%s", $0); first = 0 }
+      END { printf("]") }')"
+    [ -z "$weekly_json" ] && weekly_json="null"
+  fi
+
+  # atlas_top JSON — null on non-Sunday/no-weekly; else the parsed top-3.
+  local atlas_top_json="null"
+  if [ "$show_weekly" = "1" ]; then
+    atlas_top_json="["
+    local first=1 line
+    if [ -s "$atlas_top" ]; then
+      # The text body is `patt1 (n)  patt2 (n)  patt3 (n)`. Split on two
+      # spaces, then parse each `name (count)`.
+      while IFS= read -r line; do
+        local IFS_BAK="$IFS"
+        local segs
+        # Replace double-space with newline, then iterate.
+        segs="$(printf -- '%s\n' "$line" | sed 's/  /\n/g')"
+        local s
+        while IFS= read -r s; do
+          [ -z "$s" ] && continue
+          # s = "name (count)"
+          local pname pcnt
+          pname="$(printf -- '%s' "$s" | sed -E 's/ \(([0-9]+)\)$//')"
+          pcnt="$(printf -- '%s' "$s" | sed -nE 's/.* \(([0-9]+)\)$/\1/p')"
+          [ -z "$pcnt" ] && pcnt=0
+          if [ "$first" = "1" ]; then
+            atlas_top_json+="{\"pattern\":\"$(morning_json_escape "$pname")\",\"fired\":$pcnt}"
+            first=0
+          else
+            atlas_top_json+=",{\"pattern\":\"$(morning_json_escape "$pname")\",\"fired\":$pcnt}"
+          fi
+        done <<EOS
+$segs
+EOS
+        IFS="$IFS_BAK"
+      done < "$atlas_top"
+    fi
+    atlas_top_json+="]"
+  fi
+
+  local esc_date esc_hint
+  esc_date="$(morning_json_escape "$date_part")"
+  esc_hint="$(morning_json_escape "$next_hint")"
+
+  printf -- '{"date":"%s","dow":"%s","verdict":"%s","owes_click":%s,"paused":%s,"digest":%s,"inbox":%s,"weekly":%s,"atlas_top":%s,"next":"%s"}\n' \
+    "$esc_date" "$dow" "$band" "$n_owes" "$n_paused" \
+    "$digest_json" "$inbox_obj" "$weekly_json" "$atlas_top_json" "$esc_hint"
+
+  # Silence shellcheck on $digest_body / $inbox_body / $weekly_body / $next_hint
+  # in this scope — we use them indirectly via subshell re-invocation, but
+  # static analysis flags them as unread.
+  : "$digest_body" "$inbox_body" "$weekly_body"
+}
+
+if [ "$CMD" = "morning" ]; then
+  morning "$@"
+  exit $?
 fi
 
 # --- lessons-sync ---------------------------------------------------------

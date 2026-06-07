@@ -1,0 +1,38 @@
+MORNING — 2026-06-07 Sun · 2 owes you a click · 0 paused · fleet WARN
+
+DIGEST (24h)
+  agent-fleet  OK  0 opened / 0 merged  $0.00  infra_flake_rerun
+  almanac  OK  0 opened / 0 merged  $0.00  budget_block
+  courtiq  OK  0 opened / 0 merged  $0.00  ## 2026-05-25 — bootstrap
+
+INBOX
+  drafts to promote                 1 across 1 project
+    agent-fleet    1 draft         docs/LESSONS.md
+  
+  self-cancel expiring (<=7d)       0
+  
+  paused projects                   0
+  
+  budget tripped today              1
+    almanac        $5.00/$5.00     bump MAX_DAILY_USD or wait for tomorrow
+  
+  in-flight agent PRs >24h old      0
+  
+
+WEEKLY (Sunday-only — last 7d)
+  WEEK OF 2026-05-31 – 2026-06-07 (7d)
+  
+  PROJECT        SHIPPED  $SPEND   DRAFTS↑  HEAL  INFRA  PAUSED  SELF-CANCEL
+  ─────────────────────────────────────────────────────────────────────────
+  agent-fleet    3        $1.41    1*       0     1      no      84d
+  almanac        0        $0.00    0        0     0      no      86d
+  courtiq        1        $0.40    0        0     0      no      86d
+  
+  1* drafts waiting on you. Promote in <repo>/docs/LESSONS.md or run
+  `fleet digest --slug <slug>` for the per-project event tail.
+  
+  ALL: 4 PRs shipped, $1.81 spent ($0.45/PR avg), 0 heal attempts,
+       1 infra-flake rerun, 0 paused, 0 expired.
+  top atlas patterns: actions_silent (1)
+
+NEXT: fleet lessons-promote agent-fleet
