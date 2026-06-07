@@ -316,3 +316,39 @@ shortcut works ONLY when the subcommand dispatcher block sits at the
 very bottom of the file — `bin/fleet`'s dispatcher is interleaved
 with the function bodies (one inline `if [ "$CMD" = "<sub>" ]` block
 per subcommand), so the forward-reference window is narrow but real.
+
+## 2026-06-07 — composing a reader that writes a wall-clock-stamped state file (inbox) into a golden-tested briefing forces a banner-strip pass
+
+While shipping ticket 0036's `fleet morning`, the first cut composed the
+INBOX section by indenting the full `bin/fleet inbox` output verbatim
+under a `INBOX` heading. `inbox`'s first line is `FLEET INBOX —
+<today> (since last run <Nh|Nd> ago)` and its trailing line is
+`nothing else owes you a click. last weekly: <Nh|Nd> ago`. Both ages
+are computed as `FLEET_INBOX_FAKE_NOW - stat -m
+$HOME/.cache/fleet/inbox-state`, where the state file's mtime is
+written at REAL wall-clock time by every `inbox` invocation — even
+the helper invocations `morning` makes internally to compute the
+verdict counters (`morning_count_owes_click`,
+`morning_count_paused`, `morning_next_hint`). Symptom in
+`tests/morning.sh`'s golden byte-match: the first run produced
+`since last run never` / `last weekly: never` locally (no marker yet);
+the second run on CI produced `since last run 5h ago` /
+`last weekly: 5h ago` (real-CI-clock minus fake_now = 5h on a
+2026-06-07 anchor). `diff -u` against the golden flagged both
+lines and the test failed despite the underlying composition being
+correct. The fix is to make the composed briefing OWN the time-
+sensitive header line and STRIP inbox's own banner + trailing line
+on render: `awk 'NR<=2 { next } /^nothing else owes you a click\.
+last weekly:/ { next } { print "  " $0 }' "$inbox_body"`. The verdict
+line at the top of `morning` already encodes the "what changed since
+last run" question; the inbox section just needs the five section
+blocks, indented. Cheap defensive habit: when composing a reader
+that writes a wall-clock-stamped marker file as a side effect, the
+composer MUST either (a) STRIP the reader's mtime-dependent lines
+(this fix), (b) explicitly touch the marker file's mtime to the
+fake clock anchor BEFORE every internal invocation, or (c) avoid
+the reader entirely and re-aggregate from the underlying telemetry.
+Option (a) is the simplest when the composer owns its own
+"freshness" surface (a verdict line, a NEXT footer); options (b)
+and (c) only pay off when the composer needs to expose the
+reader's freshness to the operator unchanged.
