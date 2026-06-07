@@ -1,7 +1,7 @@
 ---
 id: 0036
 title: fleet morning collapses the daily briefing into one composed command
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-07
@@ -385,3 +385,5 @@ doesn't have to re-discover the architecture.
   strips inbox's own banner + trailing line (which depends on
   wall-clock state-file mtime) so the golden stays byte-stable across
   CI runs regardless of when the test fires.
+- 2026-06-07 — PR #74 opened and squash-merged green
+  (commit `ed1db64`). Ticket shipped.

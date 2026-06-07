@@ -54,7 +54,7 @@ ones, `review` grades them.
 | 0033 | QUIET_HOURS manifest knob suppresses ship/groom/eng during operator-declared windows | P1 | shipped | governance |
 | 0034 | fleet replay --batch <since> grades current prompts against the last N merged PRs | P2 | shipped | governance |
 | 0035 | fleet prompts-revert pins the kit's prompts/ tree back to a known-good SHA | P2 | shipped | governance |
-| 0036 | fleet morning collapses the daily briefing into one composed command | P1 | in-progress | observability |
+| 0036 | fleet morning collapses the daily briefing into one composed command | P1 | shipped | observability |
 | 0037 | fleet incident assembles a window of events into a single structured post-mortem | P1 | groomed | observability |
 | 0038 | fleet diff <slug-a> <slug-b> calls out cross-project ROI and posture divergence | P2 | groomed | observability |
 | 0039 | LESSONS expiry markers let PHASE 0 reads skip stale operational memory | P2 | groomed | governance |
