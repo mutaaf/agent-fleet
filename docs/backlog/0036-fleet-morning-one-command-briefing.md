@@ -1,7 +1,7 @@
 ---
 id: 0036
 title: fleet morning collapses the daily briefing into one composed command
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-07
@@ -367,7 +367,4 @@ doesn't have to re-discover the architecture.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD — branch `feat/0036-...` opened
-- YYYY-MM-DD — failing test added in `tests/morning.sh`
-- YYYY-MM-DD — PR #N opened, CI [state]
-- YYYY-MM-DD — merged to main
+- 2026-06-07 — branch `feat/0036-fleet-morning-one-command-briefing` opened
