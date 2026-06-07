@@ -1,7 +1,7 @@
 ---
 id: 0037
 title: fleet incident assembles a window of events into a single structured post-mortem
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-07
@@ -471,5 +471,5 @@ doesn't have to re-discover the architecture.
 - 2026-06-07 — branch `feat/0037-fleet-incident-post-mortem` opened
 - 2026-06-07 — failing tests added in `tests/incident.sh`
 - 2026-06-07 — `incident()` + `incident_walk_events` + 4 cluster detectors + 3 open-action detectors + markdown/JSON renderers wired into `bin/fleet`; help banner + README "Daily ops" entry added
-- YYYY-MM-DD — PR #N opened, CI [state]
-- YYYY-MM-DD — merged to main
+- 2026-06-07 — PR #77 opened, CI green (shellcheck + validate)
+- 2026-06-07 — merged to main
