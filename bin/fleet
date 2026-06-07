@@ -31,6 +31,9 @@
 #                             (ticket 0032 — 10 PASS/WARN/FAIL rows + verdict; --json; never writes)
 #   fleet morning             one-command daily briefing (digest + inbox [+ Sunday weekly])
 #                             (ticket 0036 — composes existing readers; --no-weekly/--weekly/--json/--slug)
+#   fleet incident --since <Nh|Nd>  assemble a post-mortem from the event channel
+#                             (ticket 0037 — timeline + cluster summary + open recovery actions;
+#                              --slug/--json/--out; pure consumer of events.jsonl, no new event types)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -8148,6 +8151,905 @@ EOS
 
 if [ "$CMD" = "morning" ]; then
   morning "$@"
+  exit $?
+fi
+
+# --- incident (ticket 0037) ----------------------------------------------
+# `fleet incident --since <Nh|Nd> [--slug NAME] [--json] [--out FILE]`
+# assembles a structured post-mortem from the event channel: timeline +
+# cluster summary + open recovery actions. Pure consumer of events.jsonl
+# (+ `gh pr view` for the one network-touching open-action check). No new
+# event types — the reader CONSUMES the contract, does not extend it.
+#
+# Body placement: BELOW digest_parse_since (line ~1985); inlines
+# `incident_json_escape` (bit-for-bit copy of `provenance_json_escape`
+# at ~line 6373) and `incident_render_event_line` (a per-event formatter
+# in the same shape `tail_format_stream` uses for the live stream) per
+# LESSONS 2026-06-05 (dispatcher forward-reference trap). Every code
+# path exits explicitly per LESSONS 2026-06-01 (dispatcher fall-through
+# trap). Every printf with a value that might start with `-` uses
+# `printf -- '%s'` per LESSONS 2026-05-28. Every awk -v with a value
+# that might contain newlines uses `getline … < file` per LESSONS
+# 2026-06-01 (awk -v multiline trap). Every count uses
+# `awk … END { print n+0 }` per LESSONS 2026-06-01 (grep -c double-print
+# trap). Help-text grep uses `grep -qF --` per LESSONS 2026-05-30.
+
+# UTF-8-safe JSON escaper (LESSONS 2026-06-03 sign-extension guard).
+# Bit-for-bit copy of provenance_json_escape; inlined here because the
+# original is defined LATER in the file at ~line 6373 and the dispatcher
+# block fires at execution time (LESSONS 2026-06-05).
+incident_json_escape() {
+  local s="${1-}" out="" i ch code
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *)
+        printf -v code '%d' "'$ch"
+        if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+          printf -v out '%s\\u%04x' "$out" "$code"
+        else
+          out+="$ch"
+        fi
+        ;;
+    esac
+  done
+  printf -- '%s' "$out"
+}
+
+# Discover project (slug, events.jsonl) pairs. Same union-by-SLUG pattern
+# as tail_discover_events but standalone so incident is self-contained.
+incident_discover_events() {
+  local root="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local installed="$HOME/.local/share/agent-fleet/projects"
+  local _seen="" m slug
+  { find "$root" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$installed" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf '%s\t%s\n' "$slug" "$HOME/.cache/${slug}-agent/events.jsonl"
+  done
+}
+
+# Walk every surveyed project's events.jsonl (+ archive files per the
+# 0016 rotation contract) and emit one JSON line per event whose ts is
+# in [start_iso, end_iso]. Output is ISO-chronologically sorted across
+# all slugs. Reads file paths off stdin (tab-separated slug<TAB>events
+# rows, same shape as incident_discover_events).
+#
+# $1: start_iso ($2: end_iso) — inclusive bounds.
+incident_walk_events() {
+  local start_iso="$1" end_iso="$2"
+  local slug events archive_dir tmp_all
+  tmp_all="$(mktemp -t fleet-incident-walk.XXXXXX)"
+  while IFS=$'\t' read -r slug events; do
+    [ -z "$slug" ] && continue
+    # Main events.jsonl.
+    if [ -f "$events" ]; then
+      awk -v start="$start_iso" -v stop="$end_iso" '
+        {
+          if ($0 ~ /^[[:space:]]*$/) next
+          ts = ""
+          if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+            ts = substr($0, RSTART, RLENGTH)
+            sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+          }
+          if (ts == "") next
+          # ISO8601 strings are lexically sortable — no date math needed.
+          if (ts >= start && ts <= stop) print ts "\t" $0
+        }
+      ' "$events" >> "$tmp_all"
+    fi
+    # Archive files (ticket 0016 rotation).
+    archive_dir="$(dirname "$events")/events.jsonl.archive"
+    if [ -d "$archive_dir" ]; then
+      local af
+      for af in "$archive_dir"/*.jsonl; do
+        [ -f "$af" ] || continue
+        awk -v start="$start_iso" -v stop="$end_iso" '
+          {
+            if ($0 ~ /^[[:space:]]*$/) next
+            ts = ""
+            if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+              ts = substr($0, RSTART, RLENGTH)
+              sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+            }
+            if (ts == "") next
+            if (ts >= start && ts <= stop) print ts "\t" $0
+          }
+        ' "$af" >> "$tmp_all"
+      done
+    fi
+  done
+  # Sort by ISO8601 ts (column 1) then by the JSON payload itself so the
+  # output is deterministic across re-runs even when two events share a
+  # ts. Strip the leading ts column on output — readers use the ts that
+  # is already inside the JSON line.
+  sort -k1,1 -k2,2 "$tmp_all" | cut -f2-
+  rm -f "$tmp_all"
+}
+
+# Extract a "name" field's string value from a JSON line. Echoes the
+# value with no quotes, or empty when the key is absent. Lightweight
+# replacement for jq — same algorithm tail_format_stream's `field()`
+# uses inside awk.
+incident_field() {
+  local line="$1" name="$2"
+  printf -- '%s' "$line" | awk -v name="$name" '
+    {
+      re = "\"" name "\"[[:space:]]*:[[:space:]]*"
+      start = match($0, re)
+      if (start == 0) { print ""; exit }
+      raw = substr($0, start + RLENGTH)
+      if (substr(raw, 1, 1) == "\"") {
+        end = index(substr(raw, 2), "\"")
+        if (end == 0) { print ""; exit }
+        print substr(raw, 2, end - 1); exit
+      }
+      end = match(raw, /[,}]/)
+      if (end == 0) { print raw; exit }
+      print substr(raw, 1, end - 1); exit
+    }
+  '
+}
+
+# Render one event line for the Timeline section. Format:
+#   - <iso-ts> — `<type>` <payload-render>
+# Mirrors the shape tail_format_stream uses for the live stream.
+incident_render_event_line() {
+  local line="$1"
+  local ts type
+  ts="$(incident_field "$line" "ts")"
+  type="$(incident_field "$line" "type")"
+  [ -z "$ts" ] && return 0
+  [ -z "$type" ] && type="(unknown)"
+
+  # Per-type payload renders. Keep them short and stable so they round-
+  # trip into golden tests. Unknown types fall through to a generic
+  # k=v render of every key except the four required ones.
+  local payload=""
+  case "$type" in
+    pr_opened)
+      local num br
+      num="$(incident_field "$line" "number")"
+      br="$(incident_field "$line" "branch")"
+      payload="#${num} ${br}"
+      ;;
+    lesson_draft_emitted)
+      local pr hd
+      pr="$(incident_field "$line" "pr")"
+      hd="$(incident_field "$line" "headline")"
+      payload="PR #${pr} \"${hd}\""
+      ;;
+    ship_paused)
+      local reason cnt prs
+      reason="$(incident_field "$line" "reason")"
+      cnt="$(incident_field "$line" "count")"
+      prs="$(incident_field "$line" "prs")"
+      payload="reason=${reason} count=${cnt}"
+      [ -n "$prs" ] && payload="${payload} prs=${prs}"
+      ;;
+    ship_resumed)
+      local src forced
+      src="$(incident_field "$line" "source")"
+      forced="$(incident_field "$line" "forced")"
+      payload="source=${src} forced=${forced}"
+      ;;
+    rollback_opened)
+      local pr rev mc
+      pr="$(incident_field "$line" "pr")"
+      rev="$(incident_field "$line" "reverts")"
+      mc="$(incident_field "$line" "merge_commit")"
+      payload="pr=${pr} reverts=${rev} merge_commit=${mc}"
+      ;;
+    prompts_drift)
+      local pinned actual
+      pinned="$(incident_field "$line" "pinned")"
+      actual="$(incident_field "$line" "actual")"
+      payload="pinned=${pinned} actual=${actual}"
+      ;;
+    prompts_reverted)
+      local frm to pr
+      frm="$(incident_field "$line" "from")"
+      to="$(incident_field "$line" "to")"
+      pr="$(incident_field "$line" "pr")"
+      payload="from=${frm} to=${to} pr=${pr}"
+      ;;
+    prompts_pin_changed)
+      local old new
+      old="$(incident_field "$line" "old")"
+      new="$(incident_field "$line" "new")"
+      payload="old=${old} new=${new}"
+      ;;
+    budget_block)
+      local reason spent cap
+      reason="$(incident_field "$line" "reason")"
+      spent="$(incident_field "$line" "spent")"
+      cap="$(incident_field "$line" "cap")"
+      payload="reason=${reason} spent=${spent} cap=${cap}"
+      ;;
+    lesson_promoted)
+      local source_slug text_sha scope
+      source_slug="$(incident_field "$line" "source")"
+      text_sha="$(incident_field "$line" "text_sha")"
+      scope="$(incident_field "$line" "scope")"
+      payload="source=${source_slug} text_sha=${text_sha} scope=${scope}"
+      ;;
+    run_started)
+      payload="pid=$(incident_field "$line" "pid")"
+      ;;
+    run_completed)
+      local ex dur
+      ex="$(incident_field "$line" "exit")"
+      dur="$(incident_field "$line" "duration_ms")"
+      payload="exit=${ex} duration_ms=${dur}"
+      ;;
+    *)
+      payload="(raw payload — see events.jsonl)"
+      ;;
+  esac
+
+  if [ -n "$payload" ]; then
+    printf -- '- %s — `%s` %s\n' "$ts" "$type" "$payload"
+  else
+    printf -- '- %s — `%s`\n' "$ts" "$type"
+  fi
+}
+
+# Cluster detector: sendback_streak. Looks for >=3 lesson_draft_emitted
+# events on DIFFERENT PRs within 24h ending in a ship_paused, per slug.
+# Reads JSON lines (one per event) from stdin; writes one tab-delimited
+# cluster row per detection:
+#   sendback_streak<TAB><slug><TAB><pr,pr,...><TAB><first_ts><TAB><last_ts>
+incident_detect_sendback_streak() {
+  awk '
+    function field(line, name,    re, start, raw, end) {
+      re = "\"" name "\"[[:space:]]*:[[:space:]]*"
+      start = match(line, re)
+      if (start == 0) return ""
+      raw = substr(line, start + RLENGTH)
+      if (substr(raw, 1, 1) == "\"") {
+        end = index(substr(raw, 2), "\"")
+        if (end == 0) return ""
+        return substr(raw, 2, end - 1)
+      }
+      end = match(raw, /[,}]/)
+      if (end == 0) return raw
+      return substr(raw, 1, end - 1)
+    }
+    {
+      ts = field($0, "ts"); slug = field($0, "slug"); type = field($0, "type")
+      if (slug == "" || ts == "") next
+      if (type == "lesson_draft_emitted") {
+        pr = field($0, "pr")
+        if (pr == "") next
+        # Track first/last ts and distinct PRs per slug.
+        if (drafts_first[slug] == "") drafts_first[slug] = ts
+        drafts_last[slug] = ts
+        key = slug "|" pr
+        if (!(key in seen_pr)) {
+          seen_pr[key] = 1
+          if (drafts_prs[slug] == "") drafts_prs[slug] = pr
+          else                          drafts_prs[slug] = drafts_prs[slug] "," pr
+          drafts_count[slug]++
+        }
+      } else if (type == "ship_paused") {
+        # Only fire when there are >=3 distinct-PR drafts and the pause
+        # is reason=sendback_streak (or count>=3).
+        reason = field($0, "reason")
+        if ((drafts_count[slug] + 0) >= 3) {
+          printf("sendback_streak\t%s\t%s\t%s\t%s\n",
+                 slug, drafts_prs[slug], drafts_first[slug], ts)
+          # Mark used so a later second ship_paused does not double-fire
+          # on the same draft set.
+          drafts_count[slug] = 0
+          drafts_prs[slug]   = ""
+          drafts_first[slug] = ""
+          # Reference reason once so awk does not complain about unread.
+          if (reason == "") {}
+        }
+      }
+    }
+  '
+}
+
+# Cluster detector: rollback_after_merge. A rollback_opened event whose
+# `reverts` field names a PR that earlier emitted pr_opened in the window.
+# Emits:
+#   rollback_after_merge<TAB><slug><TAB><orig_pr,revert_pr><TAB><orig_ts><TAB><rollback_ts>
+incident_detect_rollback_after_merge() {
+  awk '
+    function field(line, name,    re, start, raw, end) {
+      re = "\"" name "\"[[:space:]]*:[[:space:]]*"
+      start = match(line, re)
+      if (start == 0) return ""
+      raw = substr(line, start + RLENGTH)
+      if (substr(raw, 1, 1) == "\"") {
+        end = index(substr(raw, 2), "\"")
+        if (end == 0) return ""
+        return substr(raw, 2, end - 1)
+      }
+      end = match(raw, /[,}]/)
+      if (end == 0) return raw
+      return substr(raw, 1, end - 1)
+    }
+    {
+      ts = field($0, "ts"); slug = field($0, "slug"); type = field($0, "type")
+      if (slug == "" || ts == "") next
+      if (type == "pr_opened") {
+        num = field($0, "number")
+        if (num != "") {
+          key = slug "|" num
+          opened_ts[key] = ts
+        }
+      } else if (type == "rollback_opened") {
+        pr = field($0, "pr"); rev = field($0, "reverts")
+        key = slug "|" rev
+        if (key in opened_ts) {
+          printf("rollback_after_merge\t%s\t%s,%s\t%s\t%s\n",
+                 slug, rev, pr, opened_ts[key], ts)
+        }
+      }
+    }
+  '
+}
+
+# Cluster detector: prompts_revision_walk. A prompts_drift OR
+# prompts_pin_changed followed by a prompts_reverted within 7 days
+# (all in the window). Emits one row per detection:
+#   prompts_revision_walk<TAB><slug><TAB><revert_pr><TAB><first_ts><TAB><revert_ts>
+incident_detect_prompts_revision_walk() {
+  awk '
+    function field(line, name,    re, start, raw, end) {
+      re = "\"" name "\"[[:space:]]*:[[:space:]]*"
+      start = match(line, re)
+      if (start == 0) return ""
+      raw = substr(line, start + RLENGTH)
+      if (substr(raw, 1, 1) == "\"") {
+        end = index(substr(raw, 2), "\"")
+        if (end == 0) return ""
+        return substr(raw, 2, end - 1)
+      }
+      end = match(raw, /[,}]/)
+      if (end == 0) return raw
+      return substr(raw, 1, end - 1)
+    }
+    {
+      ts = field($0, "ts"); slug = field($0, "slug"); type = field($0, "type")
+      if (slug == "" || ts == "") next
+      if (type == "prompts_drift" || type == "prompts_pin_changed") {
+        if (first_ts[slug] == "") first_ts[slug] = ts
+      } else if (type == "prompts_reverted") {
+        if (first_ts[slug] != "") {
+          pr = field($0, "pr")
+          printf("prompts_revision_walk\t%s\t%s\t%s\t%s\n",
+                 slug, pr, first_ts[slug], ts)
+          first_ts[slug] = ""  # consume the pairing
+        }
+      }
+    }
+  '
+}
+
+# Cluster detector: budget_block_recurrence. >=2 budget_block events on
+# different UTC days within the window. Emits one row per slug:
+#   budget_block_recurrence<TAB><slug><TAB>—<TAB><first_ts><TAB><last_ts>
+incident_detect_budget_block_recurrence() {
+  awk '
+    function field(line, name,    re, start, raw, end) {
+      re = "\"" name "\"[[:space:]]*:[[:space:]]*"
+      start = match(line, re)
+      if (start == 0) return ""
+      raw = substr(line, start + RLENGTH)
+      if (substr(raw, 1, 1) == "\"") {
+        end = index(substr(raw, 2), "\"")
+        if (end == 0) return ""
+        return substr(raw, 2, end - 1)
+      }
+      end = match(raw, /[,}]/)
+      if (end == 0) return raw
+      return substr(raw, 1, end - 1)
+    }
+    {
+      ts = field($0, "ts"); slug = field($0, "slug"); type = field($0, "type")
+      if (slug == "" || ts == "") next
+      if (type != "budget_block") next
+      # UTC date = first 10 chars of ts (YYYY-MM-DD).
+      day = substr(ts, 1, 10)
+      key = slug "|" day
+      if (!(key in seen_day)) {
+        seen_day[key] = 1
+        distinct_days[slug]++
+      }
+      if (first_ts[slug] == "") first_ts[slug] = ts
+      last_ts[slug] = ts
+    }
+    END {
+      for (s in distinct_days) {
+        if (distinct_days[s] >= 2) {
+          printf("budget_block_recurrence\t%s\t—\t%s\t%s\n",
+                 s, first_ts[s], last_ts[s])
+        }
+      }
+    }
+  '
+}
+
+# Open-action detector: resume actions. For every ship_paused without a
+# later ship_resumed in the window, emit one row:
+#   resume<TAB><slug><TAB>fleet resume <slug>
+incident_open_resume_actions() {
+  awk '
+    function field(line, name,    re, start, raw, end) {
+      re = "\"" name "\"[[:space:]]*:[[:space:]]*"
+      start = match(line, re)
+      if (start == 0) return ""
+      raw = substr(line, start + RLENGTH)
+      if (substr(raw, 1, 1) == "\"") {
+        end = index(substr(raw, 2), "\"")
+        if (end == 0) return ""
+        return substr(raw, 2, end - 1)
+      }
+      end = match(raw, /[,}]/)
+      if (end == 0) return raw
+      return substr(raw, 1, end - 1)
+    }
+    {
+      ts = field($0, "ts"); slug = field($0, "slug"); type = field($0, "type")
+      if (slug == "" || ts == "") next
+      if (type == "ship_paused")   paused[slug] = ts
+      if (type == "ship_resumed")  resumed[slug] = ts
+    }
+    END {
+      for (s in paused) {
+        if (!(s in resumed) || resumed[s] < paused[s]) {
+          printf("resume\t%s\tfleet resume %s\n", s, s)
+        }
+      }
+    }
+  '
+}
+
+# Open-action detector: lesson promote actions. For every
+# lesson_draft_emitted without a later lesson_promoted whose text_sha
+# matches, emit one row per outstanding draft:
+#   promote<TAB><slug><TAB>fleet lessons-promote <slug>
+incident_open_promote_actions() {
+  awk '
+    function field(line, name,    re, start, raw, end) {
+      re = "\"" name "\"[[:space:]]*:[[:space:]]*"
+      start = match(line, re)
+      if (start == 0) return ""
+      raw = substr(line, start + RLENGTH)
+      if (substr(raw, 1, 1) == "\"") {
+        end = index(substr(raw, 2), "\"")
+        if (end == 0) return ""
+        return substr(raw, 2, end - 1)
+      }
+      end = match(raw, /[,}]/)
+      if (end == 0) return raw
+      return substr(raw, 1, end - 1)
+    }
+    {
+      slug = field($0, "slug"); type = field($0, "type")
+      if (slug == "") next
+      if (type == "lesson_draft_emitted") {
+        sha = field($0, "text_sha")
+        # Without a text_sha we still count the draft (the cross-ref check
+        # falls back to "any promote for this slug closes one draft").
+        if (sha == "") sha = "draft-" (++anon[slug])
+        key = slug "|" sha
+        draft_open[key] = 1
+        draft_slug[key] = slug
+      } else if (type == "lesson_promoted") {
+        sha = field($0, "text_sha")
+        if (sha != "") {
+          # Search any draft for this slug with matching sha.
+          for (k in draft_open) {
+            split(k, parts, "|")
+            if (parts[1] == slug && parts[2] == sha) {
+              delete draft_open[k]
+            }
+          }
+        }
+      }
+    }
+    END {
+      for (k in draft_open) {
+        s = draft_slug[k]
+        printf("promote\t%s\tfleet lessons-promote %s\n", s, s)
+      }
+    }
+  '
+}
+
+# Open-action detector: merge-or-close revert PR. For every
+# rollback_opened, call `gh pr view <pr> --json state` and treat MERGED
+# or CLOSED as resolved. Network-touching; skipped when AGENT_DRY_RUN=1.
+# Emits one row per still-open revert:
+#   merge_revert<TAB><slug><TAB>merge or close revert PR #<N>
+incident_open_revert_merge_actions() {
+  local stream_file="$1"
+  [ -f "$stream_file" ] || return 0
+  # First pass: collect (slug, pr) for every rollback_opened in the window.
+  while IFS= read -r line; do
+    local type slug pr
+    type="$(incident_field "$line" "type")"
+    [ "$type" = "rollback_opened" ] || continue
+    slug="$(incident_field "$line" "slug")"
+    pr="$(incident_field "$line" "pr")"
+    [ -z "$slug" ] || [ -z "$pr" ] && continue
+    if [ "${AGENT_DRY_RUN:-0}" = "1" ]; then
+      # Dry-run: assume the revert is still open and surface it.
+      printf -- 'merge_revert\t%s\tmerge or close revert PR #%s\n' "$slug" "$pr"
+      continue
+    fi
+    local state
+    state="$(gh pr view "$pr" --json state 2>/dev/null \
+      | awk -F'"state":"' 'NF>1 { sub(/".*$/, "", $2); print $2; exit }')"
+    case "$state" in
+      MERGED|CLOSED) ;;                # resolved — skip
+      *) printf -- 'merge_revert\t%s\tmerge or close revert PR #%s\n' "$slug" "$pr" ;;
+    esac
+  done < "$stream_file"
+}
+
+# Render the markdown post-mortem. Reads pre-computed pieces from files
+# under $tmp_dir (so multi-line values never go through `awk -v`, per
+# LESSONS 2026-06-01).
+incident_render_markdown() {
+  local start_iso="$1" end_iso="$2" slugs_csv="$3"
+  local stream_file="$4" clusters_file="$5" actions_file="$6"
+
+  # Header.
+  printf -- '# INCIDENT — %s, %s → %s\n' "$slugs_csv" "$start_iso" "$end_iso"
+  printf -- '\n'
+
+  # Empty window: print the quiet message and stop.
+  if [ ! -s "$stream_file" ]; then
+    printf -- 'No events in window. fleet is quiet — this is normal.\n'
+    return 0
+  fi
+
+  # Timeline.
+  printf -- '## Timeline\n'
+  printf -- '\n'
+  local line
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    incident_render_event_line "$line"
+  done < "$stream_file"
+  printf -- '\n'
+
+  # Cluster summary.
+  printf -- '## Cluster summary\n'
+  printf -- '\n'
+  if [ -s "$clusters_file" ]; then
+    local ctype cslug cprs cfirst clast
+    while IFS=$'\t' read -r ctype cslug cprs cfirst clast; do
+      [ -z "$ctype" ] && continue
+      case "$ctype" in
+        sendback_streak)
+          printf -- '- `sendback_streak` (%s) — drafts on PRs %s ending in ship_paused at %s\n' \
+            "$cslug" "$cprs" "$clast"
+          ;;
+        rollback_after_merge)
+          printf -- '- `rollback_after_merge` (%s) — PRs %s (opened %s, rolled back %s)\n' \
+            "$cslug" "$cprs" "$cfirst" "$clast"
+          ;;
+        prompts_revision_walk)
+          printf -- '- `prompts_revision_walk` (%s) — prompts_drift/pin_changed at %s, reverted via PR #%s at %s\n' \
+            "$cslug" "$cfirst" "$cprs" "$clast"
+          ;;
+        budget_block_recurrence)
+          printf -- '- `budget_block_recurrence` (%s) — budget_block recurred between %s and %s\n' \
+            "$cslug" "$cfirst" "$clast"
+          ;;
+        *)
+          printf -- '- `%s` (%s)\n' "$ctype" "$cslug"
+          ;;
+      esac
+    done < "$clusters_file"
+  else
+    printf -- '- No clusters detected — events are independent.\n'
+  fi
+  printf -- '\n'
+
+  # Open recovery actions.
+  printf -- '## Open recovery actions\n'
+  printf -- '\n'
+  if [ -s "$actions_file" ]; then
+    # Group promote rows by slug so the operator sees one summary line
+    # per slug rather than one row per outstanding draft. macOS bash 3.2
+    # has no associative arrays, so we precompute a "slug<TAB>count"
+    # table via awk and look up by grep.
+    local promote_counts
+    promote_counts="$(awk -F'\t' '$1 == "promote" { c[$2]++ } END { for (s in c) print s "\t" c[s] }' "$actions_file")"
+    local seen_promote=""
+    local akind aslug arem
+    while IFS=$'\t' read -r akind aslug arem; do
+      [ -z "$akind" ] && continue
+      case "$akind" in
+        resume)       printf -- '- `%s` — %s\n' "$aslug" "$arem" ;;
+        merge_revert) printf -- '- `%s` — %s\n' "$aslug" "$arem" ;;
+        promote)
+          case " $seen_promote " in
+            *" $aslug "*) ;;
+            *)
+              local cnt
+              cnt="$(printf -- '%s\n' "$promote_counts" \
+                | awk -F'\t' -v s="$aslug" '$1 == s { print $2; exit }')"
+              [ -z "$cnt" ] && cnt=1
+              printf -- '- `%s` — %s (%s outstanding draft(s))\n' \
+                "$aslug" "$arem" "$cnt"
+              seen_promote="$seen_promote $aslug"
+              ;;
+          esac
+          ;;
+        *) printf -- '- `%s` — %s\n' "$aslug" "$arem" ;;
+      esac
+    done < "$actions_file"
+  else
+    printf -- '- No open actions — every incident in the window has a recorded recovery.\n'
+  fi
+  printf -- '\n'
+
+  return 0
+}
+
+# Render the JSON synthesis object. Timeline is intentionally OMITTED
+# (operators wanting raw event lines use `fleet tail --json`). Per
+# LESSONS 2026-06-01 (awk -v multiline trap), every multi-line value
+# (none today, but defensive for future cluster types) goes through a
+# tmp file via `getline line < file`.
+incident_render_json() {
+  local start_iso="$1" end_iso="$2" slugs_csv="$3"
+  local clusters_file="$4" actions_file="$5"
+
+  local esc_start esc_end
+  esc_start="$(incident_json_escape "$start_iso")"
+  esc_end="$(incident_json_escape "$end_iso")"
+
+  # slugs array.
+  local slugs_json="[" first=1 s
+  local IFS_BAK="$IFS"
+  IFS=','
+  for s in $slugs_csv; do
+    [ -z "$s" ] && continue
+    local esc_s; esc_s="$(incident_json_escape "$s")"
+    if [ "$first" = "1" ]; then slugs_json+="\"$esc_s\""; first=0
+    else                         slugs_json+=",\"$esc_s\""; fi
+  done
+  IFS="$IFS_BAK"
+  slugs_json+="]"
+
+  # clusters array.
+  local clusters_json="[" cfirst=1
+  if [ -s "$clusters_file" ]; then
+    local ctype cslug cprs ctfirst ctlast
+    while IFS=$'\t' read -r ctype cslug cprs ctfirst ctlast; do
+      [ -z "$ctype" ] && continue
+      local esc_t esc_sl esc_f esc_l
+      esc_t="$(incident_json_escape "$ctype")"
+      esc_sl="$(incident_json_escape "$cslug")"
+      esc_f="$(incident_json_escape "$ctfirst")"
+      esc_l="$(incident_json_escape "$ctlast")"
+      # PRs: comma-separated tokens → JSON array of strings. The em-dash
+      # placeholder used by budget_block_recurrence renders as an empty
+      # array.
+      local prs_json="["
+      if [ "$cprs" != "—" ] && [ -n "$cprs" ]; then
+        local prfirst=1 p
+        local pIFS="$IFS"
+        IFS=','
+        for p in $cprs; do
+          [ -z "$p" ] && continue
+          local esc_p; esc_p="$(incident_json_escape "$p")"
+          if [ "$prfirst" = "1" ]; then prs_json+="\"$esc_p\""; prfirst=0
+          else                            prs_json+=",\"$esc_p\""; fi
+        done
+        IFS="$pIFS"
+      fi
+      prs_json+="]"
+      if [ "$cfirst" = "1" ]; then cfirst=0
+      else                          clusters_json+=","; fi
+      clusters_json+="{\"type\":\"$esc_t\",\"slug\":\"$esc_sl\",\"prs\":$prs_json,\"first_ts\":\"$esc_f\",\"last_ts\":\"$esc_l\"}"
+    done < "$clusters_file"
+  fi
+  clusters_json+="]"
+
+  # open_actions array.
+  local actions_json="[" afirst=1
+  if [ -s "$actions_file" ]; then
+    local akind aslug arem
+    while IFS=$'\t' read -r akind aslug arem; do
+      [ -z "$akind" ] && continue
+      local esc_k esc_sl esc_r
+      esc_k="$(incident_json_escape "$akind")"
+      esc_sl="$(incident_json_escape "$aslug")"
+      esc_r="$(incident_json_escape "$arem")"
+      if [ "$afirst" = "1" ]; then afirst=0
+      else                          actions_json+=","; fi
+      actions_json+="{\"kind\":\"$esc_k\",\"slug\":\"$esc_sl\",\"remediation\":\"$esc_r\"}"
+    done < "$actions_file"
+  fi
+  actions_json+="]"
+
+  printf -- '{"window":{"start":"%s","end":"%s"},"slugs":%s,"clusters":%s,"open_actions":%s}\n' \
+    "$esc_start" "$esc_end" "$slugs_json" "$clusters_json" "$actions_json"
+  return 0
+}
+
+incident() {
+  shift  # drop "incident"
+  local since="" slug_filter="" want_json=0 out_file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since)   since="${2:-}"; shift 2 ;;
+      --since=*) since="${1#--since=}"; shift ;;
+      --slug)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "incident: --slug requires a non-empty value" >&2
+          exit 2
+        fi
+        slug_filter="$2"; shift 2 ;;
+      --slug=*)
+        slug_filter="${1#--slug=}"
+        if [ -z "$slug_filter" ]; then
+          echo "incident: --slug requires a non-empty value" >&2
+          exit 2
+        fi
+        shift ;;
+      --json)    want_json=1; shift ;;
+      --out)     out_file="${2:-}"; shift 2 ;;
+      --out=*)   out_file="${1#--out=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet incident — assemble a post-mortem from the event channel.
+
+Usage:
+  fleet incident --since <Nh|Nd>            survey every project, default text
+  fleet incident --since 72h --slug NAME    narrow to one project
+  fleet incident --since 72h --json         machine-readable synthesis object
+  fleet incident --since 72h --out FILE     write markdown to FILE (stderr line)
+
+Output (text mode):
+  # INCIDENT — <slug-list>, <iso-start> → <iso-end>
+
+  ## Timeline
+    - <iso-ts> — \`<type>\` <one-line-payload>
+
+  ## Cluster summary
+    - \`<cluster-token>\` (<slug>) — <one-line-summary>
+
+  ## Open recovery actions
+    - \`<slug>\` — <remediation command>
+
+Cluster detectors:
+  sendback_streak           >=3 lesson_draft_emitted on distinct PRs within
+                             24h ending in a ship_paused
+  rollback_after_merge      rollback_opened.reverts cross-references a
+                             pr_opened in the window
+  prompts_revision_walk     prompts_drift|prompts_pin_changed followed by a
+                             prompts_reverted within 7 days
+  budget_block_recurrence   >=2 budget_block events on distinct UTC days
+
+Open-action detectors (event opener with no closer):
+  ship_paused -> ship_resumed
+  lesson_draft_emitted (text_sha) -> lesson_promoted (text_sha)
+  rollback_opened -> revert PR state MERGED|CLOSED (via gh pr view)
+
+--since is REQUIRED — incidents have no implicit window. Reuses
+digest_parse_since for the Nh|Nd parser. Pure consumer of events.jsonl;
+no new event types are emitted.
+
+Exit code: 0 on success; 2 on usage error.
+USAGE
+        exit 0 ;;
+      *) echo "incident: unknown flag '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  # --since required.
+  if [ -z "$since" ]; then
+    echo "incident: --since <Nh|Nd> is required" >&2
+    exit 2
+  fi
+  local since_seconds
+  if ! since_seconds="$(digest_parse_since "$since")"; then
+    echo "incident: invalid --since \"$since\" (use Nh or Nd)" >&2
+    exit 2
+  fi
+
+  # Resolve window: end = now (override-able for tests); start = end - since.
+  local end_epoch start_epoch
+  end_epoch="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  start_epoch=$(( end_epoch - since_seconds ))
+  local start_iso end_iso
+  start_iso="$(date -u -r "$start_epoch" +%FT%TZ 2>/dev/null || date -u -d "@$start_epoch" +%FT%TZ)"
+  end_iso="$(date -u -r "$end_epoch" +%FT%TZ 2>/dev/null || date -u -d "@$end_epoch" +%FT%TZ)"
+
+  # Discover project (slug, events.jsonl) pairs.
+  local discover_rows
+  discover_rows="$(incident_discover_events)"
+  if [ -n "$slug_filter" ]; then
+    discover_rows="$(printf -- '%s\n' "$discover_rows" | awk -F'\t' -v s="$slug_filter" '$1 == s')"
+  fi
+
+  # Build the slugs CSV (sorted, comma-joined).
+  local slugs_csv
+  slugs_csv="$(printf -- '%s\n' "$discover_rows" | awk -F'\t' 'NF>0 { print $1 }' \
+    | sort -u | awk 'NR==1 { printf("%s", $0); next } { printf(",%s", $0) }')"
+  if [ -z "$slugs_csv" ]; then
+    if [ -n "$slug_filter" ]; then
+      slugs_csv="$slug_filter"
+    else
+      slugs_csv="(none)"
+    fi
+  fi
+
+  # Walk events in window — produces one JSON line per event, ISO-sorted.
+  local tmp_dir
+  tmp_dir="$(mktemp -d -t fleet-incident.XXXXXX)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  local stream_file="$tmp_dir/stream.jsonl"
+  printf -- '%s\n' "$discover_rows" \
+    | incident_walk_events "$start_iso" "$end_iso" > "$stream_file"
+
+  # Run cluster detectors. Each detector reads the stream and emits zero
+  # or more rows to its own file; we concatenate them in detector order.
+  local clusters_file="$tmp_dir/clusters.tsv"
+  : > "$clusters_file"
+  incident_detect_sendback_streak           < "$stream_file" >> "$clusters_file"
+  incident_detect_rollback_after_merge      < "$stream_file" >> "$clusters_file"
+  incident_detect_prompts_revision_walk     < "$stream_file" >> "$clusters_file"
+  incident_detect_budget_block_recurrence   < "$stream_file" >> "$clusters_file"
+
+  # Run open-action detectors.
+  local actions_file="$tmp_dir/actions.tsv"
+  : > "$actions_file"
+  incident_open_resume_actions   < "$stream_file" >> "$actions_file"
+  incident_open_promote_actions  < "$stream_file" >> "$actions_file"
+  incident_open_revert_merge_actions "$stream_file" >> "$actions_file"
+
+  # Render.
+  if [ "$want_json" = "1" ]; then
+    if [ -n "$out_file" ]; then
+      incident_render_json "$start_iso" "$end_iso" "$slugs_csv" \
+        "$clusters_file" "$actions_file" > "$out_file"
+      printf -- 'incident: wrote post-mortem to %s\n' "$out_file" >&2
+    else
+      incident_render_json "$start_iso" "$end_iso" "$slugs_csv" \
+        "$clusters_file" "$actions_file"
+    fi
+    exit 0
+  fi
+
+  if [ -n "$out_file" ]; then
+    incident_render_markdown "$start_iso" "$end_iso" "$slugs_csv" \
+      "$stream_file" "$clusters_file" "$actions_file" > "$out_file"
+    printf -- 'incident: wrote post-mortem to %s\n' "$out_file" >&2
+  else
+    incident_render_markdown "$start_iso" "$end_iso" "$slugs_csv" \
+      "$stream_file" "$clusters_file" "$actions_file"
+  fi
+  exit 0
+}
+
+if [ "$CMD" = "incident" ]; then
+  incident "$@"
   exit $?
 fi
 
