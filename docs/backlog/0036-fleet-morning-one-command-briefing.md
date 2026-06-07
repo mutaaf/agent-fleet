@@ -1,7 +1,7 @@
 ---
 id: 0036
 title: fleet morning collapses the daily briefing into one composed command
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-07
@@ -367,7 +367,21 @@ doesn't have to re-discover the architecture.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD — branch `feat/0036-...` opened
-- YYYY-MM-DD — failing test added in `tests/morning.sh`
-- YYYY-MM-DD — PR #N opened, CI [state]
-- YYYY-MM-DD — merged to main
+- 2026-06-07 — branch `feat/0036-fleet-morning-one-command-briefing` opened
+- 2026-06-07 — `tests/morning.sh` added covering all 10 AC boxes; failing
+  baseline confirmed (no `morning` subcommand falls through to `fleet
+  status`).
+- 2026-06-07 — `morning()` + helpers (`morning_clock_now`, `morning_dow`,
+  `morning_json_escape`, `morning_count_owes_click`,
+  `morning_count_paused`, `morning_any_projects`, `morning_next_hint`,
+  `morning_atlas_top3`, `morning_render_text`, `morning_render_json`)
+  added in `bin/fleet` BELOW the four delegated readers per LESSONS
+  2026-06-05 (forward-reference trap). Dispatcher block uses explicit
+  `exit $?` per LESSONS 2026-06-01. `morning_json_escape` is a
+  bit-for-bit copy of `provenance_json_escape` with the `code -ge 0`
+  UTF-8 guard from LESSONS 2026-06-03 — same shape ticket 0034 used.
+- 2026-06-07 — golden text fixture at
+  `tests/fixtures/morning/morning.text.golden.txt`. The composition
+  strips inbox's own banner + trailing line (which depends on
+  wall-clock state-file mtime) so the golden stays byte-stable across
+  CI runs regardless of when the test fires.

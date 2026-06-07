@@ -444,6 +444,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ### Daily ops
 
 ```bash
+~/code/agent-fleet/bin/fleet morning                 # one-command daily briefing — verdict + digest + inbox (+ Sunday weekly + atlas top-3); start here
 ~/code/agent-fleet/bin/fleet doctor                  # PASS/WARN/FAIL across every installed project
 ~/code/agent-fleet/bin/fleet doctor --slug courtiq   # one project
 ~/code/agent-fleet/bin/fleet doctor --json           # machine-readable, for fleet-control
