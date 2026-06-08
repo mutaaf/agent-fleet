@@ -57,4 +57,4 @@ ones, `review` grades them.
 | 0036 | fleet morning collapses the daily briefing into one composed command | P1 | shipped | observability |
 | 0037 | fleet incident assembles a window of events into a single structured post-mortem | P1 | shipped | observability |
 | 0038 | fleet diff <slug-a> <slug-b> calls out cross-project ROI and posture divergence | P2 | shipped | observability |
-| 0039 | LESSONS expiry markers let PHASE 0 reads skip stale operational memory | P2 | in-progress | governance |
+| 0039 | LESSONS expiry markers let PHASE 0 reads skip stale operational memory | P2 | shipped | governance |

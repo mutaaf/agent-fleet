@@ -1,7 +1,7 @@
 ---
 id: 0039
 title: LESSONS expiry markers let PHASE 0 reads skip stale operational memory
-status: in-progress
+status: shipped
 priority: P2
 area: governance
 created: 2026-06-07
@@ -500,3 +500,5 @@ doesn't have to re-discover the architecture.
 - 2026-06-08 — implementation landed in `bin/fleet` (`lessons_prune` + 7 helpers, ~370 LOC), AGENTS.md gained the `## Lessons` section + `lessons_pruned` telemetry bullet, README "Daily ops" + bin/fleet help banner updated, `docs/LESSONS-ARCHIVE.md` shipped with the load-bearing preamble
 - 2026-06-08 — LESSON appended: `IFS=$'\t' read -r` collapses adjacent tabs and shifts fields left when a middle column is empty (TSV sentinel fix)
 - 2026-06-08 — local gate green: `shellcheck -S warning lib/*.sh bin/fleet` + `bash -n` + `node scripts/check-backlog.mjs` + `bash tests/lessons-prune.sh` all pass
+- 2026-06-08 — PR #81 opened against `main`; auto-merge armed via `gh pr merge --auto --squash`; `pr_opened` event emitted to the kit-as-project events.jsonl
+- 2026-06-08 — CI green (`shellcheck` 30s, `validate` 9s); PR #81 auto-merged to main
