@@ -1,7 +1,7 @@
 ---
 id: 0038
 title: fleet diff <slug-a> <slug-b> calls out cross-project ROI and posture divergence
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-07
@@ -457,7 +457,7 @@ doesn't have to re-discover the architecture.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD — branch `feat/0038-...` opened
+- 2026-06-08 — branch `feat/0038-fleet-diff-cross-project-divergence` opened; status flipped groomed → in-progress
 - YYYY-MM-DD — failing test added in `tests/diff.sh`
 - YYYY-MM-DD — PR #N opened, CI [state]
 - YYYY-MM-DD — merged to main
