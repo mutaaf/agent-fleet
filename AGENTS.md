@@ -278,6 +278,27 @@ postcard.
     the shape of `rollback_opened` (0017) and `lesson_promoted`
     (0028): one operator-initiated action, one typed event, no
     transcript scraping required to reconstruct the recovery.
+  - `lessons_pruned {archived_count, since_date, pr, cause}` — emitted
+    by `bin/fleet lessons-prune --commit` (ticket 0039) once per
+    successful archival run that moves one or more
+    `<!-- EXPIRES: YYYY-MM-DD -->`-marked paragraphs out of
+    `docs/LESSONS.md` and into `docs/LESSONS-ARCHIVE.md`. `archived_count`
+    is the number of paragraphs moved; `since_date` is the operator's
+    effective "today" (the `FLEET_NOW_OVERRIDE` test seam or
+    `date -u '+%Y-%m-%d'`); `pr` is the new chore PR's number; `cause`
+    is the mandatory `--cause "<one-line>"` value, recorded verbatim
+    (ASCII for v1, per the LESSONS 2026-06-03 sign-extension guard).
+    Carries `phase=prune` and lives in the AGENT-FLEET kit-as-project
+    `events.jsonl` (per the `lesson_promoted` / `prompts_reverted`
+    pattern — the kit IS a project for telemetry purposes). Dry-run
+    paths (`--dry-run`, `--help`) emit NO event; refusal paths
+    (missing `--cause`, non-ASCII `--cause`) emit NO event — only
+    successful archival PRs do. Mirrors the shape of `prompts_reverted`
+    (0035) and `lesson_promoted` (0028): one operator-initiated
+    curation action, one typed event, no transcript scraping required
+    to reconstruct why `docs/LESSONS.md` shrank in a given week.
+    Consumed by `fleet provenance` and any future
+    "LESSONS read-cost over time" rollup.
 
 **Demo path (ticket 0023).** `bin/fleet kickstart --demo` walks a
 credential-less synthetic ship cycle and emits the four core event
@@ -292,6 +313,39 @@ via `agents.config.sh` rather than scanning `$HOME/.cache` blindly.
 Add new event types in the same file; consumers MUST tolerate unknown types
 gracefully. Do not rename or repurpose an existing type — the contract is the
 moat.
+
+## Lessons
+
+`docs/LESSONS.md` is the loop's operational memory — every ship and
+groom run reads it at PHASE 0. The file is **append-only by contract**:
+never reorder, never delete a paragraph. A paragraph that documents a
+trap the kit has since defused at the helper level can still carry
+read-cost on every run forever, so paragraphs MAY carry an optional
+`<!-- EXPIRES: YYYY-MM-DD -->` HTML comment on the line immediately
+following the paragraph's `## YYYY-MM-DD — <title>` heading.
+
+The marker means: "on or after this date, this paragraph is a candidate
+for archival via `bin/fleet lessons-prune --commit`." It is a candidate
+marker, **not** an automatic removal — PHASE 0 still reads the
+paragraph until the operator runs `lessons-prune --commit` and the
+resulting `chore/lessons-prune-<date>` PR merges. The command moves
+expired paragraphs byte-for-byte into `docs/LESSONS-ARCHIVE.md` (a
+separate file that PHASE 0 readers DO NOT read), preserves history
+through git, and emits one `lessons_pruned` event per run (see
+§ Telemetry). A paragraph WITHOUT an EXPIRES marker is silent — never
+pruned regardless of age.
+
+```
+fleet lessons-prune --dry-run               # list expired paragraphs
+fleet lessons-prune --commit --cause "<text>"  # open chore PR moving them
+fleet lessons-prune --help                  # USAGE
+```
+
+Operator-invoked only. No launchd schedule, no auto-prune during
+`fleet groom` — the EXPIRES marker forces a deliberate human pass
+("this trap is defused, here is the helper that defuses it"), and
+the archive PR is the auditable trail. Restoration is standard git
+semantics: `git revert <prune-pr>`.
 
 ## Prompts changelog
 

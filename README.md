@@ -465,6 +465,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet replay courtiq --pr 17              # replay PR #17 through CURRENT prompts in dry-run (review by default; --phase ship to ask "what would the ship runner do?")
 ~/code/agent-fleet/bin/fleet replay courtiq --batch --since 14d  # grade current prompts against every agent-merged PR in the window (matrix + verdict; --json for fleet prompts-score)
 ~/code/agent-fleet/bin/fleet lessons-promote agent-fleet --lesson "<title>"   # curate one local lesson into cross-fleet (ticket 0028)
+~/code/agent-fleet/bin/fleet lessons-prune --dry-run                           # list expired LESSONS entries; --commit --cause "<text>" moves them to LESSONS-ARCHIVE.md (ticket 0039)
 ```
 
 **Dry-run mode (ticket 0010).** Setting `AGENT_DRY_RUN=1` flips
