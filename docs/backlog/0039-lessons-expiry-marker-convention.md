@@ -1,7 +1,7 @@
 ---
 id: 0039
 title: LESSONS expiry markers let PHASE 0 reads skip stale operational memory
-status: groomed
+status: in-progress
 priority: P2
 area: governance
 created: 2026-06-07
@@ -494,7 +494,4 @@ doesn't have to re-discover the architecture.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD — branch `feat/0039-...` opened
-- YYYY-MM-DD — failing test added in `tests/lessons-prune.sh`
-- YYYY-MM-DD — PR #N opened, CI [state]
-- YYYY-MM-DD — merged to main
+- 2026-06-08 — branch `feat/0039-lessons-prune` opened; ticket flipped to in-progress
