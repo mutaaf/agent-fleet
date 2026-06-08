@@ -317,6 +317,32 @@ very bottom of the file — `bin/fleet`'s dispatcher is interleaved
 with the function bodies (one inline `if [ "$CMD" = "<sub>" ]` block
 per subcommand), so the forward-reference window is narrow but real.
 
+## 2026-06-08 — awk `arr[count] = v; count++` with no `BEGIN { count = 0 }` stores the first value under the empty-string key
+
+While shipping ticket 0038's `diff_paused_hours`, the first cut of the
+awk-based ship_paused/ship_resumed pairing helper accumulated events
+into two parallel arrays via `events_ts[count] = ep; events_ty[count] =
+type; count++` in the per-line block. POSIX awk treats undeclared
+scalars as initially the empty string `""`, not 0; the first iteration
+therefore stored values under `events_ts[""]` and `events_ty[""]`,
+then `count++` numerically incremented `""` to 1 (because `"" + 1 == 1`
+in awk's coerce-to-number context). Subsequent iterations stored under
+indices 1, 2, 3 — so the FIRST event was silently lost. Symptom in
+`tests/diff.sh` AC#1: slug-b's paused-hours metric rendered as 0
+instead of the expected 26, because the `ship_paused` event (the
+opener of the interval) landed under `events_ts[""]` and never
+appeared in the final `for (i=0; i<count; i++)` walk. Only the
+`ship_resumed` event under index 1 was visible, and the unmatched
+`pause_start = 0` branch silently dropped it. Fix: add an explicit
+`BEGIN { count = 0 }` block so the counter is a true integer 0 from
+the first per-line block onward. Cheap defensive habit: any awk
+script that uses `arr[ctr] = v; ctr++` MUST `BEGIN { ctr = 0 }`,
+even when "obviously" the counter starts at zero — POSIX awk's
+implicit-empty-string trap is locale-stable, version-stable, and
+silent. Same rule applies to `arr[++ctr]` (the increment happens
+before the indexing on a pre-increment, but `++""` still yields 1
+not 0, just by a different path).
+
 ## 2026-06-07 — composing a reader that writes a wall-clock-stamped state file (inbox) into a golden-tested briefing forces a banner-strip pass
 
 While shipping ticket 0036's `fleet morning`, the first cut composed the

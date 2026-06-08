@@ -34,6 +34,9 @@
 #   fleet incident --since <Nh|Nd>  assemble a post-mortem from the event channel
 #                             (ticket 0037 — timeline + cluster summary + open recovery actions;
 #                              --slug/--json/--out; pure consumer of events.jsonl, no new event types)
+#   fleet diff <slug-a> <slug-b>  side-by-side ROI / posture comparison
+#                             (ticket 0038 — 8 metric rows + DIVERGENCE + HYPOTHESES;
+#                              --since Nh|Nd default 14d, --json; pure reader)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -8151,6 +8154,746 @@ EOS
 
 if [ "$CMD" = "morning" ]; then
   morning "$@"
+  exit $?
+fi
+
+# --- diff (ticket 0038) --------------------------------------------------
+# `fleet diff <slug-a> <slug-b> [--since Nh|Nd] [--json]` renders a
+# side-by-side ROI/posture comparison of two projects and calls out the
+# metrics where one is >=2x the other. Pure consumer of events.jsonl +
+# runs.jsonl + agents.config.sh; no new event types, no fleet_* signature
+# changes, no lib/ or prompts/ edits (per ticket 0038 § Engineering notes).
+#
+# Body placement: BELOW digest_parse_since (line ~1988), digest_spend_since
+# (~2017), digest_event_count_since (~2050), weekly_ship_count_since
+# (~2391), atlas_count_pattern (~7246), and provenance_json_escape (~6376)
+# — every helper diff_cmd reaches is already parsed by the time the
+# dispatcher fires (LESSONS 2026-06-05 forward-reference trap).
+#
+# Naming: the dispatcher function is `diff_cmd` (NOT `diff`) per LESSONS
+# 2026-05-26 — bin/fleet shells out to `/usr/bin/diff` from prompts_diff_
+# trees, so a `diff()` shell function would shadow it.
+#
+# Every code path exits explicitly per LESSONS 2026-06-01 (dispatcher
+# fall-through trap). Every printf with a value that might start with `-`
+# uses `printf -- '%s'` per LESSONS 2026-05-28. Every count uses
+# `awk … END { print n+0 }` per LESSONS 2026-06-01 (grep -c double-print
+# trap). Help-text grep in the test uses `grep -qF --` per LESSONS
+# 2026-05-30. JSON escaping uses the UTF-8-safe high-byte pass-through
+# per LESSONS 2026-06-03 (sign-extension trap).
+
+# Resolve slug → (manifest, events.jsonl, runs.jsonl, prompts_sha). Echoes
+# four tab-separated values, or empty when the slug is not installed.
+diff_resolve_slug() {
+  local want="$1"
+  local roots=("${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}" "$HOME/.local/share/agent-fleet/projects")
+  local root m slug pin
+  for root in "${roots[@]}"; do
+    [ -d "$root" ] || continue
+    while IFS= read -r m; do
+      [ -n "$m" ] || continue
+      # shellcheck disable=SC1090
+      slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+      if [ "$slug" = "$want" ]; then
+        # shellcheck disable=SC1090
+        pin=$( (source "$m"; echo "${PROMPTS_SHA:-}") 2>/dev/null )
+        local cache_dir="$HOME/.cache/${slug}-agent"
+        printf -- '%s\t%s\t%s\t%s\n' \
+          "$m" "$cache_dir/events.jsonl" "$cache_dir/runs.jsonl" "$pin"
+        return 0
+      fi
+    done < <(find "$root" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort)
+  done
+  return 0
+}
+
+# Count `pr_opened` events in events.jsonl whose ts >= cutoff.
+diff_count_pr_opened() {  # $1 = events.jsonl, $2 = cutoff epoch
+  digest_event_count_since "$1" "$2" "pr_opened"
+}
+
+# Sum the time slug spent paused. Walks the event stream within the
+# window; every ship_paused opens an interval, every ship_resumed closes
+# the most recent open interval; an unclosed interval is closed at
+# end_epoch. Echoes hours (integer floor). Pairs across the window
+# boundary are clipped to the window.
+diff_paused_hours() {  # $1 = events.jsonl, $2 = start_epoch, $3 = end_epoch
+  local events="$1" start_epoch="$2" end_epoch="$3"
+  [ -f "$events" ] || { echo 0; return 0; }
+  awk -v lo="$start_epoch" -v hi="$end_epoch" '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    BEGIN { count = 0 }
+    {
+      ts=""; type=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (type != "ship_paused" && type != "ship_resumed") next
+      ep = iso2ep(ts)
+      if (ep <= 0) next
+      events_ts[count] = ep
+      events_ty[count] = type
+      count++
+    }
+    END {
+      # Insertion sort by timestamp — small N (paused/resumed pairs).
+      for (i=0; i<count; i++) order[i]=i
+      for (i=1; i<count; i++) {
+        k = order[i]; j = i
+        while (j>0 && events_ts[order[j-1]] > events_ts[k]) { order[j]=order[j-1]; j-- }
+        order[j] = k
+      }
+      total_seconds = 0
+      pause_start = 0
+      for (i=0; i<count; i++) {
+        idx = order[i]
+        ep = events_ts[idx]; ty = events_ty[idx]
+        if (ty == "ship_paused") {
+          if (pause_start == 0) pause_start = ep
+        } else if (ty == "ship_resumed") {
+          if (pause_start > 0) {
+            s = pause_start
+            e = ep
+            if (s < lo) s = lo
+            if (e > hi) e = hi
+            if (e > s) total_seconds += (e - s)
+            pause_start = 0
+          }
+        }
+      }
+      # Unclosed pause — clip to end_epoch.
+      if (pause_start > 0) {
+        s = pause_start
+        e = hi
+        if (s < lo) s = lo
+        if (e > s) total_seconds += (e - s)
+      }
+      print int(total_seconds / 3600)
+    }
+  ' "$events"
+}
+
+# Count lesson_draft_emitted events in window whose text_sha has NO
+# matching lesson_promoted event with the same text_sha anywhere in the
+# events.jsonl (not just the window — once promoted, the debt is paid).
+diff_draft_debt() {  # $1 = events.jsonl, $2 = cutoff epoch
+  local events="$1" cutoff="$2"
+  [ -f "$events" ] || { echo 0; return 0; }
+  awk -v cutoff="$cutoff" '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    {
+      ts=""; type=""; sha=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"text_sha"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        sha=substr($0, RSTART, RLENGTH)
+        sub(/.*"text_sha"[[:space:]]*:[[:space:]]*"/, "", sha); sub(/".*/, "", sha)
+      }
+      if (type == "lesson_promoted") {
+        if (sha != "") promoted[sha] = 1
+      } else if (type == "lesson_draft_emitted") {
+        if (iso2ep(ts) < cutoff) next
+        if (sha == "") sha = "_anon_" NR
+        drafts[sha] = 1
+      }
+    }
+    END {
+      n = 0
+      for (k in drafts) if (!(k in promoted)) n++
+      print n+0
+    }
+  ' "$events"
+}
+
+# Find the infra_flake_rerun pattern with the most fires in the window.
+# Echo `<pattern>:<n>` (e.g. `gh_graphql_502:2`) or `none` when none fired.
+diff_top_atlas_pattern() {  # $1 = events.jsonl, $2 = cutoff epoch
+  local events="$1" cutoff="$2"
+  [ -f "$events" ] || { echo "none"; return 0; }
+  local top
+  top="$(awk -v cutoff="$cutoff" '
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    {
+      ts=""; type=""; pat=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"pattern"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        pat=substr($0, RSTART, RLENGTH)
+        sub(/.*"pattern"[[:space:]]*:[[:space:]]*"/, "", pat); sub(/".*/, "", pat)
+      }
+      if (type != "infra_flake_rerun") next
+      if (pat == "") next
+      if (iso2ep(ts) < cutoff) next
+      counts[pat]++
+    }
+    END {
+      best = ""; best_n = 0
+      for (p in counts) {
+        if (counts[p] > best_n || (counts[p] == best_n && (best == "" || p < best))) {
+          best = p; best_n = counts[p]
+        }
+      }
+      if (best == "") print "none"
+      else printf("%s:%d", best, best_n)
+    }
+  ' "$events")"
+  printf -- '%s' "$top"
+}
+
+# Render a short (7-char) prompts SHA for display, or `—` when empty.
+diff_short_sha() {
+  local s="${1-}"
+  if [ -z "$s" ]; then printf -- '—'; return 0; fi
+  printf -- '%s' "${s:0:7}"
+}
+
+# Compute the Δ column value for two numeric values.
+# Args: a, b. Echoes `<delta> (<pct>%)` or `=` when equal or `∞` when
+# one side is zero and the other is not.
+diff_delta_numeric() {
+  local a="$1" b="$2"
+  # Treat floats and ints uniformly via awk.
+  awk -v a="$a" -v b="$b" '
+    BEGIN {
+      a_n = a + 0; b_n = b + 0
+      if (a_n == b_n) { print "="; exit }
+      diff = b_n - a_n
+      # Format with sign.
+      sign = (diff >= 0) ? "+" : ""
+      # Percent change relative to |a|; guard with max(|a|, 1).
+      base = a_n; if (base < 0) base = -base
+      if (base < 1) base = 1
+      pct = int(100 * diff / base)
+      pct_sign = (pct >= 0) ? "+" : ""
+      # When a==0 and b!=0, mark percent as ∞.
+      if (a_n == 0 && b_n != 0) {
+        printf("%s%g (∞)", sign, diff); exit
+      }
+      # Avoid trailing .0 — print as integer when both are whole numbers.
+      ai = int(a_n); bi = int(b_n)
+      if (ai == a_n && bi == b_n) printf("%s%d (%s%d%%)", sign, diff, pct_sign, pct)
+      else                         printf("%s%.2f (%s%d%%)", sign, diff, pct_sign, pct)
+    }
+  '
+}
+
+# Compute the divergence ratio for two numeric values.
+# Returns `max(a,b) / max(min(a,b), 1)` as a float with 1 decimal.
+# When both equal zero, returns 0.0 (no divergence).
+diff_ratio() {
+  local a="$1" b="$2"
+  awk -v a="$a" -v b="$b" '
+    BEGIN {
+      a_n = a + 0; b_n = b + 0
+      mx = (a_n > b_n) ? a_n : b_n
+      mn = (a_n < b_n) ? a_n : b_n
+      if (mn < 1) mn = 1
+      if (mx == 0 && mn == 1) { printf("0.0"); exit }
+      printf("%.1f", mx / mn)
+    }
+  '
+}
+
+# Direction of divergence: `b>a`, `a>b`, or `equal`.
+diff_direction() {
+  local a="$1" b="$2"
+  awk -v a="$a" -v b="$b" '
+    BEGIN {
+      a_n = a + 0; b_n = b + 0
+      if (a_n == b_n) print "equal"
+      else if (b_n > a_n) print "b>a"
+      else print "a>b"
+    }
+  '
+}
+
+# Inline UTF-8-safe JSON escape (LESSONS 2026-06-03 sign-extension trap).
+# Bit-for-bit copy of provenance_json_escape — duplicated because
+# provenance_json_escape is defined LATER in bin/fleet (~line 6376) and
+# the dispatcher block for diff fires before that helper is parsed when
+# the dispatcher is positioned mid-file. Note: in our actual placement
+# diff_cmd sits ABOVE provenance_json_escape so this duplicate avoids a
+# forward-reference trap.
+diff_json_escape() {
+  local s="${1-}" out="" i ch code
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *)
+        printf -v code '%d' "'$ch"
+        if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+          printf -v out '%s\\u%04x' "$out" "$code"
+        else
+          out+="$ch"
+        fi
+        ;;
+    esac
+  done
+  printf -- '%s' "$out"
+}
+
+# Load all 8 metrics for one slug; output one line per metric as
+# `<name>\t<value>` to a tmp file path. Uses helpers defined above
+# (and digest_spend_since / weekly_ship_count_since defined earlier).
+diff_load_slug_metrics() {  # $1 = events, $2 = runs, $3 = prompts_sha, $4 = start, $5 = end, $6 = out_file
+  local events="$1" runs="$2" pin="$3" start_epoch="$4" end_epoch="$5" out_file="$6"
+  local ships merges sendbacks spend paused_h drafts top
+  ships="$(diff_count_pr_opened "$events" "$start_epoch")"
+  merges="$(weekly_ship_count_since "$runs" "$start_epoch")"
+  sendbacks="$(digest_event_count_since "$events" "$start_epoch" "lesson_draft_emitted")"
+  spend="$(digest_spend_since "$runs" "$start_epoch")"
+  paused_h="$(diff_paused_hours "$events" "$start_epoch" "$end_epoch")"
+  drafts="$(diff_draft_debt "$events" "$start_epoch")"
+  top="$(diff_top_atlas_pattern "$events" "$start_epoch")"
+  {
+    printf -- 'ships\t%s\n'                "$ships"
+    printf -- 'merges\t%s\n'               "$merges"
+    printf -- 'sendbacks\t%s\n'            "$sendbacks"
+    printf -- 'spend ($)\t%s\n'            "$spend"
+    printf -- 'paused hours\t%s\n'         "$paused_h"
+    printf -- 'draft promotion debt\t%s\n' "$drafts"
+    printf -- 'prompts SHA\t%s\n'          "$(diff_short_sha "$pin")"
+    printf -- 'top atlas pattern (fires)\t%s\n' "$top"
+  } > "$out_file"
+}
+
+# Hypothesize root causes from the divergence set + the two metric files.
+# Emits up to 4 hypothesis lines on stdout, in deterministic order.
+# Args: a_file, b_file, divergence_file (one metric name per line).
+diff_hypothesize() {
+  local a_file="$1" b_file="$2" div_file="$3"
+  local a_ships b_ships
+  a_ships="$(awk -F'\t' '$1 == "ships" { print $2 }' "$a_file")"
+  b_ships="$(awk -F'\t' '$1 == "ships" { print $2 }' "$b_file")"
+
+  local prompts_diverges=0 atlas_diverges=0 sendbacks_diverges=0 spend_diverges=0
+  while IFS= read -r m; do
+    case "$m" in
+      "prompts SHA")               prompts_diverges=1 ;;
+      "top atlas pattern (fires)") atlas_diverges=1 ;;
+      "sendbacks")                 sendbacks_diverges=1 ;;
+      'spend ($)')                 spend_diverges=1 ;;
+    esac
+  done < "$div_file"
+
+  # Ships "similar" = ratio < 2x.
+  local ships_ratio ships_similar=0
+  ships_ratio="$(diff_ratio "$a_ships" "$b_ships")"
+  if awk -v r="$ships_ratio" 'BEGIN { exit !(r + 0 < 2.0) }'; then
+    ships_similar=1
+  fi
+
+  local out=""
+  if [ "$prompts_diverges" -eq 1 ]; then
+    out+="prompts revision regression; run \`fleet prompts-score\` per slug"$'\n'
+  fi
+  if [ "$atlas_diverges" -eq 1 ]; then
+    out+="per-project CI/infra drift; investigate <slug>'s gh actions, not the kit"$'\n'
+  fi
+  if [ "$sendbacks_diverges" -eq 1 ] && [ "$prompts_diverges" -eq 0 ]; then
+    out+="per-project AGENTS.md drift; compare \`<slug-a>/AGENTS.md\` and \`<slug-b>/AGENTS.md\` § Hard NOs"$'\n'
+  fi
+  if [ "$spend_diverges" -eq 1 ] && [ "$ships_similar" -eq 1 ]; then
+    out+="per-project manifest drift; compare MAX_DAILY_USD and model choice in the two \`agents.config.sh\`"$'\n'
+  fi
+
+  if [ -z "$out" ]; then
+    # No keyed hypothesis fired. If the divergence set itself is empty
+    # there's nothing to explain — emit nothing. If divergence is
+    # non-empty but no hypothesis branch keyed off it, emit the
+    # fallback per AC#3.
+    if [ -s "$div_file" ]; then
+      printf -- 'no hypotheses surface from the divergence; inspect by hand.\n'
+    fi
+  else
+    printf -- '%s' "$out"
+  fi
+}
+
+# Compute the Δ column for one metric row. For numeric metrics, returns
+# a `+N (+P%)` string; for non-numeric (prompts SHA, top atlas pattern),
+# returns `=` or `differ`.
+diff_delta_for_metric() {
+  local name="$1" va="$2" vb="$3"
+  case "$name" in
+    "prompts SHA"|"top atlas pattern (fires)")
+      if [ "$va" = "$vb" ]; then printf -- '=' ; else printf -- 'differ'; fi
+      ;;
+    *)
+      diff_delta_numeric "$va" "$vb"
+      ;;
+  esac
+}
+
+# Detect whether a metric row "diverges". Non-numeric: differ. Numeric:
+# ratio >= 2.0. Echoes "1" diverges, "0" otherwise.
+diff_metric_diverges() {
+  local name="$1" va="$2" vb="$3"
+  case "$name" in
+    "prompts SHA"|"top atlas pattern (fires)")
+      if [ "$va" = "$vb" ]; then echo 0; else echo 1; fi
+      ;;
+    *)
+      local r; r="$(diff_ratio "$va" "$vb")"
+      if awk -v r="$r" 'BEGIN { exit !(r + 0 >= 2.0) }'; then
+        echo 1
+      else
+        echo 0
+      fi
+      ;;
+  esac
+}
+
+# Render the text table + DIVERGENCE + HYPOTHESES sections.
+diff_render_text() {
+  local slug_a="$1" slug_b="$2" a_file="$3" b_file="$4" div_file="$5"
+  local start_iso="$6" end_iso="$7" window_label="$8"
+
+  # Header.
+  printf -- 'DIFF %s — %s vs %s (%s → %s)\n' \
+    "$window_label" "$slug_a" "$slug_b" "$start_iso" "$end_iso"
+  printf -- '\n'
+
+  # Column widths. Long metric names ("top atlas pattern (fires)") take
+  # 25 chars + 1 padding; slug columns need to fit "actions_silent:5"
+  # type values plus a few chars headroom.
+  local col_metric=26 col_val=18
+  # Slug header is at least as wide as the slug name.
+  local len_a=${#slug_a}; local len_b=${#slug_b}
+  [ "$len_a" -gt "$col_val" ] && col_val="$len_a"
+  [ "$len_b" -gt "$col_val" ] && col_val="$len_b"
+
+  # Header row.
+  printf -- '%-*s %-*s %-*s %s\n' \
+    "$col_metric" "METRIC" "$col_val" "$slug_a" "$col_val" "$slug_b" "Δ"
+  # Underline.
+  local total_len=$(( col_metric + 1 + col_val + 1 + col_val + 1 + 30 ))
+  printf -- '%*s\n' "$total_len" '' | tr ' ' '-'
+
+  # Metric rows in order (stable: paste together by line number).
+  local name va vb delta
+  while IFS=$'\t' read -r name va; do
+    vb="$(awk -F'\t' -v n="$name" '$1 == n { print $2 }' "$b_file")"
+    delta="$(diff_delta_for_metric "$name" "$va" "$vb")"
+    printf -- '%-*s %-*s %-*s %s\n' \
+      "$col_metric" "$name" \
+      "$col_val" "$va" \
+      "$col_val" "$vb" \
+      "$delta"
+  done < "$a_file"
+
+  # DIVERGENCE section.
+  printf -- '\n'
+  printf -- 'DIVERGENCE (>=2x)\n'
+  if [ ! -s "$div_file" ]; then
+    printf -- '  no metric diverges; the two projects are behaving similarly.\n'
+  else
+    while IFS= read -r m; do
+      [ -z "$m" ] && continue
+      va="$(awk -F'\t' -v n="$m" '$1 == n { print $2 }' "$a_file")"
+      vb="$(awk -F'\t' -v n="$m" '$1 == n { print $2 }' "$b_file")"
+      case "$m" in
+        "prompts SHA"|"top atlas pattern (fires)")
+          printf -- '  %s: differs (%s vs %s)\n' "$m" "$va" "$vb"
+          ;;
+        *)
+          local r; r="$(diff_ratio "$va" "$vb")"
+          local dir; dir="$(diff_direction "$va" "$vb")"
+          if [ "$dir" = "b>a" ]; then
+            printf -- '  %s: %s is %sx %s\n' "$m" "$slug_b" "$r" "$slug_a"
+          elif [ "$dir" = "a>b" ]; then
+            printf -- '  %s: %s is %sx %s\n' "$m" "$slug_a" "$r" "$slug_b"
+          else
+            printf -- '  %s: differs\n' "$m"
+          fi
+          ;;
+      esac
+    done < "$div_file"
+  fi
+
+  # HYPOTHESES section.
+  printf -- '\n'
+  printf -- 'HYPOTHESES\n'
+  local hyp
+  hyp="$(diff_hypothesize "$a_file" "$b_file" "$div_file")"
+  # Substitute the literal `<slug-a>` / `<slug-b>` placeholders for the
+  # concrete slug names — keeps hypothesize() free of slug-arg plumbing.
+  hyp="${hyp//<slug-a>/$slug_a}"
+  hyp="${hyp//<slug-b>/$slug_b}"
+  # Indent every line by 2 spaces.
+  printf -- '%s' "$hyp" | awk 'NF { print "  " $0 } !NF { print }'
+}
+
+# Render the JSON shape per AC#8.
+diff_render_json() {
+  local slug_a="$1" slug_b="$2" a_file="$3" b_file="$4" div_file="$5"
+  local start_iso="$6" end_iso="$7"
+  local esc_a esc_b
+  esc_a="$(diff_json_escape "$slug_a")"
+  esc_b="$(diff_json_escape "$slug_b")"
+
+  printf -- '{"window":{"start":"%s","end":"%s"},"a":"%s","b":"%s"' \
+    "$start_iso" "$end_iso" "$esc_a" "$esc_b"
+
+  # metrics array.
+  printf -- ',"metrics":['
+  local first=1 name va vb delta
+  while IFS=$'\t' read -r name va; do
+    vb="$(awk -F'\t' -v n="$name" '$1 == n { print $2 }' "$b_file")"
+    [ "$first" -eq 1 ] || printf -- ','
+    first=0
+    case "$name" in
+      "prompts SHA"|"top atlas pattern (fires)")
+        # Non-numeric metrics: a/b are strings.
+        local pct
+        if [ "$va" = "$vb" ]; then pct='='; else pct='differ'; fi
+        printf -- '{"name":"%s","a":"%s","b":"%s","delta":null,"pct":"%s"}' \
+          "$(diff_json_escape "$name")" \
+          "$(diff_json_escape "$va")" \
+          "$(diff_json_escape "$vb")" \
+          "$pct"
+        ;;
+      *)
+        # Numeric metrics.
+        delta="$(awk -v a="$va" -v b="$vb" 'BEGIN { printf("%g", b-a) }')"
+        local pct
+        pct="$(diff_delta_for_metric "$name" "$va" "$vb")"
+        # Numeric a/b — escape just in case but they should be numeric.
+        printf -- '{"name":"%s","a":%s,"b":%s,"delta":%s,"pct":"%s"}' \
+          "$(diff_json_escape "$name")" \
+          "$va" "$vb" "$delta" \
+          "$(diff_json_escape "$pct")"
+        ;;
+    esac
+  done < "$a_file"
+  printf -- ']'
+
+  # divergence array.
+  printf -- ',"divergence":['
+  first=1
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    va="$(awk -F'\t' -v n="$m" '$1 == n { print $2 }' "$a_file")"
+    vb="$(awk -F'\t' -v n="$m" '$1 == n { print $2 }' "$b_file")"
+    [ "$first" -eq 1 ] || printf -- ','
+    first=0
+    case "$m" in
+      "prompts SHA"|"top atlas pattern (fires)")
+        printf -- '{"metric":"%s","ratio":null,"direction":"differ"}' \
+          "$(diff_json_escape "$m")"
+        ;;
+      *)
+        local r d
+        r="$(diff_ratio "$va" "$vb")"
+        d="$(diff_direction "$va" "$vb")"
+        printf -- '{"metric":"%s","ratio":%s,"direction":"%s"}' \
+          "$(diff_json_escape "$m")" "$r" "$d"
+        ;;
+    esac
+  done < "$div_file"
+  printf -- ']'
+
+  # hypotheses array.
+  printf -- ',"hypotheses":['
+  local hyp
+  hyp="$(diff_hypothesize "$a_file" "$b_file" "$div_file")"
+  hyp="${hyp//<slug-a>/$slug_a}"
+  hyp="${hyp//<slug-b>/$slug_b}"
+  first=1
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    [ "$first" -eq 1 ] || printf -- ','
+    first=0
+    printf -- '"%s"' "$(diff_json_escape "$line")"
+  done <<< "$hyp"
+  printf -- ']'
+
+  printf -- '}\n'
+}
+
+# Compute the divergence set from the two metric files — one metric
+# name per line on stdout (only the names that diverge).
+diff_compute_divergence() {  # $1 = a_file, $2 = b_file
+  local a_file="$1" b_file="$2"
+  local name va vb
+  while IFS=$'\t' read -r name va; do
+    vb="$(awk -F'\t' -v n="$name" '$1 == n { print $2 }' "$b_file")"
+    if [ "$(diff_metric_diverges "$name" "$va" "$vb")" = "1" ]; then
+      printf -- '%s\n' "$name"
+    fi
+  done < "$a_file"
+}
+
+diff_cmd() {
+  shift  # drop the leading "diff"
+  local want_json=0 since="14d"
+  local positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)    want_json=1; shift ;;
+      --since)   since="${2:-}"; shift 2 ;;
+      --since=*) since="${1#--since=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet diff — side-by-side ROI / posture comparison of two projects.
+
+Usage:
+  fleet diff <slug-a> <slug-b>             default --since 14d window
+  fleet diff <slug-a> <slug-b> --since 7d  override window (Nh or Nd)
+  fleet diff <slug-a> <slug-b> --json      machine-readable object
+
+Output (text mode):
+  DIFF <window> — <slug-a> vs <slug-b> (<iso-start> → <iso-end>)
+  METRIC                     <slug-a>    <slug-b>    Δ
+  ships                      ...
+  merges                     ...
+  sendbacks                  ...
+  spend ($)                  ...
+  paused hours               ...
+  draft promotion debt       ...
+  prompts SHA                ...
+  top atlas pattern (fires)  ...
+
+  DIVERGENCE (>=2x)
+    <metric>: <slug> is <ratio>x <other>
+
+  HYPOTHESES
+    <one short root-cause line per diverging metric>
+
+Delta column: <delta> (<pct>%) for numeric metrics; "=" when identical;
+"differ" for non-numeric pairs that disagree; infinity when one side is zero.
+
+Pure consumer of events.jsonl + runs.jsonl + agents.config.sh -
+no new event types, no fleet_* signature changes, no lib/ or
+prompts/ edits.
+
+Exit code: 0 on success; 2 on usage error.
+USAGE
+        exit 0 ;;
+      --)        shift; while [ $# -gt 0 ]; do positional+=("$1"); shift; done ;;
+      -*)
+        printf -- 'fleet diff: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        positional+=("$1"); shift ;;
+    esac
+  done
+
+  if [ "${#positional[@]}" -lt 2 ]; then
+    printf -- 'diff: usage: bin/fleet diff <slug-a> <slug-b> [--since Nh|Nd] [--json]\n' >&2
+    exit 2
+  fi
+
+  local slug_a="${positional[0]}" slug_b="${positional[1]}"
+
+  if [ "$slug_a" = "$slug_b" ]; then
+    printf -- 'diff: <slug-a> and <slug-b> must differ; use `fleet weekly --slug <slug>` for the same-project historical comparison\n' >&2
+    exit 2
+  fi
+
+  # Parse --since.
+  local since_seconds
+  if ! since_seconds="$(digest_parse_since "$since")"; then
+    printf -- 'diff: invalid --since "%s" (use Nh or Nd)\n' "$since" >&2
+    exit 2
+  fi
+
+  # Resolve slugs. Both must exist; missing-slug branch names which side.
+  local rec_a rec_b
+  rec_a="$(diff_resolve_slug "$slug_a")"
+  rec_b="$(diff_resolve_slug "$slug_b")"
+  if [ -z "$rec_a" ] || ! [ -f "$(printf -- '%s' "$rec_a" | awk -F'\t' '{print $2}')" ]; then
+    printf -- 'diff: slug "%s" not installed (no events.jsonl found)\n' "$slug_a" >&2
+    exit 2
+  fi
+  if [ -z "$rec_b" ] || ! [ -f "$(printf -- '%s' "$rec_b" | awk -F'\t' '{print $2}')" ]; then
+    printf -- 'diff: slug "%s" not installed (no events.jsonl found)\n' "$slug_b" >&2
+    exit 2
+  fi
+
+  local events_a runs_a pin_a events_b runs_b pin_b
+  events_a="$(printf -- '%s' "$rec_a" | awk -F'\t' '{print $2}')"
+  runs_a="$(printf -- '%s' "$rec_a" | awk -F'\t' '{print $3}')"
+  pin_a="$(printf -- '%s' "$rec_a" | awk -F'\t' '{print $4}')"
+  events_b="$(printf -- '%s' "$rec_b" | awk -F'\t' '{print $2}')"
+  runs_b="$(printf -- '%s' "$rec_b" | awk -F'\t' '{print $3}')"
+  pin_b="$(printf -- '%s' "$rec_b" | awk -F'\t' '{print $4}')"
+
+  # Resolve window.
+  local end_epoch start_epoch
+  end_epoch="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  start_epoch=$(( end_epoch - since_seconds ))
+  local start_iso end_iso
+  start_iso="$(date -u -r "$start_epoch" +%FT%TZ 2>/dev/null || date -u -d "@$start_epoch" +%FT%TZ)"
+  end_iso="$(date -u -r "$end_epoch" +%FT%TZ 2>/dev/null || date -u -d "@$end_epoch" +%FT%TZ)"
+
+  # Load metrics for both slugs.
+  local tmp_dir
+  tmp_dir="$(mktemp -d -t fleet-diff.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp_dir'" RETURN
+  local a_file="$tmp_dir/a.tsv" b_file="$tmp_dir/b.tsv" div_file="$tmp_dir/divergence.txt"
+  diff_load_slug_metrics "$events_a" "$runs_a" "$pin_a" "$start_epoch" "$end_epoch" "$a_file"
+  diff_load_slug_metrics "$events_b" "$runs_b" "$pin_b" "$start_epoch" "$end_epoch" "$b_file"
+  diff_compute_divergence "$a_file" "$b_file" > "$div_file"
+
+  if [ "$want_json" = "1" ]; then
+    diff_render_json "$slug_a" "$slug_b" "$a_file" "$b_file" "$div_file" \
+      "$start_iso" "$end_iso"
+  else
+    diff_render_text "$slug_a" "$slug_b" "$a_file" "$b_file" "$div_file" \
+      "$start_iso" "$end_iso" "$since"
+  fi
+  exit 0
+}
+
+if [ "$CMD" = "diff" ]; then
+  diff_cmd "$@"
   exit $?
 fi
 

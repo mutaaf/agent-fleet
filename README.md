@@ -458,6 +458,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet resume courtiq          # re-enable a ship_paused project (--force --reason "…" for audited override)
 ~/code/agent-fleet/bin/fleet atlas                   # fleet-wide infra-flake catalog with per-pattern frequency (text/json)
 ~/code/agent-fleet/bin/fleet incident --since 72h    # assemble a post-mortem from the event channel — timeline + cluster summary + open recovery actions (text/json/--out)
+~/code/agent-fleet/bin/fleet diff agent-fleet courtiq # side-by-side ROI / posture comparison of two projects — 8 metric rows + DIVERGENCE + HYPOTHESES (--since Nh|Nd; --json)
 ~/code/agent-fleet/bin/fleet kickstart courtiq ship             # trigger a one-shot agent-ship run
 ~/code/agent-fleet/bin/fleet kickstart courtiq ship --dry-run   # set AGENT_DRY_RUN=1 first, then kickstart
 ~/code/agent-fleet/bin/fleet kickstart --demo                   # credential-less synthetic loop in $TMPDIR (ticket 0023)
