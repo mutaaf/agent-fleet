@@ -378,3 +378,35 @@ Option (a) is the simplest when the composer owns its own
 "freshness" surface (a verdict line, a NEXT footer); options (b)
 and (c) only pay off when the composer needs to expose the
 reader's freshness to the operator unchanged.
+
+## 2026-06-08 — `IFS=$'\t' read -r f1 f2 f3 f4 f5` shifts fields left when a middle column is empty
+
+While shipping ticket 0039's `lessons_prune_scan`, the first cut
+emitted one TSV record per LESSONS paragraph in the shape
+`head\tend\torig\texpires\theadline`, where `expires` is an empty
+string for paragraphs without an `<!-- EXPIRES: -->` marker. The
+dispatcher consumed those records with
+`while IFS=$'\t' read -r head end orig expires headline; do …`.
+Bash 5.1's `read` builtin, when IFS is set to a NON-whitespace
+single character (here `\t`) and the input has two ADJACENT
+delimiters (an empty middle field), collapses them into one — so
+the empty `expires` field disappeared, the headline shifted left
+into `expires`, and `headline` came out empty. Symptom in
+`tests/lessons-prune.sh` AC#3: the unmarked paragraph's classifier
+warned `paragraph "" has invalid EXPIRES "bootstrap entry without
+expiry marker"` and the dry-run table missed two of its columns.
+This is documented bash behavior — POSIX says non-whitespace IFS
+chars produce one empty field per delimiter, but the bash manual
+notes "if the input contains adjacent delimiters that are not in
+IFS whitespace, no empty fields are produced" — confusing
+phrasing for a confusing rule. Fix: emit a sentinel string (we
+used `-`) in the optional column from awk, and map it back to
+empty in the dispatcher (`[ "$expires" = "-" ] && expires=""`).
+Cheap defensive habit: any TSV-with-`read` pipeline where ANY
+middle column can be empty must use a sentinel, NOT a true empty
+string. Same trap applies to space-separated columns under
+`IFS=' '` and to comma-separated under `IFS=','`. The only
+delimiter where `read` "does the right thing" with consecutive
+delimiters is whitespace IFS (the default), where adjacent
+whitespace IS treated as one separator — but that's the OPPOSITE
+problem and only safe when no column can contain spaces.

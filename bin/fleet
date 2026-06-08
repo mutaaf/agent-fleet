@@ -21,6 +21,9 @@
 #   fleet lessons-promote <slug> --lesson "<title>"
 #                             curate one lesson into cross-fleet
 #                             (ticket 0028 — operator's curation primitive)
+#   fleet lessons-prune --dry-run
+#                             list expired LESSONS entries (operator-invoked archival)
+#                             (ticket 0039 — --commit --cause "<text>" moves to LESSONS-ARCHIVE.md)
 #   fleet provenance <slug> <pr>  one-command audit receipt for a shipped PR
 #                             (ticket 0029 — text/md/json; network-free reader)
 #   fleet resume <slug>       re-enable a ship_paused project (safety-checked)
@@ -10662,6 +10665,556 @@ USAGE
 
 if [ "$CMD" = "lessons-promote" ]; then
   lessons_promote "$@"
+fi
+
+# --- lessons-prune --------------------------------------------------------
+# Ticket 0039. `bin/fleet lessons-prune --dry-run` walks
+# `docs/LESSONS.md`, flags every paragraph whose `<!-- EXPIRES:
+# YYYY-MM-DD -->` marker is <= today (today = $FLEET_NOW_OVERRIDE
+# when set, else `date -u '+%Y-%m-%d'`), and prints a 4-column table.
+# `--commit --cause "<one-line>"` moves those paragraphs from
+# `docs/LESSONS.md` into `docs/LESSONS-ARCHIVE.md`, commits on a
+# `chore/lessons-prune-<today>` branch, pushes, and opens a PR via
+# `gh pr create`. Emits one `lessons_pruned` event per successful
+# `--commit` (see AGENTS.md § Telemetry). Operator-invoked only.
+#
+# Hard NO: this command never touches `lib/` or `prompts/` — it is a
+# pure caller of `fleet_emit_event` (lib/common.sh ~1196). Per LESSONS
+# 2026-06-01 every code path ends with explicit `exit 0`/`exit 1`/
+# `exit 2` to dodge the dispatcher fall-through trap. Per LESSONS
+# 2026-05-28 every `printf` of `$cause` (which may begin with `-`)
+# uses `printf -- '%s'`. Per LESSONS 2026-06-01 (awk -v multiline
+# trap) paragraph bodies buffer to a tmp file and are pulled back in
+# via `getline line < file`. Per LESSONS 2026-06-01 (`grep -c …`
+# double-print trap) paragraph counts use `awk … END { print n+0 }`.
+# Per LESSONS 2026-06-03 the `--cause` value is restricted to ASCII
+# (same v1 constraint as ticket 0035's `--reason`).
+
+lessons_prune_kit_root() {
+  # FLEET_KIT_ROOT wins (test seam); else bin/fleet → .. .
+  if [ -n "${FLEET_KIT_ROOT:-}" ]; then
+    printf -- '%s\n' "$FLEET_KIT_ROOT"
+  else
+    ( cd "$( dirname "$0" )/.." && pwd )
+  fi
+}
+
+# Resolve today as YYYY-MM-DD. Test seam: FLEET_NOW_OVERRIDE.
+lessons_prune_today() {
+  if [ -n "${FLEET_NOW_OVERRIDE:-}" ]; then
+    # Accept either bare YYYY-MM-DD or "YYYY-MM-DD HH:MM" (the latter
+    # is morning_clock_now's shape); trim to the date part.
+    printf -- '%s\n' "${FLEET_NOW_OVERRIDE%% *}"
+  else
+    date -u '+%Y-%m-%d'
+  fi
+}
+
+# Walk $1 (LESSONS.md path) and emit one line per paragraph in the
+# format: `<head_line>\t<body_end_line>\t<orig_date>\t<expires_or_empty>\t<headline>`.
+# The expires field is the verbatim value from the marker (so the
+# caller can validate it as YYYY-MM-DD or warn). The headline is the
+# heading-line text with the leading `## YYYY-MM-DD — ` prefix
+# stripped. body_end_line is the LAST source line of the paragraph
+# (inclusive of trailing blank line before the next `## ` heading).
+#
+# Per LESSONS 2026-06-01 (awk -v multiline trap) we never pass the
+# paragraph BODIES through awk -v — we emit start/end line numbers
+# and let the caller slice via `sed -n 'A,Bp'` (byte-exact).
+lessons_prune_scan() {
+  local lessons="$1"
+  [ -f "$lessons" ] || return 0
+  awk '
+    BEGIN { head = 0; orig = ""; headline = ""; expires = "" }
+    function flush(end_line) {
+      if (head > 0) {
+        # Emit "-" as the EXPIRES placeholder for unmarked paragraphs.
+        # `read -r f1..f5` with non-whitespace IFS collapses adjacent
+        # tabs, so an empty middle field would shift fields right by
+        # one. The sentinel keeps every record at exactly 5 tab-
+        # separated columns.
+        out_exp = (expires == "" ? "-" : expires)
+        printf("%d\t%d\t%s\t%s\t%s\n", head, end_line, orig, out_exp, headline)
+      }
+    }
+    /^## [0-9]{4}-[0-9]{2}-[0-9]{2} / {
+      # Close the previous paragraph at NR-1 (last line was before us).
+      flush(NR - 1)
+      head = NR
+      orig = substr($0, 4, 10)   # `## YYYY-MM-DD`s `YYYY-MM-DD`
+      # The headline is everything after `## YYYY-MM-DD ` + the
+      # em-dash/separator + a space. We keep it simple: strip the
+      # `## YYYY-MM-DD ` prefix (13 chars + space) and any leading
+      # non-space token (the em-dash) + its trailing space.
+      tail = $0
+      sub(/^## [0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[^[:space:]]+[[:space:]]+/, "", tail)
+      headline = tail
+      expires = ""
+      next
+    }
+    # The EXPIRES marker can ONLY live on the line immediately after
+    # the heading (NR == head + 1). We accept any whitespace before/
+    # after the comment markers but require the EXPIRES: token.
+    head > 0 && NR == head + 1 && /<!--[[:space:]]*EXPIRES:[[:space:]]*[^[:space:]]+[[:space:]]*-->/ {
+      val = $0
+      sub(/^.*<!--[[:space:]]*EXPIRES:[[:space:]]*/, "", val)
+      sub(/[[:space:]]*-->.*$/, "", val)
+      expires = val
+    }
+    END {
+      # Final paragraph: end_line is the last line of the file (NR).
+      flush(NR)
+    }
+  ' "$lessons"
+}
+
+# Given a scan line and today's YYYY-MM-DD, classify the paragraph as
+# `prune` (expires <= today), `future` (expires > today), `unmarked`,
+# or `malformed` (bad date format). Echoes one of those tokens.
+lessons_prune_classify() {
+  local expires="$1" today="$2"
+  if [ -z "$expires" ]; then
+    echo "unmarked"; return 0
+  fi
+  # YYYY-MM-DD shape check.
+  case "$expires" in
+    [0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]) ;;
+    *)
+      echo "malformed"; return 0 ;;
+  esac
+  # Compare as strings — YYYY-MM-DD sorts lexicographically by date.
+  if [ "$expires" \> "$today" ]; then
+    echo "future"
+  else
+    echo "prune"
+  fi
+}
+
+# Render the 4-column dry-run table given the filtered-prune list
+# on stdin (one scan-line per match). Mirrors the example in
+# ticket 0039 § "User (operator after ...)".
+lessons_prune_render_dry_run() {
+  local today="$1"
+  awk -v today="$today" '
+    BEGIN {
+      printf("  %-10s  %-10s  %s\n", "EXPIRES", "DATE", "HEADLINE")
+    }
+    {
+      # tab-separated: head end orig expires headline
+      n = split($0, F, "\t")
+      if (n < 5) next
+      printf("  %-10s  %-10s  %s\n", F[4], F[3], F[5])
+    }
+  '
+}
+
+# Slice the byte-exact paragraph block from $lessons between line
+# $head and $end (inclusive) and append it (wrapped in an
+# `## archived <today> — originally <orig>` heading) to $archive.
+# Per LESSONS 2026-05-27 we use `cp`-style file ops (no `$(cat …)`
+# round-trips).
+lessons_prune_append_archive() {
+  local lessons="$1" archive="$2" today="$3" head="$4" end="$5" orig="$6"
+  # Normalize the archive file to end with EXACTLY one blank line
+  # before appending, so concatenated paragraphs are visually
+  # separated by one blank line (not zero, not two). We strip any
+  # trailing newlines via awk + temp, then re-add a single blank
+  # line. Per LESSONS 2026-05-27 we use `cp`-style file ops here
+  # (mv-over-tmp), not `$(cat …)`.
+  if [ -f "$archive" ]; then
+    local norm; norm="$(mktemp -t fleet-lessons-prune-norm.XXXXXX)"
+    awk '
+      { lines[NR] = $0 }
+      END {
+        end = NR
+        while (end >= 1 && lines[end] == "") end--
+        for (i = 1; i <= end; i++) print lines[i]
+      }
+    ' "$archive" > "$norm"
+    mv -f "$norm" "$archive"
+    # `print` adds a single `\n` per line so the file ends with `…text\n`.
+    # Add one blank line so the next heading is visually separated.
+    printf -- '\n' >> "$archive"
+  fi
+  {
+    printf -- '## archived %s — originally %s\n\n' "$today" "$orig"
+    sed -n "${head},${end}p" "$lessons"
+  } >> "$archive"
+}
+
+# Drop every paragraph whose head..end range appears in the
+# "prune list" file (one `head\tend` pair per line, sorted ascending)
+# from $lessons in one pass. Writes the result to $tmp and renames
+# atomically over $lessons. Per LESSONS 2026-05-27 we use `cp`-like
+# ops (file → tmp → mv), never `$(cat …)`. Per LESSONS 2026-06-01
+# we feed the prune-range list to awk via `getline … < file` rather
+# than `-v` (the value would contain newlines).
+lessons_prune_drop_paragraphs() {
+  local lessons="$1" range_file="$2"
+  local tmp; tmp="$(mktemp -t fleet-lessons-prune.XXXXXX)"
+  # Single awk pass: drop in-range lines, accumulate the survivors,
+  # then strip trailing blank lines in END so a paragraph removed
+  # from the bottom doesn't leave a dangling blank line. We MUST
+  # buffer into an array (the trim depends on knowing the end) —
+  # this is fine for a docs file the operator hand-tends. Per
+  # LESSONS 2026-06-01 the awk -v multiline trap does NOT apply
+  # here (range_file is read via getline < file, not -v).
+  # BEGIN { count = 0 } per LESSONS 2026-06-08 (POSIX awk's
+  # implicit-empty-string-key trap).
+  awk -v range_file="$range_file" '
+    BEGIN {
+      n = 0
+      while ((getline line < range_file) > 0) {
+        split(line, F, "\t")
+        if (F[1] == "" || F[2] == "") continue
+        n++
+        starts[n] = F[1] + 0
+        ends[n]   = F[2] + 0
+      }
+      close(range_file)
+      kept = 0
+    }
+    {
+      drop = 0
+      for (i = 1; i <= n; i++) {
+        if (NR >= starts[i] && NR <= ends[i]) { drop = 1; break }
+      }
+      if (!drop) {
+        kept++
+        out[kept] = $0
+      }
+    }
+    END {
+      # Strip trailing blank lines from the survivor list.
+      while (kept >= 1 && out[kept] == "") kept--
+      for (i = 1; i <= kept; i++) print out[i]
+    }
+  ' "$lessons" > "$tmp"
+  mv -f "$tmp" "$lessons"
+}
+
+# Bootstrap the LESSONS-ARCHIVE.md file with the load-bearing
+# preamble (per LESSONS 2026-05-25 — load-bearing docs are never
+# committed empty). Idempotent: a no-op if the file already exists.
+lessons_prune_ensure_archive_preamble() {
+  local archive="$1"
+  [ -f "$archive" ] && return 0
+  cat > "$archive" <<'PREAMBLE'
+# LESSONS — ARCHIVE
+
+This file is the retirement target for `docs/LESSONS.md` paragraphs
+whose `<!-- EXPIRES: YYYY-MM-DD -->` marker has come due and were
+moved here by `bin/fleet lessons-prune --commit`. Pruning is
+operator-invoked, append-only, and never deletes a lesson — the move
+is the contract.
+
+PHASE 0 readers DO NOT read this file. Only `docs/LESSONS.md` is on
+the hot read path. See `AGENTS.md § Lessons` and ticket 0039.
+PREAMBLE
+}
+
+# Emit the lessons_pruned event into the AGENT-FLEET kit-as-project
+# events.jsonl. Mirrors prompts_revert_emit_event (line ~534) and
+# lessons_promote_emit_event (line ~10476). Sources lib/common.sh in
+# a subshell so SLUG/CACHE_DIR/FLEET_PHASE scope to this emit only.
+lessons_prune_emit_event() {
+  local archived_count="$1" since_date="$2" pr="$3" cause="$4"
+  # The lib/common.sh source always comes from THIS script's
+  # checkout (`bin/fleet → ..`), never FLEET_KIT_ROOT — that env
+  # var is a test seam for redirecting the docs/LESSONS.md target,
+  # not the engine. Mirrors prompts_revert_emit_event (~line 534).
+  local lib_root; lib_root="$( cd "$( dirname "$0" )/.." && pwd )"
+  [ -f "$lib_root/lib/common.sh" ] || return 0
+  local cache_dir="$HOME/.cache/agent-fleet-agent"
+  mkdir -p "$cache_dir"
+  (
+    export SLUG="agent-fleet"
+    export CACHE_DIR="$cache_dir"
+    export FLEET_PHASE="prune"
+    # shellcheck disable=SC1090
+    source "$lib_root/lib/common.sh" >/dev/null 2>&1
+    fleet_emit_event lessons_pruned \
+      "archived_count=$archived_count" \
+      "since_date=$since_date" \
+      "pr=$pr" \
+      "cause=$cause"
+  ) || true
+}
+
+lessons_prune() {
+  shift  # drop the leading "lessons-prune"
+
+  local mode="" cause=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run)
+        if [ -n "$mode" ] && [ "$mode" != "dry-run" ]; then
+          echo "lessons-prune: --dry-run and --commit are mutually exclusive" >&2
+          exit 2
+        fi
+        mode="dry-run"; shift ;;
+      --commit)
+        if [ -n "$mode" ] && [ "$mode" != "commit" ]; then
+          echo "lessons-prune: --dry-run and --commit are mutually exclusive" >&2
+          exit 2
+        fi
+        mode="commit"; shift ;;
+      --cause)
+        cause="${2:-}"; shift 2 ;;
+      --cause=*)
+        cause="${1#--cause=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet lessons-prune — operator-invoked archival of expired LESSONS.md entries.
+
+Usage:
+  fleet lessons-prune --dry-run
+  fleet lessons-prune --commit --cause "<one-line>"
+  fleet lessons-prune --help
+
+Flags:
+  --dry-run   List every paragraph in docs/LESSONS.md whose
+              <!-- EXPIRES: YYYY-MM-DD --> marker is <= today
+              (today = \$FLEET_NOW_OVERRIDE if set, else
+              date -u '+%Y-%m-%d'). Read-only — no file mutation,
+              no commit, no event.
+  --commit    Same scan as --dry-run, then MOVE the expired
+              paragraphs (byte-for-byte) from docs/LESSONS.md to
+              docs/LESSONS-ARCHIVE.md, commit on branch
+              chore/lessons-prune-<today>, push, and open a PR
+              via gh pr create. Emits one lessons_pruned event.
+  --cause     MANDATORY on --commit. One-line operator rationale
+              ("kit defends at helper level", "superseded by
+              ticket 0035", etc). Recorded verbatim in the PR
+              body, the commit message, AND the event payload.
+              ASCII only for v1 (LESSONS 2026-06-03).
+
+Paragraphs WITHOUT an EXPIRES marker are NEVER listed (silent
+paragraphs are append-only forever — never pruned). Paragraphs
+whose EXPIRES is strictly > today are NEVER listed (future-dated
+EXPIRES is a planned retirement, not a current one). Malformed
+EXPIRES values warn to stderr without aborting.
+
+The PHASE 0 LESSONS read target is docs/LESSONS.md, NOT the
+archive — so the archive preserves history without paying the
+every-run read cost. Restoration is standard git: revert the PR.
+
+See AGENTS.md § Lessons and AGENTS.md § Telemetry (lessons_pruned).
+USAGE
+        exit 0 ;;
+      --)
+        shift ;;
+      -*)
+        printf -- 'lessons-prune: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        printf -- 'lessons-prune: unexpected positional %s\n' "$1" >&2
+        exit 2 ;;
+    esac
+  done
+
+  if [ -z "$mode" ]; then
+    echo "lessons-prune: pick one of --dry-run / --commit (see --help)" >&2
+    exit 2
+  fi
+
+  # --cause is MANDATORY on --commit.
+  if [ "$mode" = "commit" ] && [ -z "$cause" ]; then
+    echo 'lessons-prune: --commit requires --cause "<one-line>" explaining why these lessons are now safe to archive (e.g. "kit now defuses at helper level")' >&2
+    exit 2
+  fi
+
+  # ASCII-only --cause for v1 per LESSONS 2026-06-03 (same as
+  # prompts_revert's --reason guard).
+  if [ -n "$cause" ] \
+     && LC_ALL=C printf -- '%s' "$cause" \
+        | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
+    echo "lessons-prune: --cause must be ASCII for v1 (see ticket 0039 note)" >&2
+    exit 2
+  fi
+
+  local kit_root; kit_root="$(lessons_prune_kit_root)"
+  local lessons="$kit_root/docs/LESSONS.md"
+  local archive="$kit_root/docs/LESSONS-ARCHIVE.md"
+  local today; today="$(lessons_prune_today)"
+
+  if [ ! -f "$lessons" ]; then
+    printf -- 'lessons-prune: %s not found\n' "$lessons" >&2
+    exit 1
+  fi
+
+  # Scan + classify. Emit warnings for malformed markers on stderr.
+  local scan_out; scan_out="$(lessons_prune_scan "$lessons")"
+  local prune_list; prune_list="$(mktemp -t fleet-lessons-prune-list.XXXXXX)"
+  local range_file; range_file="$(mktemp -t fleet-lessons-prune-ranges.XXXXXX)"
+  : > "$prune_list"
+  : > "$range_file"
+
+  # Walk the scan output line by line. We cannot pipe directly into a
+  # while loop because we need to update shell-side counters. The
+  # scan emits "-" as a placeholder for unmarked paragraphs (bash's
+  # `read` with non-whitespace IFS collapses adjacent tabs); we map
+  # it back to empty before classification.
+  while IFS=$'\t' read -r head end orig expires headline; do
+    [ -z "$head" ] && continue
+    [ "$expires" = "-" ] && expires=""
+    local verdict
+    verdict="$(lessons_prune_classify "$expires" "$today")"
+    case "$verdict" in
+      unmarked|future)
+        : ;;  # never pruned
+      malformed)
+        # Per AC#4 we warn to stderr but DO NOT abort.
+        printf -- 'lessons-prune: paragraph "%s" has invalid EXPIRES "%s" (use YYYY-MM-DD); skipped\n' \
+          "$headline" "$expires" >&2
+        ;;
+      prune)
+        printf -- '%s\t%s\t%s\t%s\t%s\n' "$head" "$end" "$orig" "$expires" "$headline" >> "$prune_list"
+        printf -- '%s\t%s\n' "$head" "$end" >> "$range_file"
+        ;;
+    esac
+  done <<EOF
+$scan_out
+EOF
+
+  # Per LESSONS 2026-06-01 use awk for the count (grep -c || echo 0
+  # double-prints on zero matches).
+  local n; n="$(awk 'END { print NR+0 }' "$prune_list")"
+
+  if [ "$mode" = "dry-run" ]; then
+    if [ "$n" = "0" ]; then
+      printf -- 'lessons-prune: no paragraphs expired as of %s\n' "$today"
+      rm -f "$prune_list" "$range_file"
+      exit 0
+    fi
+    printf -- 'lessons-prune: %s paragraphs expired as of %s\n\n' "$n" "$today"
+    lessons_prune_render_dry_run "$today" < "$prune_list"
+    printf -- '\n(re-run with --commit --cause "<text>" to archive)\n'
+    rm -f "$prune_list" "$range_file"
+    exit 0
+  fi
+
+  # --- commit path ---------------------------------------------------
+  if [ "$n" = "0" ]; then
+    printf -- 'lessons-prune: no paragraphs expired as of %s — nothing to do.\n' "$today"
+    rm -f "$prune_list" "$range_file"
+    exit 0
+  fi
+
+  # Bootstrap LESSONS-ARCHIVE.md with its preamble if absent.
+  lessons_prune_ensure_archive_preamble "$archive"
+
+  # Append every expired paragraph (byte-exact) to the archive.
+  while IFS=$'\t' read -r head end orig expires headline; do
+    [ -z "$head" ] && continue
+    lessons_prune_append_archive "$lessons" "$archive" "$today" "$head" "$end" "$orig"
+  done < "$prune_list"
+
+  # Drop the expired paragraphs from LESSONS.md in one awk pass.
+  lessons_prune_drop_paragraphs "$lessons" "$range_file"
+
+  # Branch / commit / push / PR. Stub-friendly: each git step is its
+  # own subshell so the test's $HOME/.local/bin/git stub records each
+  # invocation independently. Failure on any step → exit 1.
+  local branch="chore/lessons-prune-$today"
+  if ! ( cd "$kit_root" && git checkout -b "$branch" ) >/dev/null 2>&1; then
+    if ! ( cd "$kit_root" && git checkout "$branch" ) >/dev/null 2>&1; then
+      echo "lessons-prune: could not create or switch to branch $branch" >&2
+      rm -f "$prune_list" "$range_file"
+      exit 1
+    fi
+  fi
+  if ! ( cd "$kit_root" && git add docs/LESSONS.md docs/LESSONS-ARCHIVE.md ) >/dev/null 2>&1; then
+    echo "lessons-prune: git add failed" >&2
+    rm -f "$prune_list" "$range_file"
+    exit 1
+  fi
+
+  # Compose the commit message via a tmp file (LESSONS 2026-06-01 —
+  # `git commit -F` is the multi-line-safe path).
+  local msg_file; msg_file="$(mktemp -t fleet-lessons-prune-msg.XXXXXX)"
+  {
+    printf -- 'chore: archive %s expired lessons (' "$n"
+    printf -- '%s' "$cause"
+    printf -- ')\n\n'
+    printf -- 'since_date: %s\n' "$today"
+    printf -- 'archived_count: %s\n' "$n"
+    printf -- 'cause: '
+    printf -- '%s' "$cause"
+    printf -- '\n\n'
+    printf -- 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>\n'
+  } > "$msg_file"
+  if ! ( cd "$kit_root" && git commit -F "$msg_file" ) >/dev/null 2>&1; then
+    rm -f "$msg_file" "$prune_list" "$range_file"
+    echo "lessons-prune: git commit failed" >&2
+    exit 1
+  fi
+  rm -f "$msg_file"
+
+  if ! ( cd "$kit_root" && git push -u origin "$branch" ) >/dev/null 2>&1; then
+    echo "lessons-prune: git push -u origin $branch failed" >&2
+    rm -f "$prune_list" "$range_file"
+    exit 1
+  fi
+
+  # Compose the PR body via a tmp file (same multi-line guard).
+  local body_file; body_file="$(mktemp -t fleet-lessons-prune-body.XXXXXX)"
+  {
+    printf -- '[FLEET lessons-prune] archive %s expired lesson(s) as of %s\n\n' "$n" "$today"
+    printf -- 'cause: '
+    printf -- '%s' "$cause"
+    printf -- '\n\n'
+    printf -- 'Moved the following paragraph(s) from docs/LESSONS.md to docs/LESSONS-ARCHIVE.md:\n\n'
+    while IFS=$'\t' read -r head end orig expires headline; do
+      [ -z "$head" ] && continue
+      printf -- '  - %s — %s (EXPIRES %s)\n' "$orig" "$headline" "$expires"
+    done < "$prune_list"
+    printf -- '\n'
+    printf -- 'PHASE 0 readers (`prompts/ship.prompt.md`, `prompts/groom.prompt.md`) read\n'
+    printf -- 'ONLY docs/LESSONS.md — the archive is out of the hot read path.\n'
+    printf -- '\n'
+    printf -- 'Emitted lessons_pruned {archived_count, since_date, pr, cause} to the\n'
+    printf -- 'agent-fleet kit-as-project events.jsonl. See AGENTS.md § Telemetry.\n'
+  } > "$body_file"
+
+  local create_out new_pr_number=""
+  create_out="$(gh pr create \
+                  --repo mutaaf/agent-fleet \
+                  --head "mutaaf:$branch" \
+                  --base main \
+                  --title "[FLEET lessons-prune] archive $n expired lesson(s) as of $today" \
+                  --body-file "$body_file" \
+                  2>&1 || true)"
+  rm -f "$body_file"
+  echo "$create_out"
+  new_pr_number="$(echo "$create_out" | sed -nE 's#.*/pull/([0-9]+).*#\1#p' | head -1)"
+  if [ -z "$new_pr_number" ]; then
+    echo "lessons-prune: could not parse new PR number from 'gh pr create' output" >&2
+    rm -f "$prune_list" "$range_file"
+    exit 1
+  fi
+
+  lessons_prune_emit_event "$n" "$today" "$new_pr_number" "$cause"
+
+  printf -- '\nlessons-prune: archived %s paragraph(s) as of %s\n' "$n" "$today"
+  printf -- '  branch:  %s\n' "$branch"
+  printf -- '  PR:      #%s\n' "$new_pr_number"
+  printf -- '  cause:   '
+  printf -- '%s' "$cause"
+  printf -- '\n'
+  printf -- '\nemitted lessons_pruned archived_count=%s since_date=%s pr=%s cause=' \
+    "$n" "$today" "$new_pr_number"
+  printf -- '%s' "$cause"
+  printf -- '\n'
+  printf -- '\nNEXT: the review subagent will grade this PR like any other.\n'
+  printf -- '      After merge, every project'\''s next PHASE 0 will read a\n'
+  printf -- "      shorter docs/LESSONS.md. The archive preserves the moved entries.\n"
+  rm -f "$prune_list" "$range_file"
+  exit 0
+}
+
+if [ "$CMD" = "lessons-prune" ]; then
+  lessons_prune "$@"
 fi
 
 # --- resume ---------------------------------------------------------------
