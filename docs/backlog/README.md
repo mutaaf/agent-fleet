@@ -59,6 +59,6 @@ ones, `review` grades them.
 | 0038 | fleet diff <slug-a> <slug-b> calls out cross-project ROI and posture divergence | P2 | shipped | observability |
 | 0039 | LESSONS expiry markers let PHASE 0 reads skip stale operational memory | P2 | shipped | governance |
 | 0040 | fleet self-check greps the kit's own shell for known LESSONS-documented call-shape traps | P1 | shipped | safety |
-| 0041 | fleet onboarding-check verifies a freshly-installed project is end-to-end healthy | P1 | in-progress | docs |
+| 0041 | fleet onboarding-check verifies a freshly-installed project is end-to-end healthy | P1 | shipped | docs |
 | 0042 | fleet streak shows the longest continuous green-day run per project | P2 | groomed | observability |
 | 0043 | fleet rank orders every project on a single posture metric in one leaderboard | P2 | groomed | observability |
