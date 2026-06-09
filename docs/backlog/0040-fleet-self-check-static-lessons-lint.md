@@ -1,7 +1,7 @@
 ---
 id: 0040
 title: fleet self-check greps the kit's own shell for known LESSONS-documented call-shape traps
-status: groomed
+status: in-progress
 priority: P1
 area: safety
 created: 2026-06-09
@@ -478,7 +478,7 @@ doesn't have to re-discover the architecture.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD — branch `feat/0040-...` opened
-- YYYY-MM-DD — failing test added in `tests/self-check.sh`
+- 2026-06-09 — branch `feat/0040-self-check-static-lessons-lint` opened
+- 2026-06-09 — failing test added in `tests/self-check.sh`
 - YYYY-MM-DD — PR #N opened, CI [state]
 - YYYY-MM-DD — merged to main

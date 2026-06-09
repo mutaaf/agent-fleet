@@ -33,7 +33,7 @@ seatbelt. Hand-merge the first few PRs to be safe, then trust the loop.
   - `revert/` — operator-initiated rollback (emitted by `fleet rollback`)
 - **Local gate command** — what the heal/dev step runs locally before pushing
   (must be green):
-  `shellcheck lib/*.sh bin/fleet && bash -n lib/*.sh bin/fleet && node scripts/check-backlog.mjs`
+  `shellcheck lib/*.sh bin/fleet && bash -n lib/*.sh bin/fleet && node scripts/check-backlog.mjs && FLEET_SELF_CHECK_GATE=1 bin/fleet self-check`
 - **Subagents** (in `.claude/agents/`): `implementation-dev`, `gtm-innovation`,
   `review`
 - **Backlog areas**: `engine | telemetry | governance | safety | observability | docs`
@@ -299,6 +299,29 @@ postcard.
     to reconstruct why `docs/LESSONS.md` shrank in a given week.
     Consumed by `fleet provenance` and any future
     "LESSONS read-cost over time" rollup.
+  - `self_check_failed {pattern, lesson_date, file, line}` — emitted
+    by `bin/fleet self-check` (ticket 0040) once per hit when the
+    operator (or pre-push gate) invokes it with
+    `FLEET_SELF_CHECK_GATE=1` exported. `pattern` is the catalog name
+    (e.g. `printf-leading-dash`, `awk-v-multiline`); `lesson_date` is
+    the `YYYY-MM-DD` LESSON the pattern is keyed to; `file` is the
+    repo-relative source path the linter found the hit in (one of
+    `bin/fleet`, `lib/*.sh`, `scripts/*.mjs`); `line` is the
+    1-indexed line number of the matched call shape. Carries
+    `phase=self-check` and lives in the AGENT-FLEET kit-as-project
+    `events.jsonl` (per the `lesson_promoted` (0028) /
+    `prompts_reverted` (0035) / `lessons_pruned` (0039) pattern —
+    the kit IS a project for telemetry purposes). Unset gate env
+    emits NO event — `fleet self-check` from an operator's prompt
+    is a diagnostic read; only the gate call path writes telemetry.
+    Idempotent: re-running with the same source set re-emits the
+    same hits (consumers MUST tolerate this — fleet-control and any
+    "lint debt over time" rollup deduplicate on
+    `{pattern, file, line}` as needed). Mirrors the shape of
+    `lessons_pruned` (0039) and `prompts_reverted` (0035): one
+    operator-/gate-initiated diagnostic action, one typed event,
+    no transcript scraping required to reconstruct "did the heal
+    step push a regression of a documented trap?"
 
 **Demo path (ticket 0023).** `bin/fleet kickstart --demo` walks a
 credential-less synthetic ship cycle and emits the four core event

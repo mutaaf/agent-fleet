@@ -40,6 +40,9 @@
 #   fleet diff <slug-a> <slug-b>  side-by-side ROI / posture comparison
 #                             (ticket 0038 — 8 metric rows + DIVERGENCE + HYPOTHESES;
 #                              --since Nh|Nd default 14d, --json; pure reader)
+#   fleet self-check          run the LESSONS-derived static linter against the kit's own shell
+#                             (ticket 0040 — 12 patterns keyed to LESSONS dates;
+#                              --list/--pattern/--json; FLEET_SELF_CHECK_GATE=1 emits self_check_failed)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -1547,6 +1550,881 @@ USAGE
 
 if [ "$CMD" = "preflight" ]; then
   preflight "$@"
+fi
+
+# --- self-check -----------------------------------------------------------
+# Ticket 0040. `fleet self-check` is a static linter that greps the kit's
+# own shell (`bin/fleet`, every file under `lib/`, every `.mjs` file under
+# `scripts/`) for the call-shape footprints docs/LESSONS.md warns against.
+# Each pattern in the catalog is keyed to its LESSONS date so a hit in
+# the output reads as "the call shape on line N is the one LESSONS
+# YYYY-MM-DD documents — re-read the paragraph and fix the call." Exit
+# codes: 0 = zero hits, 1 = at least one hit, 2 = usage error. When
+# `FLEET_SELF_CHECK_GATE=1` is set (the local-gate / pre-push path),
+# every hit ALSO emits one `self_check_failed` event to the agent-fleet
+# kit-as-project events.jsonl so fleet-control / `fleet weekly` can
+# render "lint debt over time" without scraping stdout.
+#
+# All `self_check_*` helpers are defined ABOVE the inline dispatcher
+# block per LESSONS 2026-06-05 (forward-reference trap). JSON escape
+# goes through `preflight_json_escape` (line ~1064) per LESSONS
+# 2026-06-03 (UTF-8 sign-extension). Width comp goes through
+# `preflight_visible_width` (line ~1331) per LESSONS 2026-06-05
+# (bash 3.2 LC_ALL caching). `self_check()` ends with explicit
+# `exit N` on every branch per LESSONS 2026-06-01 (dispatcher
+# fall-through). The catalog TSV uses `-` sentinels in middle empty
+# columns per LESSONS 2026-06-08 (IFS=$'\t' middle-empty-field).
+
+# Catalog: one TSV line per pattern.
+#   name<TAB>lesson_date<TAB>description<TAB>kind<TAB>approximate(0|1)
+# Where `kind` selects the scanner dispatch:
+#   re:<regex>             plain `grep -nE` against each source file
+#   ax:<id>                custom awk handler keyed by `<id>`
+# `description` is the human label rendered in the text table. The
+# `-` sentinel is reserved for empty middle columns (LESSONS 2026-06-08)
+# but every column here is non-empty so the sentinel does not appear.
+self_check_catalog() {
+  # Heredoc kept single-quoted so $ in regexes is literal — awk and
+  # grep both see the bytes verbatim.
+  cat <<'CATALOG'
+printf-leading-dash	2026-05-28	printf leading-dash	re:printf ['"]-[^-]	0
+cat-roundtrip	2026-05-27	$(cat file) round-trip	ax:cat-roundtrip	1
+awk-v-multiline	2026-06-01	awk -v multi-line value	re:awk -v [A-Za-z_]+="\$\((cat|<)	1
+grep-F-flag-pattern	2026-05-30	grep -F flag pattern	re:grep -[a-zA-Z]*F[a-zA-Z]* ['"]--[a-zA-Z]	0
+grep-c-double-print	2026-06-01	grep -c result feeding shell math	re:grep -[a-zA-Z]*c[a-zA-Z]* .* \|\| echo 0	0
+dispatcher-missing-exit	2026-06-01	dispatcher missing exit 0	ax:dispatcher-missing-exit	1
+dispatcher-forward-reference	2026-06-05	dispatcher forward-reference	ax:dispatcher-forward-reference	1
+json-escape-sign-extension	2026-06-03	_json_escape sign-extension	ax:json-escape-sign-extension	1
+IFS-tab-empty-middle	2026-06-08	IFS=$'\t' read with empty middles	ax:IFS-tab-empty-middle	1
+bash-32-lc_all-string-length	2026-06-05	bash 3.2 ${#s} on UTF-8	ax:bash-32-lc_all-string-length	1
+export-in-command-substitution	2026-06-05	export inside $(...)	ax:export-in-command-substitution	1
+function-shadow-coreutils	2026-05-26	tail()/head()/cat() function shadow	ax:function-shadow-coreutils	1
+CATALOG
+}
+
+# List the files the scanner targets, given a kit root. Stable order
+# bin/fleet → lib/*.sh → scripts/*.mjs so the row counts match the
+# documented "union of kit shell-and-script source". A missing dir is
+# silently skipped; the scanner just emits zero hits across nothing.
+self_check_source_files() {
+  local kit_root="$1"
+  [ -f "$kit_root/bin/fleet" ] && printf -- '%s\n' "$kit_root/bin/fleet"
+  if [ -d "$kit_root/lib" ]; then
+    find "$kit_root/lib" -type f -name '*.sh' 2>/dev/null | sort
+  fi
+  if [ -d "$kit_root/scripts" ]; then
+    find "$kit_root/scripts" -type f -name '*.mjs' 2>/dev/null | sort
+  fi
+}
+
+# Awk handlers — one per `ax:<id>` catalog entry. Each handler reads a
+# file path and emits one hit line per match in the shape
+# `LINENO<TAB>SNIPPET`. Caller adds pattern + file context. Keeping the
+# handlers in awk (and not bash regexes) means the trickier multi-line
+# / function-body / dependency checks have one tool, not three.
+
+# cat-roundtrip: `VAR=$(cat file)` somewhere AND `printf '%s' "$VAR" >`
+# (or `printf "%s" "$VAR" >`) later in the SAME file. The LESSON trap
+# is the byte-mutating round-trip — a bare `$(cat ...)` capture used
+# only for grep/comparison is safe and we do not flag it.
+self_check_ax_cat_roundtrip() {
+  awk '
+    function process_file(   v, i, line, write_pat) {
+      for (v in captured) {
+        # Build a regex matching `printf '%s' "$v" >` or similar
+        # write-back patterns. We only flag if a corresponding
+        # write-to-disk for the same variable name appears later
+        # in the file.
+        write_pat = "printf[[:space:]]+([\"'"'"']?--[\"'"'"']?[[:space:]]+)?[\"'"'"']%s[\"'"'"'][[:space:]]+\"\\$" v "\"[[:space:]]*>"
+        for (i = captured[v]; i <= last_nr; i++) {
+          if (match(buf[i], write_pat)) {
+            printf "%s\t%d\t%s\n", cur_file, captured[v], buf[captured[v]]
+            break
+          }
+        }
+      }
+    }
+    FNR == 1 {
+      if (cur_file != "") process_file()
+      cur_file = FILENAME
+      last_nr = 0
+      delete buf
+      delete captured
+    }
+    {
+      buf[FNR] = $0
+      last_nr = FNR
+      # Skip comments.
+      if ($0 ~ /^[[:space:]]*#/) next
+      # Detect `VAR=$(cat ...)` or `VAR="$(cat ...)"`. Reject the
+      # `cat <<` heredoc form (which is unrelated).
+      if (match($0, /[A-Za-z_][A-Za-z0-9_]*=\"?\$\(cat[[:space:]]+[^<]/)) {
+        s = substr($0, RSTART, RLENGTH)
+        eq = index(s, "=")
+        v = substr(s, 1, eq - 1)
+        # Strip leading whitespace.
+        sub(/^[[:space:]]+/, "", v)
+        if (!(v in captured)) captured[v] = FNR
+      }
+    }
+    END { if (cur_file != "") process_file() }
+  ' "$@"
+}
+
+# dispatcher-missing-exit: function definitions (e.g. `name() {`) whose
+# body's last 5 non-blank non-`}` lines do NOT contain
+# `^[[:space:]]*exit [0-2][[:space:]]*$`. Approximate: closing brace
+# tracking is brace-count based, so case statements / heredocs with
+# stray `{` `}` may skew counts.
+self_check_ax_dispatcher_missing_exit() {
+  awk '
+    function process_file(   i, line, fn_name, fn_line, fn_header, in_fn, nlines, j, k, has_exit) {
+      # Pass 2: walk functions, check ones whose name appears as a CMD
+      # dispatcher target. Trap is specific to NEW subcommand
+      # functions called via inline `if [ "$CMD" = "<name>" ]; then
+      # <name> "$@"; fi` — utility helpers legitimately fall through.
+      in_fn = 0
+      for (i = 1; i <= last_nr; i++) {
+        line = buf[i]
+        if (match(line, /^[a-z_][a-z_0-9]*\(\)[[:space:]]*\{?[[:space:]]*$/)) {
+          if (in_fn) {
+            # Flush previous function.
+            has_exit = 0
+            k = 0
+            for (j = nlines; j >= 1 && k < 5; j--) {
+              if (body[j] ~ /^[[:space:]]*$/) continue
+              if (body[j] ~ /^[[:space:]]*}[[:space:]]*$/) continue
+              k++
+              if (body[j] ~ /exit[[:space:]]+[0-2][[:space:]]*(;;)?[[:space:]]*$/) {
+                has_exit = 1; break
+              }
+            }
+            if (!has_exit && (fn_name in dispatched)) {
+              printf "%s\t%d\t%s\n", cur_file, fn_line, fn_header
+            }
+            in_fn = 0
+            delete body
+          }
+          fn_name = substr(line, RSTART, RLENGTH - 2)
+          gsub(/\(\)/, "", fn_name)
+          gsub(/[[:space:]{]/, "", fn_name)
+          fn_line = i
+          fn_header = line
+          in_fn = 1
+          nlines = 0
+          continue
+        }
+        if (in_fn) {
+          if (line ~ /^\}[[:space:]]*$/) {
+            nlines++
+            body[nlines] = line
+            # Flush.
+            has_exit = 0
+            k = 0
+            for (j = nlines; j >= 1 && k < 5; j--) {
+              if (body[j] ~ /^[[:space:]]*$/) continue
+              if (body[j] ~ /^[[:space:]]*}[[:space:]]*$/) continue
+              k++
+              if (body[j] ~ /exit[[:space:]]+[0-2][[:space:]]*(;;)?[[:space:]]*$/) {
+                has_exit = 1; break
+              }
+            }
+            if (!has_exit && (fn_name in dispatched)) {
+              printf "%s\t%d\t%s\n", cur_file, fn_line, fn_header
+            }
+            in_fn = 0
+            delete body
+            continue
+          }
+          nlines++
+          body[nlines] = line
+        }
+      }
+    }
+    FNR == 1 {
+      if (cur_file != "") process_file()
+      cur_file = FILENAME
+      last_nr = 0
+      delete buf
+      delete dispatched
+    }
+    {
+      buf[FNR] = $0
+      last_nr = FNR
+      # Track subcommand dispatchers: `if [ "$CMD" = "<sub>" ]; then`.
+      if (match($0, /\[[[:space:]]*"\$CMD"[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*\]/)) {
+        s = substr($0, RSTART, RLENGTH)
+        if (match(s, /"[^"]+"[[:space:]]*\]/)) {
+          tok = substr(s, RSTART, RLENGTH)
+          gsub(/["[:space:]\]]/, "", tok)
+          # Dispatcher target name may have `-`; the function name
+          # uses `_`. Normalize: map `-` to `_` so e.g. `self-check`
+          # ↔ `self_check`.
+          gsub(/-/, "_", tok)
+          dispatched[tok] = 1
+        }
+      }
+    }
+    END { if (cur_file != "") process_file() }
+  ' "$@"
+}
+
+# dispatcher-forward-reference: build a name→line index of all
+# `^[a-z_][a-z_0-9]*\(\)` headers, then for each header find call sites
+# inside its body to a NAME whose definition line is LATER than the
+# header's own line. Approximate: words that happen to match a known
+# function name in a comment or string are still flagged. The cheap
+# defense is to namespace helpers (LESSONS 2026-06-05).
+self_check_ax_dispatcher_forward_reference() {
+  awk '
+    function process_file(   i, line, fn_name, fn_start, in_fn, tok, disp_line) {
+      in_fn = 0
+      for (i = 1; i <= last_nr; i++) {
+        line = buf[i]
+        if (match(line, /^[a-z_][a-z_0-9]*\(\)/)) {
+          fn_name = substr(line, RSTART, RLENGTH - 2)
+          fn_start = i
+          in_fn = 1
+          continue
+        }
+        if (!in_fn) continue
+        if (line ~ /^\}[[:space:]]*$/) { in_fn = 0; continue }
+        if (line ~ /^[[:space:]]*#/) continue
+        if (line ~ /^[[:space:]]*$/) continue
+        if (match(line, /^[[:space:]]*[a-z_][a-z_0-9]*/)) {
+          tok = substr(line, RSTART, RLENGTH)
+          sub(/^[[:space:]]*/, "", tok)
+          if (tok == fn_name) continue
+          if (tok in def_line && def_line[tok] > fn_start) {
+            # Real forward-reference trap fires only when the
+            # ENCLOSING function is invoked via an inline `if [
+            # "$CMD" = "<sub>" ]; then <sub> "$@"; fi` dispatcher
+            # that lives BEFORE the called helpers definition.
+            # Without a dispatcher entry, the function is utility
+            # code that runs AFTER the whole file is parsed (e.g.
+            # the toplevel `fleet status` block) and forward refs
+            # are safe.
+            if (!(fn_name in disp_at)) continue
+            disp_line = disp_at[fn_name]
+            if (disp_line < def_line[tok]) {
+              printf "%s\t%d\t%s\n", cur_file, i, line
+            }
+          }
+        }
+      }
+    }
+    FNR == 1 {
+      if (cur_file != "") process_file()
+      cur_file = FILENAME
+      last_nr = 0
+      delete buf
+      delete def_line
+      delete disp_at
+    }
+    {
+      if (match($0, /^[a-z_][a-z_0-9]*\(\)/)) {
+        name = substr($0, RSTART, RLENGTH - 2)
+        def_line[name] = FNR
+      }
+      # Track dispatcher line for each subcommand: `if [ "$CMD" =
+      # "<sub>" ]; then`. Map `-` to `_` so e.g. `self-check` maps
+      # to the function `self_check`.
+      if (match($0, /\[[[:space:]]*"\$CMD"[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*\]/)) {
+        s = substr($0, RSTART, RLENGTH)
+        if (match(s, /"[^"]+"[[:space:]]*\]/)) {
+          tok = substr(s, RSTART, RLENGTH)
+          gsub(/["[:space:]\]]/, "", tok)
+          gsub(/-/, "_", tok)
+          disp_at[tok] = FNR
+        }
+      }
+      buf[FNR] = $0
+      last_nr = FNR
+    }
+    END { if (cur_file != "") process_file() }
+  ' "$@"
+}
+
+# json-escape-sign-extension: any function named `*_json_escape` (with
+# a non-empty alpha prefix) whose body does NOT contain the
+# `code -ge 0` guard. The canonical `_json_escape` in lib/common.sh is
+# intentionally NOT matched (no prefix) — a follow-up ticket lifts the
+# guard there; this PR holds lib/common.sh byte-stable per AC#11.
+self_check_ax_json_escape_sign_extension() {
+  awk '
+    function flush(   has_guard) {
+      if (!in_fn) return
+      has_guard = 0
+      for (i = 1; i <= nlines; i++) {
+        if (body[i] ~ /code"?[[:space:]]*-ge[[:space:]]+0/) { has_guard = 1; break }
+      }
+      if (!has_guard) {
+        printf "%s\t%d\t%s\n", cur_file, fn_line, fn_header
+      }
+      in_fn = 0
+      nlines = 0
+      delete body
+    }
+    FNR == 1 {
+      flush()
+      cur_file = FILENAME
+    }
+    {
+      if (match($0, /^[a-z_][a-z_0-9]*_json_escape\(\)/)) {
+        flush()
+        name = substr($0, RSTART, RLENGTH - 2)
+        if (name == "_json_escape") next
+        in_fn = 1
+        fn_line = FNR
+        fn_header = $0
+        nlines = 0
+        next
+      }
+      if (in_fn) {
+        if ($0 ~ /^\}[[:space:]]*$/) {
+          flush()
+          next
+        }
+        nlines++
+        body[nlines] = $0
+      }
+    }
+    END { flush() }
+  ' "$@"
+}
+
+# IFS-tab-empty-middle: `IFS=$'\t' read -r v1 v2 v3 v4 [v5 ...]` (4+
+# names) where the SAME file does NOT contain a `[ "$X" = "-" ]`-style
+# sentinel remap on any of the captured variables. Approximate: a file
+# may legitimately read 4 fields where the middle columns CANNOT be
+# empty by construction. The cheap defense is the sentinel.
+self_check_ax_IFS_tab_empty_middle() {
+  awk '
+    function process_file(   i, line) {
+      for (i = 1; i <= last_nr; i++) {
+        line = buf[i]
+        if (match(line, /IFS=\$'"'"'\\t'"'"'[[:space:]]+read[[:space:]]+-r[[:space:]]+[A-Za-z_][A-Za-z0-9_]*([[:space:]]+[A-Za-z_][A-Za-z0-9_]*){3,}/)) {
+          if (!sentinel_seen) {
+            printf "%s\t%d\t%s\n", cur_file, i, line
+          }
+        }
+      }
+    }
+    FNR == 1 {
+      if (cur_file != "") process_file()
+      cur_file = FILENAME
+      sentinel_seen = 0
+      last_nr = 0
+      delete buf
+    }
+    {
+      if ($0 ~ /=[[:space:]]*"-"/) sentinel_seen = 1
+      if ($0 ~ /"-"[[:space:]]*\][[:space:]]*&&/) sentinel_seen = 1
+      buf[FNR] = $0
+      last_nr = FNR
+    }
+    END { if (cur_file != "") process_file() }
+  ' "$@"
+}
+
+# bash-32-lc_all-string-length: a function body that ALSO contains
+# `LC_ALL=` AND uses `${#var}` or `${var:N:1}` for string-length /
+# substring extraction. Approximate: a function may legitimately set
+# LC_ALL for an external command and use ${#s} on a known-ASCII value.
+self_check_ax_bash_32_lc_all_string_length() {
+  awk '
+    function flush(   has_lc, has_lenop) {
+      if (!in_fn) return
+      has_lc = 0; has_lenop = 0
+      for (i = 1; i <= nlines; i++) {
+        # Skip comment-only lines — references to ${#s} / LC_ALL=
+        # inside a # comment are documentation, not a real trap.
+        if (body[i] ~ /^[[:space:]]*#/) continue
+        if (body[i] ~ /LC_ALL=[A-Za-z_]/) has_lc = 1
+        if (body[i] ~ /\$\{#[A-Za-z_][A-Za-z0-9_]*\}/) has_lenop = 1
+        if (body[i] ~ /\$\{[A-Za-z_][A-Za-z0-9_]*:[0-9ij]+:1\}/) has_lenop = 1
+      }
+      if (has_lc && has_lenop) {
+        printf "%s\t%d\t%s\n", cur_file, fn_line, fn_header
+      }
+      in_fn = 0
+      nlines = 0
+      delete body
+    }
+    FNR == 1 {
+      flush()
+      cur_file = FILENAME
+    }
+    {
+      if (match($0, /^[a-z_][a-z_0-9]*\(\)[[:space:]]*\{?[[:space:]]*$/)) {
+        flush()
+        in_fn = 1
+        fn_line = FNR
+        fn_header = $0
+        nlines = 0
+        next
+      }
+      if (in_fn) {
+        if ($0 ~ /^\}[[:space:]]*$/) {
+          flush()
+          next
+        }
+        nlines++
+        body[nlines] = $0
+      }
+    }
+    END { flush() }
+  ' "$@"
+}
+
+# export-in-command-substitution: any `export FOO=` that lives inside a
+# `$( ... )` block. Detect by tracking `$(` open / `)` close on a
+# line-by-line basis. Approximate: heredocs and quoted parens may skew
+# the depth count.
+self_check_ax_export_in_command_substitution() {
+  # Fast path: only walk per-char on lines that COULD change the
+  # depth. Lines without `$(` or `)` cannot mutate depth, so we
+  # short-circuit them and only check for `export …` matches when
+  # depth > 0.
+  awk '
+    function count_substr(s, t,    n, p) {
+      n = 0
+      p = index(s, t)
+      while (p > 0) {
+        n++
+        s = substr(s, p + length(t))
+        p = index(s, t)
+      }
+      return n
+    }
+    FNR == 1 { cur_file = FILENAME; depth = 0 }
+    {
+      line = $0
+      opens = count_substr(line, "$(")
+      closes = count_substr(line, ")")
+      # Strip the `)` count by the `$(` count (each `$(` consumes a
+      # matching `)` later — but on this line specifically we cannot
+      # match. Use a simple depth bookkeeping: depth in/out per line.
+      depth_in = depth
+      if (opens > 0) depth += opens
+      if (closes > 0) depth -= closes
+      if (depth < 0) depth = 0
+      # We flag exports if the line is INSIDE a `$( ... )` block
+      # (depth_in > 0 OR opens > 0 with the export AFTER the open
+      # before the matching close). Cheap approximation: depth_in > 0.
+      if (depth_in > 0) {
+        if (line ~ /\bexport[[:space:]]+[A-Z_][A-Z0-9_]*=/ \
+            || line ~ /^[[:space:]]*export[[:space:]]+[A-Z_]/) {
+          printf "%s\t%d\t%s\n", cur_file, FNR, line
+        }
+      }
+    }
+  ' "$@"
+}
+
+# function-shadow-coreutils: a function definition for a coreutils
+# binary name AND a shell-out to the same binary in the same file.
+# Approximate: the shell-out might be intentional (e.g. via `command
+# tail` to bypass the shadow), which we cannot detect statically.
+self_check_ax_function_shadow_coreutils() {
+  awk '
+    function process_file(   name, i, line, re) {
+      for (name in def_line) {
+        for (i = 1; i <= last_nr; i++) {
+          if (i == def_line[name]) continue
+          line = buf[i]
+          if (line ~ /^[[:space:]]*#/) continue
+          re = "(^|[^A-Za-z0-9_/])" name "[[:space:]]+-[a-zA-Z]"
+          if (match(line, re)) {
+            printf "%s\t%d\t%s\n", cur_file, def_line[name], def_header[name]
+            break
+          }
+        }
+      }
+    }
+    BEGIN {
+      split("tail head cat sort uniq find grep awk sed cut tr wc", names, " ")
+      for (k in names) want[names[k]] = 1
+    }
+    FNR == 1 {
+      if (cur_file != "") process_file()
+      cur_file = FILENAME
+      last_nr = 0
+      delete buf
+      delete def_line
+      delete def_header
+    }
+    {
+      buf[FNR] = $0
+      last_nr = FNR
+      if (match($0, /^[a-z]+\(\)/)) {
+        name = substr($0, RSTART, RLENGTH - 2)
+        if (name in want) {
+          def_line[name] = FNR
+          def_header[name] = $0
+        }
+      }
+    }
+    END { if (cur_file != "") process_file() }
+  ' "$@"
+}
+
+# Scan ONE pattern across an arbitrary list of files (passed as $@).
+# Each pattern runs ONE subprocess chain over all files (awk + optional
+# grep), so total scan cost is ~12 subprocess pairs not ~12*N pairs.
+# Echoes one hit per line in the shape
+# `PATTERN_NAME<TAB>LESSON_DATE<TAB>FILE<TAB>LINENO<TAB>SNIPPET<TAB>APPROX`
+# where APPROX is `0` or `1`. Caller renders or JSON-emits.
+self_check_scan_one() {
+  local name="$1" lesson="$2" desc="$3" kind="$4" approx="$5"
+  shift 5
+  case "$kind" in
+    re:*)
+      local re="${kind#re:}"
+      local skip_re=""
+      case "$name" in
+        printf-leading-dash) skip_re='printf -- |printf -v ' ;;
+        grep-F-flag-pattern) skip_re='grep -[a-zA-Z]*F[a-zA-Z]* -- ' ;;
+        cat-roundtrip) skip_re='cat <<' ;;
+      esac
+      # grep -nH prints `file:lineno:content`. -E for ERE.
+      grep -nHE -- "$re" "$@" 2>/dev/null | awk \
+        -v name="$name" -v lesson="$lesson" -v approx="$approx" \
+        -v skip="$skip_re" '
+        {
+          line = $0
+          if (skip != "" && match(line, skip)) next
+          # `file:line:snippet` — file may itself contain `:` so use
+          # the FIRST two colons only.
+          c1 = index(line, ":")
+          rest = substr(line, c1 + 1)
+          c2 = index(rest, ":")
+          file = substr(line, 1, c1 - 1)
+          lineno = substr(rest, 1, c2 - 1)
+          snippet = substr(rest, c2 + 1)
+          # Cheap comment-line skip: a leading `#` (whitespace OK)
+          # means the call shape lives inside a comment, not actual
+          # code. LESSONS paragraphs in code comments would otherwise
+          # be flagged on every scan.
+          if (snippet ~ /^[[:space:]]*#/) next
+          printf "%s\t%s\t%s\t%s\t%s\t%s\n", name, lesson, file, lineno, snippet, approx
+        }'
+      ;;
+    ax:*)
+      local id="${kind#ax:}"
+      case "$id" in
+        cat-roundtrip) self_check_ax_cat_roundtrip "$@" ;;
+        dispatcher-missing-exit) self_check_ax_dispatcher_missing_exit "$@" ;;
+        dispatcher-forward-reference) self_check_ax_dispatcher_forward_reference "$@" ;;
+        json-escape-sign-extension) self_check_ax_json_escape_sign_extension "$@" ;;
+        IFS-tab-empty-middle) self_check_ax_IFS_tab_empty_middle "$@" ;;
+        bash-32-lc_all-string-length) self_check_ax_bash_32_lc_all_string_length "$@" ;;
+        export-in-command-substitution) self_check_ax_export_in_command_substitution "$@" ;;
+        function-shadow-coreutils) self_check_ax_function_shadow_coreutils "$@" ;;
+      esac | awk \
+        -v name="$name" -v lesson="$lesson" -v approx="$approx" \
+        -F'\t' '
+        NF >= 2 && $1 != "" {
+          printf "%s\t%s\t%s\t%s\t%s\t%s\n", name, lesson, $1, $2, $3, approx
+        }'
+      ;;
+  esac
+}
+
+# Render the text table: one row per pattern, columns:
+#   TRAP        LESSON       FILES SCANNED   HITS   (approximate suffix)
+# All formatting happens in a single awk pass that consumes the hits
+# TSV stream + the filtered catalog — avoids the per-row wc+awk
+# subprocess fan-out the original implementation incurred. Label widths
+# are byte-based; the catalog labels are ASCII except for the trailing
+# `≈` (U+2248, 3 bytes) and we add the 3-byte adjustment explicitly.
+self_check_render_text() {
+  local hits_file="$1" patterns_seen="$2" n_files="$3" lesson_min="$4" lesson_max="$5"
+  # Filter catalog by patterns_seen (space-separated names) and stream
+  # both the filtered catalog + hits_file into one awk that builds
+  # per-pattern counts and renders. Catalog lines are tagged "C\t…",
+  # hits lines are tagged "H\t…", so awk can tell them apart in one
+  # pass.
+  {
+    self_check_catalog | awk -v want="$patterns_seen" '
+      BEGIN {
+        n = split(want, a, " ")
+        for (i = 1; i <= n; i++) keep[a[i]] = 1
+      }
+      {
+        split($0, f, "\t")
+        if (f[1] in keep) print "C\t" $0
+      }'
+    awk -F'\t' '{ print "H\t" $0 }' "$hits_file"
+  } | awk -v n_files="$n_files" \
+        -v lesson_min="$lesson_min" -v lesson_max="$lesson_max" \
+        -F'\t' '
+    {
+      tag = $1
+      if (tag == "C") {
+        # f1=name f2=lesson f3=desc f4=kind f5=approx
+        cat_idx++
+        c_name[cat_idx] = $2
+        c_lesson[cat_idx] = $3
+        c_desc[cat_idx] = $4
+        c_approx[cat_idx] = $6
+        order[$2] = cat_idx
+      } else if (tag == "H") {
+        # f1=pattern f2=lesson f3=file f4=line f5=match f6=approx
+        n_hits[$2]++
+        if (!($2 in first_file)) {
+          first_file[$2] = $4
+          first_line[$2] = $5
+        }
+        total_hits++
+      }
+    }
+    function pad_right(s, w,    cur, pad) {
+      cur = length(s)
+      # `≈` adds 3 bytes for 1 visible col — adjust if present.
+      if (index(s, "≈")) cur -= 2
+      pad = w - cur
+      if (pad < 0) pad = 0
+      printf "%s", s
+      while (pad-- > 0) printf " "
+    }
+    END {
+      # Header.
+      pad_right("TRAP", 38)
+      pad_right("LESSON", 14)
+      pad_right("FILES SCANNED", 15)
+      printf "HITS\n"
+      # Body.
+      for (i = 1; i <= cat_idx; i++) {
+        label = c_desc[i]
+        if (c_approx[i] == "1") label = label " ≈"
+        pad_right(label, 38)
+        pad_right(c_lesson[i], 14)
+        pad_right(n_files "", 15)
+        nh = n_hits[c_name[i]] + 0
+        if (nh > 0) {
+          printf "%d  ← %s:%s\n", nh, first_file[c_name[i]], first_line[c_name[i]]
+        } else {
+          printf "0\n"
+        }
+      }
+      printf "\n"
+      hit_word = (total_hits == 1) ? "hit" : "hits"
+      n_patterns = cat_idx
+      if (lesson_min != "" && lesson_max != "" && lesson_min != lesson_max) {
+        printf "self-check: %d %s across %d patterns (LESSONS %s..%s)\n", \
+          total_hits, hit_word, n_patterns, lesson_min, lesson_max
+      } else {
+        printf "self-check: %d %s across %d patterns\n", \
+          total_hits, hit_word, n_patterns
+      }
+    }'
+}
+
+# Render JSON: one object per hit (NDJSON-style). Empty hits file → no
+# output. Approximate flag flows through.
+self_check_render_json() {
+  local hits_file="$1"
+  local name lesson file lineno snippet approx
+  while IFS=$'\t' read -r name lesson file lineno snippet approx; do
+    [ -z "$name" ] && continue
+    local approx_json="false"
+    [ "$approx" = "1" ] && approx_json="true"
+    printf -- '{"pattern":"%s","lesson":"%s","file":"%s","line":%s,"match":"%s","approximate":%s}\n' \
+      "$(preflight_json_escape "$name")" \
+      "$(preflight_json_escape "$lesson")" \
+      "$(preflight_json_escape "$file")" \
+      "$lineno" \
+      "$(preflight_json_escape "$snippet")" \
+      "$approx_json"
+  done < "$hits_file"
+}
+
+# Emit one self_check_failed event per hit when FLEET_SELF_CHECK_GATE=1
+# is set. Sources lib/common.sh in a subshell so SLUG / CACHE_DIR /
+# FLEET_PHASE scope to this emit only. Mirrors lessons_prune_emit_event
+# (~line 10920) and prompts_revert_emit_event (~line 534).
+self_check_emit_event() {
+  local name="$1" lesson="$2" file="$3" lineno="$4"
+  local lib_root; lib_root="$( cd "$( dirname "$0" )/.." && pwd )"
+  [ -f "$lib_root/lib/common.sh" ] || return 0
+  local cache_dir="$HOME/.cache/agent-fleet-agent"
+  mkdir -p "$cache_dir"
+  (
+    export SLUG="agent-fleet"
+    export CACHE_DIR="$cache_dir"
+    export FLEET_PHASE="self-check"
+    # shellcheck disable=SC1090
+    source "$lib_root/lib/common.sh" >/dev/null 2>&1
+    fleet_emit_event self_check_failed \
+      "pattern=$name" \
+      "lesson_date=$lesson" \
+      "file=$file" \
+      "line=$lineno"
+  ) || true
+}
+
+self_check() {
+  shift  # drop the leading "self-check"
+
+  local want_json=0 want_list=0 want_help=0 want_pattern=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      --list) want_list=1; shift ;;
+      --pattern)
+        want_pattern="${2:-}"; shift 2 || true ;;
+      --pattern=*)
+        want_pattern="${1#--pattern=}"; shift ;;
+      -h|--help) want_help=1; shift ;;
+      --) shift; break ;;
+      -*)
+        printf -- 'self-check: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        printf -- 'self-check: unexpected positional argument %s\n' "$1" >&2
+        exit 2 ;;
+    esac
+  done
+
+  if [ "$want_help" = "1" ]; then
+    cat <<'USAGE'
+fleet self-check — static linter for LESSONS-derived call-shape traps.
+
+Usage:
+  fleet self-check                  scan the kit's own shell and print the table
+  fleet self-check --json           one JSON object per hit (NDJSON)
+  fleet self-check --list           list the catalog of patterns + LESSONS dates
+  fleet self-check --pattern <name> restrict the scan to a single pattern
+  fleet self-check --help           this banner
+
+Exit codes: 0 = zero hits, 1 = at least one hit, 2 = usage error.
+
+When FLEET_SELF_CHECK_GATE=1 is exported (the local-gate / pre-push call
+shape), every hit ALSO emits one self_check_failed event to the
+agent-fleet kit-as-project events.jsonl. Unset env = no event.
+USAGE
+    exit 0
+  fi
+
+  # --list: print the catalog and exit, no scan.
+  if [ "$want_list" = "1" ]; then
+    local name lesson desc kind approx
+    while IFS=$'\t' read -r name lesson desc kind approx; do
+      [ -z "$name" ] && continue
+      local suffix=""
+      [ "$approx" = "1" ] && suffix=" ≈"
+      printf -- '%-34s %s  %s%s\n' "$name" "$lesson" "$desc" "$suffix"
+    done < <(self_check_catalog)
+    exit 0
+  fi
+
+  # Validate --pattern <name>: must be in the catalog.
+  if [ -n "$want_pattern" ]; then
+    local known
+    known="$(self_check_catalog | awk -F'\t' -v p="$want_pattern" '$1 == p { print $1; exit }')"
+    if [ -z "$known" ]; then
+      printf -- 'self-check: unknown pattern "%s" (run --list to see available)\n' \
+        "$want_pattern" >&2
+      exit 2
+    fi
+  fi
+
+  # Resolve the kit root. FLEET_SELF_CHECK_ROOT overrides for tests.
+  local kit_root="${FLEET_SELF_CHECK_ROOT:-}"
+  if [ -z "$kit_root" ]; then
+    kit_root="$( cd "$( dirname "$0" )/.." && pwd )"
+  fi
+
+  # Build the list of files to scan. We use a bash array so each
+  # pattern's awk/grep gets the full file list as separate args.
+  local files=()
+  local f
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    files+=("$f")
+  done < <(self_check_source_files "$kit_root")
+  local n_files="${#files[@]}"
+
+  # Walk the catalog, run each pattern across the full file list in one
+  # subprocess chain. Run patterns in PARALLEL via `&` + a per-pattern
+  # tmp file so the 12 awk/grep invocations don't serialize (a stock
+  # macOS laptop has 8+ cores and the scan workload is CPU-bound). The
+  # per-pattern outputs are concatenated after `wait` in the catalog
+  # order so the renderer sees a stable hits stream.
+  local hits_file; hits_file="$(mktemp)"
+  : > "$hits_file"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  local patterns_seen=""
+  local lesson_min="" lesson_max=""
+  local name lesson desc kind approx
+  local pat_idx=0
+  local -a pat_files=()
+  while IFS=$'\t' read -r name lesson desc kind approx; do
+    [ -z "$name" ] && continue
+    if [ -n "$want_pattern" ] && [ "$want_pattern" != "$name" ]; then
+      continue
+    fi
+    patterns_seen="$patterns_seen $name"
+    if [ -z "$lesson_min" ] || [ "$lesson" \< "$lesson_min" ]; then lesson_min="$lesson"; fi
+    if [ -z "$lesson_max" ] || [ "$lesson" \> "$lesson_max" ]; then lesson_max="$lesson"; fi
+    if [ "$n_files" -gt 0 ]; then
+      local pat_out="$tmpdir/pat-$pat_idx"
+      pat_files+=("$pat_out")
+      self_check_scan_one "$name" "$lesson" "$desc" "$kind" "$approx" "${files[@]}" > "$pat_out" &
+      pat_idx=$(( pat_idx + 1 ))
+    fi
+  done < <(self_check_catalog)
+  wait
+  # Stable concatenation in catalog order.
+  if [ "$pat_idx" -gt 0 ]; then
+    cat "${pat_files[@]}" > "$hits_file"
+  fi
+  rm -rf "$tmpdir"
+
+  # Strip patterns_seen leading space.
+  patterns_seen="${patterns_seen# }"
+
+  # Total hit count.
+  local total_hits
+  total_hits="$(awk 'NF { n++ } END { print n+0 }' "$hits_file")"
+
+  # Render.
+  if [ "$want_json" = "1" ]; then
+    self_check_render_json "$hits_file"
+  else
+    self_check_render_text "$hits_file" "$patterns_seen" "$n_files" "$lesson_min" "$lesson_max"
+  fi
+
+  # Telemetry: emit one self_check_failed event per hit under the gate
+  # env. Path is OUTSIDE any command substitution per LESSONS
+  # 2026-06-05 so the function-scope exports inside the subshell apply
+  # cleanly (the helper itself runs in a `( ... )` subshell that
+  # exports SLUG/CACHE_DIR/FLEET_PHASE only for the fleet_emit_event
+  # call — caller's environment is unaffected).
+  if [ "${FLEET_SELF_CHECK_GATE:-}" = "1" ] && [ "$total_hits" -gt 0 ]; then
+    local h_name h_lesson h_file h_line h_snippet h_approx
+    while IFS=$'\t' read -r h_name h_lesson h_file h_line h_snippet h_approx; do
+      [ -z "$h_name" ] && continue
+      # h_snippet and h_approx are captured to consume the tab-delimited
+      # row in full but are intentionally unused — the event payload is
+      # narrow on purpose (pattern, lesson_date, file, line).
+      _=$h_snippet
+      _=$h_approx
+      self_check_emit_event "$h_name" "$h_lesson" "$h_file" "$h_line"
+    done < "$hits_file"
+  fi
+
+  rm -f "$hits_file"
+
+  if [ "$total_hits" -gt 0 ]; then
+    exit 1
+  fi
+  exit 0
+}
+
+if [ "$CMD" = "self-check" ]; then
+  self_check "$@"
 fi
 
 # Hand-rolled JSON string escape — same intent as common.sh _json_escape but
