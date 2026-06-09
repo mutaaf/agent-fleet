@@ -1,7 +1,7 @@
 ---
 id: 0040
 title: fleet self-check greps the kit's own shell for known LESSONS-documented call-shape traps
-status: in-progress
+status: shipped
 priority: P1
 area: safety
 created: 2026-06-09
