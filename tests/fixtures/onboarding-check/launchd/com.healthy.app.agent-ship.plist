@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- fixture: pretend launchd plist for healthy-app.agent-ship -->
+<plist version="1.0"><dict><key>Label</key><string>com.healthy.app.agent-ship</string></dict></plist>

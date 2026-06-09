@@ -323,15 +323,19 @@ postcard.
     no transcript scraping required to reconstruct "did the heal
     step push a regression of a documented trap?"
 
-**Demo path (ticket 0023).** `bin/fleet kickstart --demo` walks a
-credential-less synthetic ship cycle and emits the four core event
-types (`run_started`, `pr_opened`, `lesson_draft_emitted`,
-`run_completed`) with `phase=demo` and `slug=demo-XXXX`. No new event
-type is introduced — the demo is a CONSUMER of the existing channel
-contract, not a new channel. Consumers can filter `phase=demo` to
-exclude synthetic traffic from real-project rollups; `fleet digest`
-and `fleet weekly` already do this implicitly by discovering projects
-via `agents.config.sh` rather than scanning `$HOME/.cache` blindly.
+**Demo path (ticket 0023) and onboarding-check (ticket 0041).** `bin/fleet
+kickstart --demo` walks a credential-less synthetic ship cycle and emits
+the four core event types (`run_started`, `pr_opened`,
+`lesson_draft_emitted`, `run_completed`) with `phase=demo` and
+`slug=demo-XXXX`. `bin/fleet onboarding-check <repo>` walks the same
+four-event synthetic cycle against a freshly-installed project but emits
+with `phase=onboarding-check` and `slug=onboarding-check-XXXXXX`. No new
+event type is introduced in either case — both are CONSUMERS of the
+existing channel contract, not new channels. Consumers can filter
+`phase=demo` and `phase=onboarding-check` to exclude synthetic traffic
+from real-project rollups; `fleet digest` and `fleet weekly` already do
+this implicitly by discovering projects via `agents.config.sh` rather
+than scanning `$HOME/.cache` blindly.
 
 Add new event types in the same file; consumers MUST tolerate unknown types
 gracefully. Do not rename or repurpose an existing type — the contract is the

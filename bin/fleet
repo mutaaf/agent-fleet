@@ -32,6 +32,9 @@
 #                             (ticket 0031 — --since/--slug/--json; pure reader, no new event types)
 #   fleet preflight <repo>    dry-adopt a candidate project; print what install.sh would do (read-only)
 #                             (ticket 0032 — 10 PASS/WARN/FAIL rows + verdict; --json; never writes)
+#   fleet onboarding-check <repo>  verify a freshly-installed project end-to-end (post-install)
+#                             (ticket 0041 — 11 GREEN/YELLOW/RED checks + synthetic ship cycle;
+#                              phase=onboarding-check on the four core events; --json; read-only)
 #   fleet morning             one-command daily briefing (digest + inbox [+ Sunday weekly])
 #                             (ticket 0036 — composes existing readers; --no-weekly/--weekly/--json/--slug)
 #   fleet incident --since <Nh|Nd>  assemble a post-mortem from the event channel
@@ -1550,6 +1553,515 @@ USAGE
 
 if [ "$CMD" = "preflight" ]; then
   preflight "$@"
+fi
+
+# --- onboarding-check -----------------------------------------------------
+# Ticket 0041. `fleet onboarding-check <repo-path>` is the AFTER-install
+# verifier in the acquisition trio (kickstart --demo → preflight → install
+# → onboarding-check). It walks 11 read-only checks against a freshly-
+# installed project + a synthetic ship cycle (NO real claude spawn, NO
+# real PR, NO heal-counter advance). Each check returns GREEN | YELLOW |
+# RED with a one-line remediation hint.
+#
+# Telemetry: REUSES the four core event types from kickstart --demo with
+# a new `phase=onboarding-check` discriminator (per AGENTS.md § Telemetry
+# Demo path paragraph — this is a CONSUMER of the existing contract, not
+# a new channel). Synthetic events land in the AGENT-FLEET kit-as-project
+# events.jsonl (per the lesson_promoted / prompts_reverted pattern — the
+# kit IS a project for telemetry purposes) so they do NOT pollute the
+# verified project's ROI rollup.
+#
+# Hard NOs the helpers respect:
+#   - never call fleet_run_claude (AC#9 — claude stub records zero hits)
+#   - never call `gh pr create` (the gh stub log assertion)
+#   - never touch ~/.local/share/agent-fleet, ~/Library/LaunchAgents, or
+#     ~/.cache/<other-slug>-agent (read-only by design)
+#
+# All helpers below this header are defined ABOVE the dispatcher block at
+# the END of this section per LESSONS 2026-06-05 (forward-reference trap).
+# Every check helper prints one TSV record `result<TAB>hint` to stdout.
+# The consumer remaps empty hints from a `-` sentinel per LESSONS
+# 2026-06-08 (IFS=$'\t' middle-empty-field trap).
+
+# Pad a label to display-width N for the text renderer. Reuses preflight's
+# UTF-8-aware width helper so the section sign § in any future check label
+# pads correctly across locales.
+onboarding_check_pad() {
+  local s="$1" target="$2" cur pad
+  cur="$(preflight_visible_width "$s")"
+  pad=$(( target - cur ))
+  if [ "$pad" -lt 0 ]; then pad=0; fi
+  printf -- '%s' "$s"
+  if [ "$pad" -gt 0 ]; then
+    printf -- '%*s' "$pad" ""
+  fi
+}
+
+# check 1: agents.config.sh present + sources cleanly. RED if missing or
+# fails to source. GREEN otherwise (the deeper "is SLUG set" check is
+# already covered by preflight; here we only confirm the manifest is
+# reachable from the project tree the operator just installed against).
+onboarding_check_agents_config() {
+  local proj_dir="$1"
+  local manifest="$proj_dir/agents.config.sh"
+  if [ ! -f "$manifest" ]; then
+    printf 'red\tagents.config.sh missing — re-run install.sh against this repo\n'
+    return 0
+  fi
+  # shellcheck disable=SC1090
+  if ! ( source "$manifest" 2>/dev/null ); then
+    printf 'red\tagents.config.sh fails to source — open it and fix the syntax error\n'
+    return 0
+  fi
+  printf 'green\t-\n'
+}
+
+# check 2: AGENTS.md has the gating-contract section header.
+onboarding_check_agents_md_section() {
+  local proj_dir="$1"
+  local am="$proj_dir/AGENTS.md"
+  if [ ! -f "$am" ]; then
+    printf 'red\tAGENTS.md missing — copy templates/AGENTS.section.md into place\n'
+    return 0
+  fi
+  if ! grep -qE '^##[[:space:]]+Agent parameters' "$am"; then
+    printf 'red\tAGENTS.md lacks the "## Agent parameters" section header\n'
+    return 0
+  fi
+  printf 'green\t-\n'
+}
+
+# check 3: docs/backlog/README.md index file is present.
+onboarding_check_backlog_index() {
+  local proj_dir="$1"
+  local readme="$proj_dir/docs/backlog/README.md"
+  if [ ! -f "$readme" ]; then
+    printf 'red\tdocs/backlog/README.md missing — install.sh template scaffolds it\n'
+    return 0
+  fi
+  printf 'green\t-\n'
+}
+
+# check 4: ~/.local/share/agent-fleet/lib/ present (the TCC-safe engine
+# copy install.sh writes). RED if absent — operator hasn't installed yet.
+onboarding_check_lib_copied() {
+  local share="$HOME/.local/share/agent-fleet/lib"
+  if [ ! -d "$share" ]; then
+    printf 'red\tno lib/ at %s — re-run install.sh\n' "$share"
+    return 0
+  fi
+  printf 'green\t-\n'
+}
+
+# check 5: both launchd plists installed under ~/Library/LaunchAgents.
+# RED if either is missing.
+onboarding_check_plists_present() {
+  local ns="$1"
+  if [ -z "$ns" ]; then
+    printf 'red\tNAMESPACE unset in agents.config.sh — cannot resolve plist paths\n'
+    return 0
+  fi
+  local dir="$HOME/Library/LaunchAgents"
+  local missing="" job
+  for job in ship groom; do
+    if [ ! -f "$dir/$ns.agent-$job.plist" ]; then
+      missing="$missing $ns.agent-$job.plist"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    printf 'red\tmissing plist(s):%s — re-run install.sh\n' "$missing"
+    return 0
+  fi
+  printf 'green\t-\n'
+}
+
+# check 6: launchd labels enabled. YELLOW (not RED) when one is disabled —
+# the operator may deliberately disable agent-groom to ship from a
+# hand-curated backlog. We probe via `launchctl print-disabled gui/$UID`
+# which is read-only (per ticket "Out of scope" no mutation verbs).
+onboarding_check_labels_enabled() {
+  local ns="$1"
+  if [ -z "$ns" ]; then
+    printf 'red\tNAMESPACE unset — cannot probe labels\n'
+    return 0
+  fi
+  local uid="${UID:-$(id -u)}"
+  local domain="gui/$uid"
+  local job out disabled=""
+  for job in ship groom; do
+    out="$(launchctl print-disabled "$domain" "$ns.agent-$job" 2>/dev/null || true)"
+    if printf -- '%s' "$out" | grep -qF -- "disabled"; then
+      disabled="$disabled $ns.agent-$job"
+    fi
+  done
+  if [ -n "$disabled" ]; then
+    printf 'yellow\tlabel disabled:%s — launchctl enable %s/%s.agent-{ship,groom}\n' \
+      "$disabled" "$domain" "$ns"
+    return 0
+  fi
+  printf 'green\t-\n'
+}
+
+# check 7: $CACHE_DIR/events.jsonl writable. We touch a sentinel file in
+# the cache dir (creating the dir if necessary, just like the runners do)
+# and remove it. Operates against the TARGET project's cache, not the
+# kit's.
+onboarding_check_events_writable() {
+  local slug="$1"
+  if [ -z "$slug" ]; then
+    printf 'red\tSLUG unset — cannot resolve $CACHE_DIR\n'
+    return 0
+  fi
+  local cache="$HOME/.cache/${slug}-agent"
+  if ! mkdir -p "$cache" 2>/dev/null; then
+    printf 'red\tcannot create %s (parent unwritable?)\n' "$cache"
+    return 0
+  fi
+  local probe="$cache/.onboarding-check-probe.$$"
+  if : > "$probe" 2>/dev/null; then
+    rm -f "$probe"
+    printf 'green\t-\n'
+  else
+    printf 'red\t%s not writable\n' "$cache"
+  fi
+}
+
+# check 8: gh CLI is on PATH and reports an authenticated session.
+onboarding_check_gh_auth() {
+  if ! command -v gh >/dev/null 2>&1; then
+    printf 'red\tgh CLI not on PATH — install from https://cli.github.com/\n'
+    return 0
+  fi
+  local raw
+  raw="$(gh auth status 2>&1 || true)"
+  if ! printf -- '%s' "$raw" | grep -qE 'Logged in to'; then
+    printf 'red\tgh not authenticated — run `gh auth login` and re-run\n'
+    return 0
+  fi
+  printf 'green\t-\n'
+}
+
+# check 9: claude CLI on PATH.
+onboarding_check_claude_cli() {
+  if ! command -v claude >/dev/null 2>&1; then
+    printf 'red\tclaude CLI not on PATH — install Claude Code and re-run\n'
+    return 0
+  fi
+  printf 'green\t-\n'
+}
+
+# check 10: prompts SHA pin in the project's manifest matches the kit's
+# current prompts SHA. Unset PROMPTS_SHA = YELLOW (drift events will fire
+# silently forever); mismatch = YELLOW too (operator can re-install).
+# Match = GREEN.
+onboarding_check_prompts_sha() {
+  local proj_dir="$1"
+  local pin=""
+  if [ -f "$proj_dir/agents.config.sh" ]; then
+    # shellcheck disable=SC1090
+    pin="$( ( source "$proj_dir/agents.config.sh" 2>/dev/null
+              printf -- '%s' "${PROMPTS_SHA:-}" ) )"
+  fi
+  # Compute the kit's current prompts SHA the same way `fleet prompts-sha`
+  # does (find prompts -type f -name '*.md' | sort | xargs cat | shasum).
+  # We resolve the kit root via this script's path, the same way kickstart
+  # --demo does (BASH_SOURCE-relative, no `dirname` dependency in case
+  # PATH is minimal).
+  local script_path bin_dir kit_root cur=""
+  script_path="${BASH_SOURCE[0]}"
+  case "$script_path" in
+    /*) ;;
+    *)  script_path="$PWD/$script_path" ;;
+  esac
+  bin_dir="${script_path%/*}"
+  kit_root="${bin_dir%/*}"
+  if [ -d "$kit_root/prompts" ]; then
+    cur="$( cd "$kit_root" && find prompts -type f -name '*.md' 2>/dev/null \
+              | sort | xargs cat 2>/dev/null | shasum -a 256 | awk '{print $1}' )"
+  fi
+  if [ -z "$pin" ]; then
+    printf 'yellow\tPROMPTS_SHA unset — drift events will fire silently forever\n'
+    return 0
+  fi
+  if [ -z "$cur" ]; then
+    printf 'yellow\tcould not compute kit prompts SHA (run from the source checkout)\n'
+    return 0
+  fi
+  if [ "$pin" = "$cur" ]; then
+    printf 'green\t-\n'
+    return 0
+  fi
+  printf 'yellow\tPROMPTS_SHA differs from installed copy — re-run install.sh to bump\n'
+}
+
+# check 11: synthetic ship cycle. The load-bearing helper. Picks a 6-hex
+# random slug, points CACHE_DIR at a kit-as-project location, and emits
+# the four core event types directly via fleet_emit_event (NOT via
+# fleet_run_claude per AC#9). Sets up its own SLUG / CACHE_DIR / FLEET_PHASE
+# so common.sh's emit helper writes to the right channel; we do NOT call
+# fleet_log_init because it redirects stdout to a logfile.
+#
+# Per LESSONS 2026-06-05 (export-inside-$(...) trap), this helper is
+# called WITHOUT command substitution from the dispatcher so the sourced
+# common.sh's exports survive — that's why this helper prints its TSV
+# line LAST (after the emits) but uses a temp file to capture the result.
+onboarding_check_synthetic_cycle() {
+  # Generate a 6-hex random slug.
+  local rand
+  rand="$(od -An -tx1 -N3 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
+  if [ -z "$rand" ]; then
+    rand="$(printf '%06x' "$RANDOM$RANDOM" | cut -c1-6)"
+  fi
+  local synth_slug="onboarding-check-$rand"
+
+  # Resolve the kit root the same way the prompts SHA check does.
+  local script_path bin_dir kit_root
+  script_path="${BASH_SOURCE[0]}"
+  case "$script_path" in
+    /*) ;;
+    *)  script_path="$PWD/$script_path" ;;
+  esac
+  bin_dir="${script_path%/*}"
+  kit_root="${bin_dir%/*}"
+
+  # Source common.sh so fleet_emit_event is in scope. lib/common.sh
+  # resets PATH — that's fine because we are not shelling out to anything
+  # except shasum/find which all live on the restored PATH.
+  if [ ! -f "$kit_root/lib/common.sh" ]; then
+    printf 'red\tcannot find kit lib/common.sh — run from the source checkout\n'
+    return 0
+  fi
+  # Run the whole emit pass in a subshell so SLUG / CACHE_DIR / FLEET_PHASE
+  # only affect the synthetic channel, not whatever the operator's shell
+  # has set. Per LESSONS 2026-06-05 we DO call this from the dispatcher
+  # without $(...) so the subshell's emits still write the JSONL file (the
+  # writes go to disk, not to an exported guard env). The TSV record is
+  # printed AFTER the subshell exits.
+  (
+    # shellcheck source=/dev/null
+    source "$kit_root/lib/common.sh" >/dev/null 2>&1 || true
+    SLUG="$synth_slug"; export SLUG
+    CACHE_DIR="$HOME/.cache/${synth_slug}-agent"; export CACHE_DIR
+    FLEET_PHASE="onboarding-check"; export FLEET_PHASE
+    mkdir -p "$CACHE_DIR"
+    fleet_emit_event run_started "pid=$$" || true
+    fleet_emit_event pr_opened "number=0" "branch=synthetic" || true
+    fleet_emit_event lesson_draft_emitted "pr=0" "headline=onboarding-check synthetic send-back" || true
+    fleet_emit_event run_completed "exit=0" "duration_ms=0" || true
+  ) || true
+
+  # Verify the channel grew by four lines as a defensive check.
+  local channel="$HOME/.cache/${synth_slug}-agent/events.jsonl"
+  local n
+  n="$(awk 'END { print NR+0 }' "$channel" 2>/dev/null || echo 0)"
+  if [ "$n" -lt 4 ]; then
+    printf 'red\tsynthetic cycle emitted %s events (want >=4) — events.jsonl unreachable?\n' "$n"
+    return 0
+  fi
+  printf 'green\t4 events emitted (slug=%s phase=onboarding-check)\n' "$synth_slug"
+}
+
+# Text renderer. Consumes the stream of `LABEL|RESULT|HINT` records and
+# prints the table + summary + NEXT block. The exit-code sentinel mirrors
+# preflight's pattern so the dispatcher reads it back without polluting
+# the rendered output.
+onboarding_check_render_text() {
+  local repo="$1"
+  printf -- 'fleet onboarding-check: verifying %s …\n\n' "$repo"
+  printf -- '%s%s\n' "$(onboarding_check_pad "CHECK" 40)" "RESULT"
+  local g=0 y=0 r=0
+  local label result hint padded RR next_lines=""
+  while IFS='|' read -r label result hint; do
+    [ -z "$label" ] && continue
+    case "$result" in
+      green)  g=$(( g + 1 )); RR="GREEN"  ;;
+      yellow) y=$(( y + 1 )); RR="YELLOW" ;;
+      red)    r=$(( r + 1 )); RR="RED"    ;;
+      *)      RR="$result" ;;
+    esac
+    padded="$(onboarding_check_pad "  $label" 40)"
+    if [ -n "$hint" ] && [ "$hint" != "-" ]; then
+      printf -- '%s%s — %s\n' "$padded" "$RR" "$hint"
+    else
+      printf -- '%s%s\n' "$padded" "$RR"
+    fi
+    # Build the per-red NEXT lines so the RED summary lists each
+    # remediation hint as a copy-pasteable bullet (per AC#7).
+    if [ "$result" = "red" ] && [ -n "$hint" ] && [ "$hint" != "-" ]; then
+      next_lines+="  - ${label}: ${hint}"$'\n'
+    fi
+  done
+  printf -- '\n'
+  local total=$(( g + y + r ))
+  if [ "$r" -gt 0 ]; then
+    printf -- 'onboarding-check: %s/%s green, %s yellow, %s red.\n' "$g" "$total" "$y" "$r"
+    printf -- '\n'
+    printf -- 'NEXT\n'
+    if [ -n "$next_lines" ]; then
+      printf -- '%s' "$next_lines"
+    fi
+    printf -- '__ONBOARDING_EXIT__\t1\n'
+    return 0
+  fi
+  if [ "$y" -gt 0 ]; then
+    printf -- 'onboarding-check: %s/%s green, %s yellow.\n' "$g" "$total" "$y"
+  else
+    printf -- 'onboarding-check: %s/%s green; loop is ready to fire.\n' "$g" "$total"
+  fi
+  printf -- '\n'
+  printf -- 'NEXT\n'
+  printf -- '  - the next hourly :37 mark will fire your first real ship.\n'
+  printf -- '  - to fire now: launchctl kickstart -k gui/$UID/<your-namespace>.agent-ship\n'
+  printf -- '  - to watch the loop: fleet tail --slug <your-slug>\n'
+  printf -- '__ONBOARDING_EXIT__\t0\n'
+}
+
+# JSON renderer. NDJSON-style — one JSON object per check + a final
+# summary object. Per LESSONS 2026-06-03 the escape goes through
+# preflight_json_escape (UTF-8-safe).
+onboarding_check_render_json() {
+  local g=0 y=0 r=0
+  local label result hint hint_out
+  while IFS='|' read -r label result hint; do
+    [ -z "$label" ] && continue
+    case "$result" in
+      green)  g=$(( g + 1 )) ;;
+      yellow) y=$(( y + 1 )) ;;
+      red)    r=$(( r + 1 )) ;;
+    esac
+    hint_out="$hint"
+    [ "$hint_out" = "-" ] && hint_out=""
+    printf -- '{"check":"%s","result":"%s","hint":"%s"}\n' \
+      "$(preflight_json_escape "$label")" \
+      "$(preflight_json_escape "$result")" \
+      "$(preflight_json_escape "$hint_out")"
+  done
+  local ec=0
+  [ "$r" -gt 0 ] && ec=1
+  printf -- '{"summary":{"green":%s,"yellow":%s,"red":%s,"exit":%s}}\n' \
+    "$g" "$y" "$r" "$ec"
+  printf -- '__ONBOARDING_EXIT__\t%s\n' "$ec"
+}
+
+onboarding_check() {
+  shift  # drop the leading "onboarding-check"
+  local want_json=0 repo_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet onboarding-check — verify a freshly-installed project is end-to-end healthy.
+
+Usage:
+  fleet onboarding-check <repo-path>          11 GREEN/YELLOW/RED checks + verdict
+  fleet onboarding-check --json <repo-path>   one JSON object per check + summary
+  fleet onboarding-check --help               this banner
+
+Checks performed (in order):
+  1.  agents.config.sh present + sources cleanly
+  2.  AGENTS.md gating section ("## Agent parameters") present
+  3.  docs/backlog/README.md index present
+  4.  ~/.local/share/agent-fleet/lib/ copied (TCC-safe engine)
+  5.  launchd plists installed (agent-ship + agent-groom)
+  6.  launchd labels enabled in gui/\$UID/
+  7.  \$CACHE_DIR/events.jsonl writable
+  8.  gh CLI authenticated
+  9.  claude CLI on \$PATH
+  10. prompts SHA pinned + matches installed copy
+  11. synthetic ship cycle emits four core events (phase=onboarding-check)
+
+Read-only by design — never calls launchctl mutation verbs, never opens a
+real PR, never spawns the real claude binary. Exit codes: 0 = no RED rows
+(GREEN-only or GREEN+YELLOW), 1 = at least one RED row, 2 = usage error.
+USAGE
+        exit 0 ;;
+      --) shift; repo_arg="${1:-}"; shift || true; break ;;
+      -*) echo "onboarding-check: unknown flag '$1'" >&2; exit 2 ;;
+      *)
+        if [ -z "$repo_arg" ]; then repo_arg="$1"; shift
+        else echo "onboarding-check: unexpected extra argument '$1'" >&2; exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$repo_arg" ]; then
+    echo "onboarding-check: usage: bin/fleet onboarding-check <repo-path>" >&2
+    exit 2
+  fi
+  if [ ! -d "$repo_arg" ]; then
+    printf -- 'onboarding-check: %s: not a directory\n' "$repo_arg" >&2
+    exit 2
+  fi
+
+  local proj_dir; proj_dir="$( cd "$repo_arg" && pwd )"
+
+  # Resolve manifest values once so the per-check helpers can reuse them.
+  local slug="" ns=""
+  if [ -f "$proj_dir/agents.config.sh" ]; then
+    # shellcheck disable=SC1090
+    local probe
+    probe="$(
+      ( source "$proj_dir/agents.config.sh" 2>/dev/null
+        printf 'SLUG=%s\n' "${SLUG:-}"
+        printf 'NAMESPACE=%s\n' "${NAMESPACE:-}"
+      ) 2>/dev/null
+    )"
+    slug="$(printf -- '%s' "$probe" | sed -n 's/^SLUG=//p')"
+    ns="$(printf -- '%s' "$probe" | sed -n 's/^NAMESPACE=//p')"
+  fi
+
+  # Build the row stream. Each helper emits `RESULT<TAB>HINT`; we prepend
+  # the human label to form `LABEL|RESULT|HINT`. Empty hints carry the
+  # `-` sentinel per LESSONS 2026-06-08 to survive the IFS=$'\t' read in
+  # the renderers (the IFS='|' read here has the same trap shape).
+  local stream=""
+  local row label out s d
+  # The tilde in "~/.local/share/agent-fleet/lib copied:" is a LITERAL display
+  # label for the operator, NOT a path; the actual presence check resolves
+  # $HOME/.local/share/agent-fleet/lib inside onboarding_check_lib_copied.
+  # Same shellcheck disable rationale as preflight's identical row.
+  # shellcheck disable=SC2088
+  for spec in \
+    "agents.config.sh present + parses:|onboarding_check_agents_config $(printf '%q' "$proj_dir")" \
+    "AGENTS.md \xc2\xa7 Agent parameters block:|onboarding_check_agents_md_section $(printf '%q' "$proj_dir")" \
+    "docs/backlog/README.md index present:|onboarding_check_backlog_index $(printf '%q' "$proj_dir")" \
+    "~/.local/share/agent-fleet/lib copied:|onboarding_check_lib_copied" \
+    "launchd plist installed (ship/groom):|onboarding_check_plists_present $(printf '%q' "$ns")" \
+    "launchd labels enabled:|onboarding_check_labels_enabled $(printf '%q' "$ns")" \
+    "\$CACHE_DIR/events.jsonl writable:|onboarding_check_events_writable $(printf '%q' "$slug")" \
+    "gh CLI auth + push to remote:|onboarding_check_gh_auth" \
+    "claude CLI on \$PATH:|onboarding_check_claude_cli" \
+    "prompts SHA pinned + matches installed:|onboarding_check_prompts_sha $(printf '%q' "$proj_dir")" \
+    "synthetic ship cycle (NO real PR):|onboarding_check_synthetic_cycle" \
+  ; do
+    label="${spec%%|*}"
+    row="${spec#*|}"
+    out="$(eval "$row")"
+    s="${out%%	*}"
+    d="${out#*	}"
+    [ "$s" = "$d" ] && d=""
+    stream+="$label|$s|$d"$'\n'
+  done
+
+  # Render + extract sentinel exit, then strip it before printing.
+  local rendered exit_code
+  if [ "$want_json" = "1" ]; then
+    rendered="$(printf -- '%s' "$stream" | onboarding_check_render_json)"
+  else
+    rendered="$(printf -- '%s' "$stream" | onboarding_check_render_text "$proj_dir")"
+  fi
+  exit_code="$(printf -- '%s' "$rendered" | awk -F'\t' '/^__ONBOARDING_EXIT__/ { print $2 }')"
+  printf -- '%s' "$rendered" | grep -v '^__ONBOARDING_EXIT__'
+  case "$exit_code" in
+    0) exit 0 ;;
+    1) exit 1 ;;
+    *) exit 1 ;;
+  esac
+}
+
+if [ "$CMD" = "onboarding-check" ]; then
+  onboarding_check "$@"
 fi
 
 # --- self-check -----------------------------------------------------------
