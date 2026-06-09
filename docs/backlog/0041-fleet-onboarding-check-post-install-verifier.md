@@ -1,7 +1,7 @@
 ---
 id: 0041
 title: fleet onboarding-check verifies a freshly-installed project is end-to-end healthy
-status: in-progress
+status: shipped
 priority: P1
 area: docs
 created: 2026-06-09
@@ -469,5 +469,5 @@ doesn't have to re-discover the architecture.
 
 - 2026-06-09 — branch `feat/0041-onboarding-check` opened, status moved to in-progress
 - 2026-06-09 — failing test added in `tests/onboarding-check.sh`
-- YYYY-MM-DD — PR #N opened, CI [state]
-- YYYY-MM-DD — merged to main
+- 2026-06-09 — PR #85 opened, CI green on shellcheck + validate
+- 2026-06-09 — merged to main as 4ef5e5b
