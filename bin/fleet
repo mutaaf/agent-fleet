@@ -10430,15 +10430,10 @@ streak_walk_days() {  # $1 = events.jsonl, $2 = start YYYY-MM-DD, $3 = end YYYY-
 streak_collapse_runs() {  # $1 = walk_tsv, $2 = start_day, $3 = end_day
   local walk_tsv="$1" start_day="$2" end_day="$3"
 
-  # Build an indexed in-memory map: day → "green|red|neutral|broken_by".
-  # Then walk start..end and compute longest + current.
-  local d="$start_day"
-  local longest=0 cur_run=0 last_green="" broken_date="" broken_type=""
-  local most_recent_break_date="" most_recent_break_type=""
-
-  # Read the per-day TSV into associative-ish storage. Bash 3.2 has no
-  # assoc arrays, so we write a small awk that does the walk in one
-  # pass given the sorted day list AND the window range.
+  # Bash 3.2 has no associative arrays, so the walk lives entirely in
+  # awk: read the per-day TSV into two flat maps (verdicts, brokens),
+  # then iterate start..end via shellout to BSD `date` per LESSONS
+  # 2026-06-05 (no bash arithmetic on dates).
   awk -v start_day="$start_day" -v end_day="$end_day" '
     BEGIN { day_count = 0; streak = 0; longest = 0 }
     /./ {
@@ -10561,7 +10556,7 @@ streak_render_json_row() {  # $1..$6 same as streak_render_row
 streak_summary_line() {  # $1 = records_tsv
   local rec="$1"
   [ -f "$rec" ] || return 0
-  local total active longest_active_slug longest_active_n
+  local total active longest_active_slug
   total=$(awk 'END { print NR+0 }' "$rec")
   active=$(awk -F'\t' '$2 > 0 { n++ } END { print n+0 }' "$rec")
   # Pick the longest-active project (max current). Ties broken by slug.
