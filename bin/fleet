@@ -43,6 +43,9 @@
 #   fleet diff <slug-a> <slug-b>  side-by-side ROI / posture comparison
 #                             (ticket 0038 — 8 metric rows + DIVERGENCE + HYPOTHESES;
 #                              --since Nh|Nd default 14d, --json; pure reader)
+#   fleet rank --by <metric>  rank every project on a single posture metric
+#                             (ticket 0043 — roi|heal-rate|draft-debt|paused-hours|sendback-rate;
+#                              --since Nd|YYYY-MM-DD default 14d, --json; pure reader)
 #   fleet self-check          run the LESSONS-derived static linter against the kit's own shell
 #                             (ticket 0040 — 12 patterns keyed to LESSONS dates;
 #                              --list/--pattern/--json; FLEET_SELF_CHECK_GATE=1 emits self_check_failed)
@@ -10290,6 +10293,520 @@ USAGE
 
 if [ "$CMD" = "diff" ]; then
   diff_cmd "$@"
+  exit $?
+fi
+
+# --- rank (ticket 0043) --------------------------------------------------
+# `fleet rank --by <metric> [--since Nd|YYYY-MM-DD] [--json]` orders every
+# discovered project on a single posture metric in one leaderboard.
+#
+# Five v1 metrics:
+#   roi             ships / spend       (higher = better)
+#   heal-rate       merges / heal       (higher = better)
+#   draft-debt      unpromoted drafts   (lower  = better)
+#   paused-hours    sum(ship_paused)    (lower  = better)
+#   sendback-rate   sendbacks / prs     (lower  = better)
+#
+# Pure consumer of events.jsonl + runs.jsonl + agents.config.sh. No new
+# event types, no fleet_emit_event calls, no fleet_* signature changes,
+# no lib/ or prompts/ edits. Reuses the existing per-slug helpers from
+# weekly/incident/inbox/diff rather than re-implementing them.
+#
+# LESSONS defended against (all inline):
+# - 2026-05-26 — discovery shape mirrors overview_discover/streak_discover.
+# - 2026-05-26 — `rank` does not shadow any coreutils binary.
+# - 2026-05-28 — every printf of a metric/slug uses `printf --`.
+# - 2026-05-30 — help-text grep uses `grep -qF --` from tests.
+# - 2026-06-01 — `rank()` ends with explicit `exit N` on every path.
+# - 2026-06-01 — counts use `awk … END { print n+0 }` everywhere.
+# - 2026-06-03 — JSON escape goes through `preflight_json_escape`.
+# - 2026-06-05 — helpers ABOVE the dispatcher block (forward-ref trap).
+# - 2026-06-05 — width via `preflight_visible_width` for headers.
+# - 2026-06-08 — `rank_median_and_mad` awk script BEGIN-initializes the
+#                counter so the first sample does not land at arr[""].
+
+# Discovery: same shape as overview_discover / streak_discover — union
+# the fixture root and the installed root, de-dupe by SLUG. Echoes one
+# line per project: `slug<TAB>cache_dir`.
+rank_discover_slugs() {
+  local _seen="" m slug
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf -- '%s\t%s\n' "$slug" "$HOME/.cache/${slug}-agent"
+  done | sort -t $'\t' -k1,1
+}
+
+# Parse --since Nd|Nh|YYYY-MM-DD → seconds. Echoes seconds OR empty on
+# parse error; caller branches on `-z`.
+rank_parse_since() {
+  local raw="$1"
+  case "$raw" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+      # YYYY-MM-DD → seconds back from FLEET_NOW_OVERRIDE / now.
+      local now target_epoch
+      now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+      target_epoch="$(date -u -j -f '%Y-%m-%d' "$raw" '+%s' 2>/dev/null || date -u -d "$raw" +%s 2>/dev/null || echo "")"
+      [ -z "$target_epoch" ] && return 0
+      local since=$(( now - target_epoch ))
+      [ "$since" -lt 0 ] && since=0
+      echo "$since"
+      ;;
+    *)
+      # Delegate to digest_parse_since for Nh / Nd.
+      digest_parse_since "$raw" || true
+      ;;
+  esac
+}
+
+# --- per-slug metric wrappers ----
+# Each computes ONE number for ONE slug over the window. Each wraps an
+# existing per-slug helper from weekly/incident/inbox/diff per the
+# ticket's "reuse, don't reimplement" rule.
+
+rank_compute_roi() {  # $1=cache_dir $2=start_epoch
+  # Reuse weekly_ship_count_since (merges/SHIP) + digest_spend_since (sum
+  # of total_cost_usd) — same pair weekly() itself uses.
+  local cache="$1" start="$2"
+  local runs="$cache/runs.jsonl"
+  local ships spend
+  ships="$(weekly_ship_count_since "$runs" "$start")"
+  spend="$(digest_spend_since      "$runs" "$start")"
+  # ROI = ships / spend. Zero-spend → 0 (no signal to rank against).
+  awk -v s="$ships" -v p="$spend" \
+    'BEGIN { if (p + 0 <= 0) { print "0.0000" } else { printf("%.4f", (s + 0) / (p + 0)) } }'
+}
+
+rank_compute_heal_rate() {  # $1=cache_dir $2=start_epoch
+  # Reuse weekly_ship_count_since (merges) + weekly_heal_count_since
+  # (gate_failed → digest_event_count_since "gate_failed").
+  local cache="$1" start="$2"
+  local runs="$cache/runs.jsonl" events="$cache/events.jsonl"
+  local merges heal
+  merges="$(weekly_ship_count_since "$runs"   "$start")"
+  heal="$(  weekly_heal_count_since "$events" "$start")"
+  # heal-rate = merges / heal. Zero-heal → echo merges (large is better).
+  awk -v m="$merges" -v h="$heal" \
+    'BEGIN { if (h + 0 <= 0) { printf("%.4f", m + 0) } else { printf("%.4f", (m + 0) / (h + 0)) } }'
+}
+
+rank_compute_draft_debt() {  # $1=cache_dir $2=start_epoch
+  # Reuse diff_draft_debt (unpromoted lesson_draft_emitted in window).
+  local cache="$1" start="$2"
+  local events="$cache/events.jsonl"
+  diff_draft_debt "$events" "$start"
+}
+
+rank_compute_paused_hours() {  # $1=cache_dir $2=start_epoch
+  # Reuse diff_paused_hours (ship_paused/ship_resumed pairing helper
+  # introduced in ticket 0038 — already has the LESSONS 2026-06-08 fix).
+  local cache="$1" start="$2"
+  local events="$cache/events.jsonl"
+  local end_epoch
+  end_epoch="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  diff_paused_hours "$events" "$start" "$end_epoch"
+}
+
+rank_compute_sendback_rate() {  # $1=cache_dir $2=start_epoch
+  # Reuse digest_event_count_since for sendbacks (lesson_draft_emitted)
+  # AND diff_count_pr_opened (which itself wraps digest_event_count_since
+  # for pr_opened). sendback_rate = sendbacks / pr_opened. Zero PRs → 0.
+  local cache="$1" start="$2"
+  local events="$cache/events.jsonl"
+  local sendbacks prs
+  sendbacks="$(digest_event_count_since "$events" "$start" "lesson_draft_emitted")"
+  prs="$(      diff_count_pr_opened     "$events" "$start")"
+  awk -v s="$sendbacks" -v p="$prs" \
+    'BEGIN { if (p + 0 <= 0) { print "0.0000" } else { printf("%.4f", (s + 0) / (p + 0)) } }'
+}
+
+# Median + MAD over a list of values (one per line via stdin). Echoes
+# `median<TAB>mad` (both floats). Per LESSONS 2026-06-08, the awk script
+# explicitly initializes `n` in BEGIN so the first sample lands at
+# arr[0], not arr[""].
+rank_median_and_mad() {
+  awk '
+    BEGIN { n = 0 }
+    { v[n] = $0 + 0; n++ }
+    END {
+      if (n == 0) { print "0\t0"; exit }
+      # Sort v[0..n-1] ascending.
+      for (i = 1; i < n; i++) {
+        k = v[i]; j = i
+        while (j > 0 && v[j-1] > k) { v[j] = v[j-1]; j-- }
+        v[j] = k
+      }
+      # Median.
+      mid = int(n / 2)
+      if (n % 2 == 1) median = v[mid]
+      else            median = (v[mid - 1] + v[mid]) / 2.0
+      # MAD: median of |v[i] - median|.
+      for (i = 0; i < n; i++) {
+        d = v[i] - median
+        if (d < 0) d = -d
+        dev[i] = d
+      }
+      for (i = 1; i < n; i++) {
+        k = dev[i]; j = i
+        while (j > 0 && dev[j-1] > k) { dev[j] = dev[j-1]; j-- }
+        dev[j] = k
+      }
+      if (n % 2 == 1) mad = dev[mid]
+      else            mad = (dev[mid - 1] + dev[mid]) / 2.0
+      printf("%.4f\t%.4f\n", median, mad)
+    }
+  '
+}
+
+# Pretty-print a numeric value for the table. ROI/heal-rate get an "x"
+# suffix; draft-debt/paused-hours stay integer-ish; sendback-rate gets a
+# decimal.
+rank_format_value() {  # $1=metric $2=value
+  local metric="$1" v="$2"
+  case "$metric" in
+    roi|heal-rate)
+      awk -v x="$v" 'BEGIN { printf("%.2fx", x + 0) }'
+      ;;
+    draft-debt|paused-hours)
+      # Integer-friendly: strip trailing .0000.
+      awk -v x="$v" 'BEGIN { printf("%d", x + 0) }'
+      ;;
+    sendback-rate)
+      awk -v x="$v" 'BEGIN { printf("%.3f", x + 0) }'
+      ;;
+    *)
+      printf -- '%s' "$v"
+      ;;
+  esac
+}
+
+# Pretty-print a delta from median (signed) for the table.
+rank_format_delta() {  # $1=metric $2=delta (signed float)
+  local metric="$1" d="$2"
+  case "$metric" in
+    roi|heal-rate)
+      awk -v x="$d" 'BEGIN {
+        sign = (x >= 0) ? "+" : ""
+        printf("%s%.2f", sign, x)
+      }'
+      ;;
+    draft-debt|paused-hours)
+      awk -v x="$d" 'BEGIN {
+        sign = (x > 0) ? "+" : ""
+        printf("%s%g", sign, x)
+      }'
+      ;;
+    sendback-rate)
+      awk -v x="$d" 'BEGIN {
+        sign = (x >= 0) ? "+" : ""
+        printf("%s%.3f", sign, x)
+      }'
+      ;;
+    *) printf -- '%s' "$d" ;;
+  esac
+}
+
+# Direction sign for "delta is BAD" given the metric. ROI/heal-rate
+# higher = better → bad when delta < 0. Others lower = better → bad when
+# delta > 0.
+rank_metric_higher_is_better() {  # $1=metric → echoes 1 (higher better) or 0
+  case "$1" in
+    roi|heal-rate) echo 1 ;;
+    *)             echo 0 ;;
+  esac
+}
+
+# Render the text leaderboard table from the TSV records file.
+# TSV columns: rank<TAB>slug<TAB>value<TAB>delta<TAB>is_outlier(0|1)<TAB>is_median(0|1)
+rank_render_text() {  # $1=tsv_file $2=metric $3=window_label $4=median(num)
+                       # $5=leader $6=outlier(or empty) $7=mad(num)
+  local tsv="$1" metric="$2" window="$3" median="$4" leader="$5" outlier="$6" mad="$7"
+  local n
+  n="$(awk 'END { print NR + 0 }' "$tsv")"
+
+  # Header line.
+  printf -- '#  SLUG          %-10s %s\n' "$metric" "Δ FROM MEDIAN"
+
+  # Rows.
+  while IFS=$'\t' read -r rk slug v dlt is_outlier is_median; do
+    local val_fmt delta_fmt
+    val_fmt="$(rank_format_value "$metric" "$v")"
+    if [ "$is_median" = "1" ]; then
+      delta_fmt="median"
+    else
+      delta_fmt="$(rank_format_delta "$metric" "$dlt")"
+    fi
+    printf -- '%-2s %-13s %-10s %s\n' "$rk" "$slug" "$val_fmt" "$delta_fmt"
+  done < "$tsv"
+
+  printf -- '\n'
+  printf -- 'rank: %d projects ranked by %s (best=top) over %s.\n' "$n" "$metric" "$window"
+
+  if [ -n "$outlier" ]; then
+    local delta_outlier
+    delta_outlier="$(awk -F'\t' -v s="$outlier" '$2 == s { print $4 }' "$tsv")"
+    local fmt_delta
+    fmt_delta="$(rank_format_delta "$metric" "$delta_outlier")"
+    printf -- '        outlier (>2x median spread): %s (%s from median).\n' "$outlier" "$fmt_delta"
+    printf -- '        recommend: `fleet diff %s %s` next.\n' "$outlier" "$leader"
+  fi
+
+  return 0
+}
+
+# Render the JSON leaderboard from the TSV records file. One object per
+# slug + one summary object, one per line. JSON values flow through
+# preflight_json_escape per LESSONS 2026-06-03.
+rank_render_json() {  # $1=tsv_file $2=metric $3=window_label $4=median(num)
+                       # $5=leader $6=outlier(or empty)
+  local tsv="$1" metric="$2" window="$3" median="$4" leader="$5" outlier="$6"
+
+  while IFS=$'\t' read -r rk slug v dlt is_outlier _is_median; do
+    local outlier_bool="false"
+    [ "$is_outlier" = "1" ] && outlier_bool="true"
+    local slug_esc
+    slug_esc="$(preflight_json_escape "$slug")"
+    printf -- '{"slug":"%s","rank":%s,"value":%s,"delta_from_median":%s,"is_outlier":%s}\n' \
+      "$slug_esc" "$rk" "$v" "$dlt" "$outlier_bool"
+  done < "$tsv"
+
+  local outlier_json="null" leader_esc
+  if [ -n "$outlier" ]; then
+    outlier_json="\"$(preflight_json_escape "$outlier")\""
+  fi
+  leader_esc="$(preflight_json_escape "$leader")"
+  printf -- '{"summary":{"metric":"%s","window":"%s","median":%s,"outlier":%s,"leader":"%s"}}\n' \
+    "$(preflight_json_escape "$metric")" \
+    "$(preflight_json_escape "$window")" \
+    "$median" \
+    "$outlier_json" \
+    "$leader_esc"
+  return 0
+}
+
+# Main dispatcher body. Ends with `exit 0` (success) or `exit 2` (usage
+# error) on every code path per LESSONS 2026-06-01.
+rank() {
+  shift  # drop "rank"
+  local metric="" since="14d" want_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --by)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          printf -- 'rank: --by requires a value (one of: roi heal-rate draft-debt paused-hours sendback-rate)\n' >&2
+          exit 2
+        fi
+        metric="$2"; shift 2 ;;
+      --by=*)
+        metric="${1#--by=}"; shift ;;
+      --since)
+        since="${2:-}"; shift 2 ;;
+      --since=*)
+        since="${1#--since=}"; shift ;;
+      --json)
+        want_json=1; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet rank — order every project on a single posture metric.
+
+Usage:
+  fleet rank --by <metric>                       default --since 14d window
+  fleet rank --by <metric> --since 7d            override window (Nd|Nh)
+  fleet rank --by <metric> --since 2026-06-01    explicit anchor date (YYYY-MM-DD)
+  fleet rank --by <metric> --json                machine-readable: one object per
+                                                  slug + summary object, one/line
+
+Metrics (--by):
+  roi             ROI ratio = ships / $spent       (higher = better)
+  heal-rate       merges / heal-attempts           (higher = better)
+  draft-debt      open LESSONS DRAFT blocks        (lower  = better)
+  paused-hours    cumulative ship_paused minutes   (lower  = better)
+  sendback-rate   sendbacks / pr_opened            (lower  = better)
+
+Output (text mode):
+  #  SLUG          <metric>   Δ FROM MEDIAN
+  1  alpha         ...
+  ...
+
+  rank: N projects ranked by <metric> (best=top) over <window>.
+          outlier (>2x median spread): <slug> (Δ from median).
+          recommend: `fleet diff <outlier> <leader>` next.
+
+Pure consumer of events.jsonl + runs.jsonl + agents.config.sh — no new
+event types, no fleet_emit_event calls, no fleet_* signature changes,
+no lib/ or prompts/ edits.
+
+Exit code: 0 on success; 2 on usage error.
+USAGE
+        exit 0 ;;
+      *)
+        printf -- 'rank: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+    esac
+  done
+
+  # --by required.
+  if [ -z "$metric" ]; then
+    printf -- 'rank: usage: bin/fleet rank --by <roi|heal-rate|draft-debt|paused-hours|sendback-rate> [--since Nd|YYYY-MM-DD] [--json]\n' >&2
+    exit 2
+  fi
+
+  # Validate metric.
+  case "$metric" in
+    roi|heal-rate|draft-debt|paused-hours|sendback-rate) ;;
+    *)
+      printf -- 'rank: unknown metric "%s" (valid: roi heal-rate draft-debt paused-hours sendback-rate)\n' "$metric" >&2
+      exit 2 ;;
+  esac
+
+  # Resolve --since.
+  local since_seconds
+  since_seconds="$(rank_parse_since "$since")"
+  if [ -z "$since_seconds" ]; then
+    printf -- 'rank: invalid --since "%s" (use Nh, Nd, or YYYY-MM-DD)\n' "$since" >&2
+    exit 2
+  fi
+  local end_epoch start_epoch
+  end_epoch="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  start_epoch=$(( end_epoch - since_seconds ))
+
+  # Discover slugs.
+  local discover_rows
+  discover_rows="$(rank_discover_slugs)"
+
+  # Count slugs via awk per LESSONS 2026-06-01 (no `grep -c || echo 0`).
+  local n_slugs
+  n_slugs="$(printf -- '%s\n' "$discover_rows" | awk 'NF > 0 { n++ } END { print n+0 }')"
+
+  if [ "$n_slugs" -eq 0 ]; then
+    printf -- 'rank: no projects discovered. run `fleet onboard` to adopt one.\n'
+    exit 0
+  fi
+  if [ "$n_slugs" -eq 1 ]; then
+    printf -- 'rank: only 1 project; nothing to rank.\n'
+    exit 0
+  fi
+
+  # Compute the per-slug metric values.
+  local tmp_dir
+  tmp_dir="$(mktemp -d -t fleet-rank.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp_dir'" RETURN
+
+  local raw="$tmp_dir/raw.tsv"     # slug<TAB>value
+  : > "$raw"
+
+  # Fan the per-slug compute out as background processes — each per-slug
+  # helper forks `date -u -j -f` per event line, so on a 5-slug fleet the
+  # serial walk costs ~3-5s. Backgrounding all slugs runs them in parallel
+  # (8+ cores on the typical operator's laptop) so the wall-clock cost is
+  # bounded by the slowest single slug, not the sum. Same shape as
+  # self_check's parallel pattern scan (~line 2872).
+  local slug cache pid_idx=0
+  local -a row_files=()
+  while IFS=$'\t' read -r slug cache; do
+    [ -z "$slug" ] && continue
+    local row_out="$tmp_dir/row-$pid_idx"
+    row_files+=("$row_out")
+    pid_idx=$(( pid_idx + 1 ))
+    (
+      local v
+      case "$metric" in
+        roi)            v="$(rank_compute_roi            "$cache" "$start_epoch")" ;;
+        heal-rate)      v="$(rank_compute_heal_rate      "$cache" "$start_epoch")" ;;
+        draft-debt)     v="$(rank_compute_draft_debt     "$cache" "$start_epoch")" ;;
+        paused-hours)   v="$(rank_compute_paused_hours   "$cache" "$start_epoch")" ;;
+        sendback-rate)  v="$(rank_compute_sendback_rate  "$cache" "$start_epoch")" ;;
+      esac
+      printf -- '%s\t%s\n' "$slug" "$v" > "$row_out"
+    ) &
+  done <<< "$discover_rows"
+  wait
+
+  # Stable concatenation in discovery (sorted slug) order. row_files were
+  # appended in the order discover_rows produced them.
+  if [ "$pid_idx" -gt 0 ]; then
+    cat "${row_files[@]}" > "$raw"
+  fi
+
+  # Compute median + MAD over the values.
+  local stats median mad
+  stats="$(awk -F'\t' '{ print $2 }' "$raw" | rank_median_and_mad)"
+  median="$(printf -- '%s' "$stats" | awk -F'\t' '{ print $1 }')"
+  mad="$(   printf -- '%s' "$stats" | awk -F'\t' '{ print $2 }')"
+
+  # Determine direction. higher_is_better=1 means desc sort (best first).
+  local higher
+  higher="$(rank_metric_higher_is_better "$metric")"
+
+  # Sort into best-at-top order, ties broken alphabetically by slug.
+  local sorted="$tmp_dir/sorted.tsv"
+  if [ "$higher" = "1" ]; then
+    # Numeric desc on col 2, then ascending on col 1.
+    sort -t $'\t' -k2,2nr -k1,1 "$raw" > "$sorted"
+  else
+    sort -t $'\t' -k2,2n  -k1,1 "$raw" > "$sorted"
+  fi
+
+  # Assemble the final TSV with rank, delta_from_median, is_outlier, is_median.
+  # is_outlier = |delta| > 2 * MAD AND MAD > 0. When MAD == 0 (perfectly
+  # tight cluster) no row is an outlier.
+  local final="$tmp_dir/final.tsv"
+  awk -F'\t' -v median="$median" -v mad="$mad" '
+    BEGIN { n = 0 }
+    {
+      slug[n] = $1
+      val[n]  = $2 + 0
+      n++
+    }
+    END {
+      threshold = 2.0 * mad
+      for (i = 0; i < n; i++) {
+        delta = val[i] - median
+        is_med = 0
+        if (delta == 0) is_med = 1
+        d = (delta < 0) ? -delta : delta
+        is_out = 0
+        if (mad > 0 && d > threshold) is_out = 1
+        printf("%d\t%s\t%.4f\t%.4f\t%d\t%d\n", i + 1, slug[i], val[i], delta, is_out, is_med)
+      }
+    }
+  ' "$sorted" > "$final"
+
+  # Leader = the top row's slug.
+  local leader
+  leader="$(awk -F'\t' 'NR == 1 { print $2 }' "$final")"
+
+  # Outlier slug. Worst-ranked row IF it crosses the 2*MAD threshold.
+  local outlier
+  outlier="$(awk -F'\t' '$5 == 1 { print $2 }' "$final" | tail -n 1)"
+
+  # Window label for the footer / summary.
+  local window_label="$since"
+  case "$since" in
+    *d|*h) ;;
+    *) window_label="$(awk -v s="$since_seconds" 'BEGIN { printf("%dd", int(s / 86400)) }')" ;;
+  esac
+
+  if [ "$want_json" = "1" ]; then
+    rank_render_json "$final" "$metric" "$window_label" "$median" "$leader" "$outlier"
+  else
+    rank_render_text "$final" "$metric" "$window_label" "$median" "$leader" "$outlier" "$mad"
+  fi
+
+  exit 0
+}
+
+if [ "$CMD" = "rank" ]; then
+  rank "$@"
   exit $?
 fi
 
