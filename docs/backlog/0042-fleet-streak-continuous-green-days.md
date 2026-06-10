@@ -1,7 +1,7 @@
 ---
 id: 0042
 title: fleet streak shows the longest continuous green-day run per project
-status: groomed
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-09
@@ -389,7 +389,7 @@ doesn't have to re-discover the architecture.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD — branch `feat/0042-...` opened
-- YYYY-MM-DD — failing test added in `tests/streak.sh`
-- YYYY-MM-DD — PR #N opened, CI [state]
-- YYYY-MM-DD — merged to main
+- 2026-06-10 — branch `feat/0042-streak-green-days` opened; status flipped to in-progress
+- 2026-06-10 — failing test added in `tests/streak.sh` (13 ACs)
+- 2026-06-10 — streak() + 6 helpers landed in `bin/fleet`; local gate green
+- 2026-06-10 — status flipped to shipped; PR opened
