@@ -1,7 +1,7 @@
 ---
 id: 0043
 title: fleet rank orders every project on a single posture metric in one leaderboard
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-09
@@ -405,7 +405,7 @@ doesn't have to re-discover the architecture.
 
 (Appended by the implementation-dev agent during execution.)
 
-- YYYY-MM-DD — branch `feat/0043-...` opened
-- YYYY-MM-DD — failing test added in `tests/rank.sh`
-- YYYY-MM-DD — PR #N opened, CI [state]
-- YYYY-MM-DD — merged to main
+- 2026-06-10 — branch `feat/0043-fleet-rank-portfolio-posture-leaderboard` opened
+- 2026-06-10 — failing test added in `tests/rank.sh`
+- 2026-06-10 — PR #N opened, CI [state]
+- 2026-06-10 — merged to main
