@@ -469,6 +469,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet lessons-promote agent-fleet --lesson "<title>"   # curate one local lesson into cross-fleet (ticket 0028)
 ~/code/agent-fleet/bin/fleet lessons-prune --dry-run                           # list expired LESSONS entries; --commit --cause "<text>" moves them to LESSONS-ARCHIVE.md (ticket 0039)
 ~/code/agent-fleet/bin/fleet self-check                                        # run the LESSONS-derived static linter against the kit's own shell (ticket 0040 — 12 patterns; --list/--pattern/--json; FLEET_SELF_CHECK_GATE=1 in local gate)
+~/code/agent-fleet/bin/fleet streak                                            # current + longest continuous green-day run per project (ticket 0042 — pure reader of events.jsonl; --since Nd|YYYY-MM-DD default 90d, --slug, --json)
 ```
 
 **Dry-run mode (ticket 0010).** Setting `AGENT_DRY_RUN=1` flips
