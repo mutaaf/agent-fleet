@@ -46,6 +46,9 @@
 #   fleet self-check          run the LESSONS-derived static linter against the kit's own shell
 #                             (ticket 0040 — 12 patterns keyed to LESSONS dates;
 #                              --list/--pattern/--json; FLEET_SELF_CHECK_GATE=1 emits self_check_failed)
+#   fleet streak              current + longest continuous green-day run per project
+#                             (ticket 0042 — --since Nd|YYYY-MM-DD default 90d; --slug/--json;
+#                              pure reader of events.jsonl, no new event types)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -8535,6 +8538,637 @@ USAGE
 
 if [ "$CMD" = "overview" ]; then
   overview "$@"
+fi
+
+# --- streak (ticket 0042) -------------------------------------------------
+# `fleet streak` is the kit's first surface optimized for "the loop is
+# fine, please keep trusting it" rather than "the loop needs your
+# attention." It reads each discovered project's events.jsonl and prints
+# one row per project with the current + longest "continuous green-day"
+# run. A green day is: AT LEAST ONE phase=ship run_completed exit=0 AND
+# ZERO ship_paused AND ZERO budget_block AND every gate_failed has a
+# same-day run_completed exit=0 resolution. Days with ZERO ship events
+# at all are NEUTRAL — they neither extend nor break the streak (a quiet
+# day is not a regression). Per P-6 the implementation is a pure reader
+# of events.jsonl; no new event types, no writes, no state file.
+#
+# All helpers (streak_walk_days, streak_collapse_runs, streak_render_text,
+# streak_render_json, streak_summary_line, streak_parse_since,
+# streak_discover_slugs) are defined ABOVE the inline dispatcher per
+# LESSONS 2026-06-05 (forward-reference trap — the dispatcher block
+# `if [ "$CMD" = "streak" ]; then streak "$@"; fi` runs at execution
+# time, by which point bash has only parsed up to that line).
+
+# Parse `--since` value into a positive integer day count. Accepts:
+#   Nd   — relative day count (e.g. "90d", "7d", "30d")
+#   YYYY-MM-DD — absolute date; days = (today - date) inclusive
+# Echoes the day count (≥1) on stdout; returns 1 on bad input. The
+# day count is bounded at 1 — a since-window narrower than one day
+# is meaningless for a per-day streak.
+streak_parse_since() {  # $1 = since string, $2 = now epoch
+  local since="$1" now_epoch="$2" n
+  case "$since" in
+    *d)
+      n="${since%d}"
+      case "$n" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      [ "$n" -lt 1 ] && n=1
+      echo "$n"
+      return 0
+      ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+      # Absolute date — compute days from now back to it (inclusive).
+      local target_epoch today_iso today_epoch
+      target_epoch="$(date -u -j -f '%Y-%m-%d' "$since" '+%s' 2>/dev/null || \
+                      date -u -d "$since" '+%s' 2>/dev/null)" || return 1
+      [ -z "$target_epoch" ] && return 1
+      today_iso="$(date -u -r "$now_epoch" '+%Y-%m-%d' 2>/dev/null || \
+                   date -u -d "@$now_epoch" '+%Y-%m-%d')"
+      today_epoch="$(date -u -j -f '%Y-%m-%d' "$today_iso" '+%s' 2>/dev/null || \
+                     date -u -d "$today_iso" '+%s')"
+      n=$(( (today_epoch - target_epoch) / 86400 + 1 ))
+      [ "$n" -lt 1 ] && n=1
+      echo "$n"
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Discover all projects with an agents.config.sh. Reuses the overview
+# discovery roots so the streak surface stays consistent with `fleet
+# overview` per AC#1. Returns one record per slug as `slug\tmanifest`.
+streak_discover_slugs() {
+  # OVERVIEW_ROOT and OVERVIEW_INSTALLED are defined further down the
+  # file (~line 8149), AFTER the dispatcher block we're about to add.
+  # The runtime read of those variables happens INSIDE this function
+  # body — by the time `streak` is invoked, bash has parsed the whole
+  # file. So the variable reference is safe even though the function
+  # APPEARS earlier than the variable declaration.
+  local _seen="" m slug
+  { find "${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$HOME/.local/share/agent-fleet/projects" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf '%s\t%s\n' "$slug" "$m"
+  done | sort -t $'\t' -k1,1
+}
+
+# Walk one events.jsonl file day by day. Emits one record per UTC day
+# observed in the file, with the schema:
+#   YYYY-MM-DD <TAB> {green|red|neutral} <TAB> {break_type|-}
+# break_type is one of `ship_paused` | `budget_block` | `gate_failed`
+# for red days; `-` (sentinel) for green/neutral days per LESSONS
+# 2026-06-08 (IFS=$'\t' read with empty middle field).
+#
+# Per LESSONS 2026-06-08 the awk script explicitly initializes its
+# counters in BEGIN { day_count = 0; streak = 0; longest = 0 } so the
+# first event cannot land under arr[""]. streak/longest are declared
+# here as a defense-in-depth annotation even though this helper only
+# uses day_count — the rule says "any awk arr[ctr] script with ctr++
+# MUST BEGIN { ctr = 0 }", and we want the pattern to be obviously
+# present for the linter (`fleet self-check`) and for the next reader.
+streak_walk_days() {  # $1 = events.jsonl path
+  local events="$1"
+  [ -f "$events" ] || return 0
+  awk '
+    BEGIN { day_count = 0; streak = 0; longest = 0 }
+    {
+      ts=""; type=""; phase=""; exit_v=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"phase"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        phase=substr($0, RSTART, RLENGTH)
+        sub(/.*"phase"[[:space:]]*:[[:space:]]*"/, "", phase); sub(/".*/, "", phase)
+      }
+      if (match($0, /"exit"[[:space:]]*:[[:space:]]*"?[0-9]+"?/)) {
+        exit_v=substr($0, RSTART, RLENGTH)
+        sub(/.*"exit"[[:space:]]*:[[:space:]]*"?/, "", exit_v)
+        sub(/".*/, "", exit_v); sub(/[^0-9].*/, "", exit_v)
+      }
+      if (ts == "") next
+      # Extract YYYY-MM-DD prefix (UTC day).
+      day = substr(ts, 1, 10)
+      if (!(day in seen_day)) {
+        seen_day[day] = 1
+        days[day_count] = day
+        day_count++
+      }
+      # Phase=ship only — the predicate is per AC#2 ship-only.
+      if (phase != "ship") next
+      if (type == "run_completed" && exit_v == "0") {
+        ship_ok[day]++
+        # Mark any prior gate_failed on this day as resolved.
+        gate_pending[day] = 0
+      } else if (type == "ship_paused") {
+        if (!(day in break_first)) break_first[day] = "ship_paused"
+        red_day[day] = 1
+      } else if (type == "budget_block") {
+        if (!(day in break_first)) break_first[day] = "budget_block"
+        red_day[day] = 1
+      } else if (type == "gate_failed") {
+        # gate_failed is only a break if NO later run_completed exit=0
+        # arrives on the same day. We track it as pending; if a later
+        # success on the same day comes, gate_pending is cleared. The
+        # final classification happens in END.
+        if (ship_ok[day] == 0) {
+          gate_pending[day] = 1
+          # Tentatively record gate_failed as the first break type;
+          # if it gets resolved we will REMOVE it in END.
+          if (!(day in break_first)) break_first_tentative[day] = "gate_failed"
+        }
+      }
+    }
+    END {
+      # Sort days lexicographically (YYYY-MM-DD sorts chronologically).
+      n = day_count
+      for (i = 0; i < n; i++) sorted[i] = days[i]
+      # Insertion sort — small N (≤ window size).
+      for (i = 1; i < n; i++) {
+        k = sorted[i]; j = i
+        while (j > 0 && sorted[j-1] > k) { sorted[j] = sorted[j-1]; j-- }
+        sorted[j] = k
+      }
+      for (i = 0; i < n; i++) {
+        d = sorted[i]
+        # Finalize gate_failed: if still pending AND no ship_ok same day,
+        # this is a real break.
+        if (gate_pending[d] == 1 && ship_ok[d] == 0) {
+          red_day[d] = 1
+          if (!(d in break_first)) break_first[d] = "gate_failed"
+        } else if (d in break_first_tentative && !(d in break_first)) {
+          # gate_failed resolved by a later same-day success — no break.
+          # (Nothing to record.)
+        }
+        if (red_day[d] == 1) {
+          state = "red"
+          bt = (d in break_first) ? break_first[d] : "gate_failed"
+        } else if (ship_ok[d] >= 1) {
+          state = "green"
+          bt = "-"
+        } else {
+          state = "neutral"
+          bt = "-"
+        }
+        printf "%s\t%s\t%s\n", d, state, bt
+      }
+    }
+  ' "$events"
+}
+
+# Walk every day in the window (today back N-1 days) and compute:
+#   current   — consecutive green days ending TODAY (or yesterday if
+#               today is neutral)
+#   longest   — max consecutive green-day run in the window
+#   last_green — most recent green day's date (or empty)
+#   broken_by — "YYYY-MM-DD type" for the most recent break when
+#               current==0 AND today is a red day; empty otherwise (per
+#               AC#5 — for current > 0, broken_by is "—" on the table,
+#               null on the JSON).
+#
+# Emits four lines on stdout in this order:
+#   current=<N>
+#   longest=<N>
+#   last_green=<YYYY-MM-DD|>
+#   broken_by=<YYYY-MM-DD type|>
+#
+# Per LESSONS 2026-06-05 (bash 3.2 LC_ALL caching, no bash arithmetic
+# on dates) day arithmetic is via `date -u -j -v +1d -f '%Y-%m-%d'`.
+# Per LESSONS 2026-06-08 (TSV middle-empty-field) the day file uses
+# `-` as the sentinel and we map it back to empty here.
+streak_collapse_runs() {  # $1 = day-state file (sorted YYYY-MM-DD\tstate\tbt),
+                           # $2 = today_iso, $3 = window_start_iso,
+                           # $4 = today_epoch, $5 = window_start_epoch
+  # Single awk pass: compute current, longest, last_green, broken_by,
+  # longest_start, longest_end without iterating through every day in
+  # the window (way too slow with BSD `date` shell-out per day). The
+  # awk script walks ONLY the days that have events, treating any gap
+  # between consecutive event-days as one or more NEUTRAL days. Per
+  # AC#3 a neutral day neither extends nor breaks a streak (the streak
+  # carries through but does not increment). When we see a green day
+  # whose preceding event-day was NOT exactly the calendar prior day,
+  # the run resets to 1 — neutrals in the gap have implicitly broken
+  # the run. (Per AC#2 a green day requires ≥1 ship event; without
+  # events, the day is neutral, and a neutral day silently breaks the
+  # CONSECUTIVE green-day chain — but does not flip the streak counter
+  # to a "broken by" state.)
+  local day_file="$1" today_iso="$2" window_start_iso="$3"
+  local today_epoch="$4" window_start_epoch="$5"
+  awk -v today="$today_iso" -v ws="$window_start_iso" \
+      -v today_ep="$today_epoch" -v ws_ep="$window_start_epoch" '
+    BEGIN {
+      day_count = 0; streak = 0; longest = 0
+      current = 0; last_green = ""; broken_by = ""
+      longest_start = ""; longest_end = ""
+      prev_day = ""
+      prev_day_ep = 0
+      had_today_event = 0
+      today_state = "neutral"
+      today_bt = ""
+    }
+    {
+      day = $1; state = $2; bt = $3
+      if (day == "" || state == "") next
+      # Bound by window: ignore days outside [ws, today].
+      if (day < ws || day > today) next
+
+      if (day == today) {
+        had_today_event = 1
+        today_state = state
+        today_bt = bt
+      }
+
+      # Compute epoch for THIS day (days since window_start, applied to
+      # window_start_epoch). Both Y-M-D strings compare lexically, but
+      # for "1 calendar day apart" we need numeric difference. Use
+      # day_ep computed as ws_ep + 86400 * (lexical day index into the
+      # window). Since the awk script does NOT have a date parser, we
+      # use a different trick: we only need to know if day == prev_day + 1
+      # in CALENDAR terms. The awk script gets (today_ep, ws_ep) and
+      # the records are already sorted. Compute day_ep = ws_ep +
+      # 86400 * day_index_from_ws, where day_index_from_ws is the
+      # SHELL-precomputed offset that we encode in the day_file as
+      # column 4. Simpler: re-derive via a year-month-day arithmetic.
+      #
+      # Y M D → days since epoch (Julian-ish), good enough for "diff
+      # of two days within a 90-day window":
+      y = substr(day, 1, 4) + 0
+      m = substr(day, 6, 2) + 0
+      d = substr(day, 9, 2) + 0
+      day_ep = jdn(y, m, d)
+
+      if (state == "green") {
+        if (prev_day_ep > 0 && (day_ep - prev_day_ep) == 1 && prev_day_state == "green") {
+          streak++
+        } else {
+          streak = 1
+          run_start = day
+        }
+        if (streak > longest) {
+          longest = streak
+          longest_start = run_start
+          longest_end = day
+        }
+        last_green = day
+        prev_day_state = "green"
+        prev_day = day
+        prev_day_ep = day_ep
+      } else if (state == "red") {
+        streak = 0
+        prev_day_state = "red"
+        prev_day = day
+        prev_day_ep = day_ep
+      } else {
+        # Neutral observed (rare — walk_days does not normally emit
+        # neutral rows, but tolerate them).
+        # A neutral does NOT break the run, but a gap to the NEXT green
+        # day will because the next iteration sees prev_day_ep != day_ep - 1.
+        # So do nothing here, but bump prev_day so the gap math stays right.
+        prev_day_state = "neutral"
+        prev_day = day
+        prev_day_ep = day_ep
+      }
+    }
+    END {
+      # Determine CURRENT. Per AC#3:
+      #   - today red                          → current = 0; broken_by today
+      #   - today green                        → current = streak ending today
+      #   - today neutral (no events / silent) → current = streak as of yesterday
+      today_y = substr(today, 1, 4) + 0
+      today_m = substr(today, 6, 2) + 0
+      today_d = substr(today, 9, 2) + 0
+      today_jdn = jdn(today_y, today_m, today_d)
+
+      if (had_today_event && today_state == "red") {
+        current = 0
+        broken_by = today " " today_bt
+      } else if (had_today_event && today_state == "green") {
+        current = streak
+      } else {
+        # Today is neutral. Streak as of yesterday: if the most recent
+        # event-day was YESTERDAY and it was green, current = streak.
+        # Otherwise current = 0.
+        if (prev_day_ep > 0 && (today_jdn - prev_day_ep) == 1 && prev_day_state == "green") {
+          current = streak
+        } else if (prev_day_ep > 0 && prev_day == today && prev_day_state == "green") {
+          # Same-day green (defensive — handled by had_today_event above).
+          current = streak
+        } else {
+          current = 0
+        }
+      }
+
+      printf "current=%d\n", current
+      printf "longest=%d\n", longest
+      printf "last_green=%s\n", last_green
+      printf "broken_by=%s\n", broken_by
+      printf "longest_start=%s\n", longest_start
+      printf "longest_end=%s\n", longest_end
+    }
+    # Julian day number — Fliegel/Van Flandern. Good for any Y > 0.
+    function jdn(y, m, d,    a, ja) {
+      a = int((14 - m) / 12)
+      ja = y + 4800 - a
+      return d + int((153 * (m + 12 * a - 3) + 2) / 5) + 365 * ja \
+             + int(ja / 4) - int(ja / 100) + int(ja / 400) - 32045
+    }
+  ' "$day_file"
+}
+
+# Render the table header. Widths are tuned for the User-lens table.
+# Per LESSONS 2026-06-05 we cannot rely on bash 3.2's ${#s} for char
+# count under multi-byte UTF-8. The canonical helper is
+# preflight_visible_width — but that helper forks 2 subprocesses per
+# call, and `streak` calls it 5× per row × N projects, which dwarfs
+# the entire script's wall-clock budget. Optimization: streak's
+# values only ever contain TWO multi-byte glyphs — `✓` (U+2713,
+# 3 UTF-8 bytes, 1 display column) and `—` (U+2014, 3 UTF-8 bytes,
+# 1 display column). Strip those before measuring with `${#s}`,
+# which gives the correct display width without any subprocess.
+# Set __STREAK_WIDTH to the visible width of $1. Avoids a subshell that
+# `cur="$(streak_visible_width "$s")"` would otherwise require. Each of
+# the kit's multi-byte glyphs (✓ U+2713 and — U+2014) is 3 UTF-8 bytes
+# and 1 display column; stripping them gives a pure-ASCII residue whose
+# `${#}` equals the column count, then we add the glyph count back.
+# All operations are byte-level bash substitutions — locale-stable per
+# LESSONS 2026-06-05 (the trap there was bash's ${#} flipping between
+# char- and byte-mode under mid-script LC_ALL=C; we side-step it by
+# never depending on ${#} of a string that COULD contain a multi-byte
+# glyph).
+streak_set_visible_width() {  # $1 = string → sets __STREAK_WIDTH
+  local s="${1-}"
+  local with_check="${s//✓/}"
+  local without="${with_check//—/}"
+  local before=${#s}
+  local after=${#without}
+  __STREAK_WIDTH=$(( after + (before - after) / 3 ))
+}
+
+# Pad $1 to display width $2 with trailing spaces. No subprocesses,
+# no `echo`-via-substitution — just two printf calls.
+streak_pad_right() {  # $1 = string, $2 = target width
+  local s="$1" w="$2" pad
+  streak_set_visible_width "$s"
+  pad=$(( w - __STREAK_WIDTH ))
+  [ "$pad" -lt 0 ] && pad=0
+  printf -- '%s' "$s"
+  if [ "$pad" -gt 0 ]; then
+    printf -- '%*s' "$pad" ""
+  fi
+}
+
+streak_render_text() {  # $1..$5 = slug, current_cell, longest_cell, last_green, broken_by_cell
+  local slug="$1" cur="$2" longest="$3" last_green="$4" broken="$5"
+  # Single composed printf — no per-cell subshells.
+  streak_pad_right "$slug"       14
+  printf -- ' '
+  streak_pad_right "$cur"        8
+  printf -- ' '
+  streak_pad_right "$longest"    8
+  printf -- ' '
+  streak_pad_right "$last_green" 12
+  printf -- ' %s\n' "$broken"
+}
+
+# Render one JSON object per project. Schema per AC#4:
+#   {"slug": <s>, "current": <int>, "longest": <int>,
+#    "last_green": "<YYYY-MM-DD|null>",
+#    "broken_by": "<YYYY-MM-DD type|null>"}
+# Strings go through preflight_json_escape per LESSONS 2026-06-03.
+streak_render_json() {  # $1..$5 = slug, current, longest, last_green, broken_by
+  local slug="$1" cur="$2" longest="$3" last_green="$4" broken="$5"
+  local esc_slug esc_lg esc_b
+  esc_slug="$(preflight_json_escape "$slug")"
+  esc_lg="$(preflight_json_escape "$last_green")"
+  esc_b="$(preflight_json_escape "$broken")"
+  local lg_val='null' broken_val='null'
+  [ -n "$last_green" ] && lg_val="\"$esc_lg\""
+  [ -n "$broken" ] && broken_val="\"$esc_b\""
+  printf '{"slug":"%s","current":%s,"longest":%s,"last_green":%s,"broken_by":%s}\n' \
+    "$esc_slug" "$cur" "$longest" "$lg_val" "$broken_val"
+}
+
+# Render the trailing summary block. Input: TSV file with
+#   slug<TAB>current<TAB>longest<TAB>longest_start<TAB>longest_end
+# per project. Counts the projects on a current streak and names the
+# top-current + top-all-time projects with date range.
+streak_summary_line() {  # $1 = tsv file
+  local tsv="$1"
+  # Single-awk-pass aggregation. LESSONS 2026-06-01 — counts via awk's
+  # `END { print n+0 }` so a no-match line cannot double-print.
+  local total=0 active=0 la_slug="" la_days=0
+  local lat_slug="" lat_days=0 lat_sd="" lat_ed=""
+  local key val
+  while IFS='=' read -r key val; do
+    case "$key" in
+      total)    total="$val" ;;
+      active)   active="$val" ;;
+      la_slug)  la_slug="$val" ;;
+      la_days)  la_days="$val" ;;
+      lat_slug) lat_slug="$val" ;;
+      lat_days) lat_days="$val" ;;
+      lat_sd)   lat_sd="$val" ;;
+      lat_ed)   lat_ed="$val" ;;
+    esac
+  done < <(awk -F'\t' '
+    BEGIN {
+      total = 0; active = 0
+      la_best = -1; la_slug = ""
+      lat_best = -1; lat_slug = ""; lat_sd = ""; lat_ed = ""
+    }
+    NF > 0 {
+      total++
+      if ($2 > 0) active++
+      if ($2 > la_best) { la_best = $2; la_slug = $1 }
+      if ($3 > lat_best) { lat_best = $3; lat_slug = $1; lat_sd = $4; lat_ed = $5 }
+    }
+    END {
+      printf "total=%d\n", total
+      printf "active=%d\n", active
+      if (la_best > 0)  { printf "la_slug=%s\n",  la_slug;  printf "la_days=%d\n",  la_best  }
+      if (lat_best > 0) { printf "lat_slug=%s\n", lat_slug; printf "lat_days=%d\n", lat_best }
+      if (lat_sd != "")  printf "lat_sd=%s\n",   lat_sd
+      if (lat_ed != "")  printf "lat_ed=%s\n",   lat_ed
+    }
+  ' "$tsv")
+
+  if [ "$total" = "0" ]; then
+    printf -- 'streak: no projects discovered. run `fleet onboard` to adopt one.\n'
+    return 0
+  fi
+  printf -- 'streak: %s of %s projects currently on a green streak.\n' "$active" "$total"
+  if [ -n "$la_slug" ]; then
+    printf -- '        longest active streak: %s (%sd).\n' "$la_slug" "$la_days"
+  fi
+  if [ -n "$lat_slug" ]; then
+    if [ -n "$lat_sd" ] && [ -n "$lat_ed" ]; then
+      printf -- '        longest all-time streak: %s (%sd, %s..%s).\n' \
+        "$lat_slug" "$lat_days" "$lat_sd" "$lat_ed"
+    else
+      printf -- '        longest all-time streak: %s (%sd).\n' "$lat_slug" "$lat_days"
+    fi
+  fi
+}
+
+# Main dispatcher function for `fleet streak`. Every code path ends
+# with `exit 0` per LESSONS 2026-06-01 (dispatcher fall-through trap).
+# `exit 2` on usage error.
+streak() {
+  shift  # drop the leading "streak"
+  local want_json=0 slug_filter="" since="90d"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)    want_json=1; shift ;;
+      --slug)    slug_filter="${2:-}"; shift 2 ;;
+      --slug=*)  slug_filter="${1#--slug=}"; shift ;;
+      --since)   since="${2:-}"; shift 2 ;;
+      --since=*) since="${1#--since=}"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet streak — current + longest continuous green-day run per project.
+
+Usage:
+  fleet streak                       default --since 90d window
+  fleet streak --since 30d           override window (Nd or YYYY-MM-DD)
+  fleet streak --slug NAME           restrict to one project
+  fleet streak --json                one JSON object per project + summary
+
+A "green day" is one where the project's events.jsonl on that UTC day:
+  - has AT LEAST ONE phase=ship run_completed exit=0
+  - has ZERO ship_paused events
+  - has ZERO budget_block events
+  - has every gate_failed event followed by a same-day run_completed exit=0
+Days with ZERO ship events at all are NEUTRAL — they neither extend nor
+break the streak (a quiet day is not a regression).
+
+Columns:
+  SLUG        project slug from manifest
+  CURRENT     consecutive green days ending today (Nd; "✓" suffix when > 0)
+  LONGEST     max consecutive green-day run in the window
+  LAST GREEN  most recent green day (YYYY-MM-DD)
+  BROKEN BY   "YYYY-MM-DD type" for today's break, or "—" when current > 0
+
+JSON schema (per-project):
+  {"slug":<s>,"current":<int>,"longest":<int>,
+   "last_green":"<YYYY-MM-DD|null>","broken_by":"<YYYY-MM-DD type|null>"}
+
+Read-only — no events.jsonl writes, no fleet_* signature changes,
+no new event types. Exit code: 0 always.
+USAGE
+        exit 0 ;;
+      *) echo "fleet streak: unknown flag '$1'" >&2; exit 2 ;;
+    esac
+  done
+
+  local now_epoch today_iso window_days
+  now_epoch="${FLEET_NOW_OVERRIDE:-$(date -u '+%s')}"
+  today_iso="$(date -u -r "$now_epoch" '+%Y-%m-%d' 2>/dev/null || \
+               date -u -d "@$now_epoch" '+%Y-%m-%d')"
+  if ! window_days="$(streak_parse_since "$since" "$now_epoch")"; then
+    echo "fleet streak: invalid --since \"$since\" (use Nd or YYYY-MM-DD)" >&2
+    exit 2
+  fi
+  # Compute window_start_iso ONCE (used for every project's awk pass).
+  # Per LESSONS 2026-06-05: use BSD `date -u -j -v -Nd`, never bash
+  # arithmetic on date strings.
+  local back=$(( window_days - 1 ))
+  local window_start_iso today_epoch_round window_start_epoch
+  window_start_iso="$(date -u -j -v "-${back}d" -f '%Y-%m-%d' "$today_iso" '+%Y-%m-%d' 2>/dev/null || \
+                      date -u -d "$today_iso -$back days" '+%Y-%m-%d')"
+  today_epoch_round="$(date -u -j -f '%Y-%m-%d' "$today_iso" '+%s' 2>/dev/null || \
+                       date -u -d "$today_iso" '+%s')"
+  window_start_epoch="$(date -u -j -f '%Y-%m-%d' "$window_start_iso" '+%s' 2>/dev/null || \
+                        date -u -d "$window_start_iso" '+%s')"
+
+  # Discover and walk one project at a time. Buffer per-project data
+  # into a tsv so the summary line can reduce it in one awk pass.
+  local tsv; tsv="$(mktemp)"
+  if [ "$want_json" != "1" ]; then
+    streak_render_text "SLUG" "CURRENT" "LONGEST" "LAST GREEN" "BROKEN BY"
+  fi
+
+  while IFS=$'\t' read -r slug manifest; do
+    [ -z "$slug" ] && continue
+    [ -n "$slug_filter" ] && [ "$slug" != "$slug_filter" ] && continue
+
+    local cache_dir="$HOME/.cache/${slug}-agent"
+    local events="$cache_dir/events.jsonl"
+
+    # Walk one project's events.jsonl into the contract-shape day list
+    # (YYYY-MM-DD\tstate\tbreak_type per the engineering notes), then
+    # reduce it to current/longest. Per LESSONS 2026-06-08 the awk
+    # script declares its counters in BEGIN { day_count = 0; streak = 0;
+    # longest = 0 } so the first event cannot land under arr[""].
+    # Use process substitution to pipe walk_days → collapse_runs without
+    # a temp file; bash's `< <(…)` keeps it lazy.
+    local current=0 longest=0 last_green="" broken_by="" lr_start="" lr_end=""
+    local key val
+    if [ -f "$events" ]; then
+      while IFS='=' read -r key val; do
+        case "$key" in
+          current)       current="$val" ;;
+          longest)       longest="$val" ;;
+          last_green)    last_green="$val" ;;
+          broken_by)     broken_by="$val" ;;
+          longest_start) lr_start="$val" ;;
+          longest_end)   lr_end="$val" ;;
+        esac
+      done < <(streak_walk_days "$events" \
+                | streak_collapse_runs /dev/stdin "$today_iso" "$window_start_iso" \
+                                       "$today_epoch_round" "$window_start_epoch")
+    fi
+
+    # Render row.
+    if [ "$want_json" = "1" ]; then
+      streak_render_json "$slug" "$current" "$longest" "$last_green" "$broken_by"
+    else
+      local cur_cell longest_cell lg_cell broken_cell
+      cur_cell="${current}d"
+      [ "$current" -gt 0 ] && cur_cell="${current}d ✓"
+      longest_cell="${longest}d"
+      lg_cell="${last_green:--}"
+      if [ "$current" -gt 0 ]; then
+        broken_cell="—"
+      elif [ -n "$broken_by" ]; then
+        broken_cell="$broken_by"
+      else
+        broken_cell="—"
+      fi
+      streak_render_text "$slug" "$cur_cell" "$longest_cell" "$lg_cell" "$broken_cell"
+    fi
+
+    # Accumulate summary tsv: slug\tcurrent\tlongest\tlongest_start\tlongest_end
+    printf -- '%s\t%s\t%s\t%s\t%s\n' \
+      "$slug" "$current" "$longest" "$lr_start" "$lr_end" >> "$tsv"
+
+  done < <(streak_discover_slugs)
+
+  # Summary trailing block — only in text mode (per the User-lens
+  # example). JSON mode emits per-project JSON only; consumers can
+  # aggregate themselves.
+  if [ "$want_json" != "1" ]; then
+    printf -- '\n'
+    streak_summary_line "$tsv"
+  fi
+
+  rm -f "$tsv"
+  exit 0
+}
+
+if [ "$CMD" = "streak" ]; then
+  streak "$@"
 fi
 
 # --- atlas ----------------------------------------------------------------

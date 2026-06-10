@@ -390,6 +390,11 @@ doesn't have to re-discover the architecture.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-09 — branch `feat/0042-fleet-streak-continuous-green-days` opened
-- YYYY-MM-DD — failing test added in `tests/streak.sh`
+- 2026-06-09 — failing test added in `tests/streak.sh` covering all 13 ACs
+- 2026-06-09 — implementation: `streak()` + 6 helpers in `bin/fleet`; new
+  line in the help banner block + README "Daily ops"; 8 fixture
+  `tests/fixtures/streak/*.events.jsonl` files. Pure reader — zero
+  changes to `lib/common.sh` / `prompts/`, zero new event types, zero
+  `events.jsonl` writes.
 - YYYY-MM-DD — PR #N opened, CI [state]
 - YYYY-MM-DD — merged to main
