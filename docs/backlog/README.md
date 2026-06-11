@@ -63,6 +63,6 @@ ones, `review` grades them.
 | 0042 | fleet streak shows the longest continuous green-day run per project | P2 | shipped | observability |
 | 0043 | fleet rank orders every project on a single posture metric in one leaderboard | P2 | shipped | observability |
 | 0044 | fleet pr-footer posts a per-merge ROI comment on every agent-shipped PR | P1 | shipped | observability |
-| 0045 | fleet prompts-suggest proposes PRINCIPLES.md additions from recurring lesson_draft clusters | P1 | in-progress | governance |
+| 0045 | fleet prompts-suggest proposes PRINCIPLES.md additions from recurring lesson_draft clusters | P1 | shipped | governance |
 | 0046 | fleet vacation suspends ship/eng work during operator PTO and prints a return briefing | P2 | groomed | governance |
 | 0047 | fleet ticket-cost <id> attributes every dollar spent shipping one ticket | P2 | proposed | observability |
