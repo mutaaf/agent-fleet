@@ -1,7 +1,7 @@
 ---
 id: 0044
 title: fleet pr-footer posts a per-merge ROI comment on every agent-shipped PR
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-11
@@ -419,3 +419,11 @@ doesn't have to re-discover the architecture.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-11 — ticket filed by gtm-innovation
+- 2026-06-11 — implementation-dev picked up; branch feat/0044-fleet-pr-footer-roi-comment.
+  AC#5 interpretation note: `lib/ship.sh` does NOT itself invoke `gh pr
+  merge --auto --squash` (the dev agent does that inside the ship prompt).
+  The "post-merge hook" therefore lands AFTER `fleet_run_claude ship`
+  returns successfully — it reads the most recent `pr_opened` event from
+  this run's events.jsonl and invokes `bin/fleet pr-footer <pr>` in the
+  background. `pr-footer` itself refuses non-merged PRs (exit 2), so a
+  ship-without-merge run is a silent no-op on the hook.
