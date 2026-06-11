@@ -15721,8 +15721,9 @@ USAGE
         fi
       done < <(vacation_discover_slugs)
 
-      local since_iso="$(vacation_now_iso)"
-      local until_iso="${until_arg}T00:00:00Z"
+      local since_iso until_iso
+      since_iso="$(vacation_now_iso)"
+      until_iso="${until_arg}T00:00:00Z"
       vacation_write_state "$since_iso" "$until_iso" "$reason_arg" "$slugs_csv"
       vacation_install_resume_plist "$until_arg"
 
