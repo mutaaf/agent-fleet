@@ -1,0 +1,6 @@
+PROJECT_NAME="charlie-fixture"
+SLUG="charlie-fixture"
+NAMESPACE="com.charlie-fixture"
+REPO_URL="https://github.com/example/charlie-fixture"
+SELF_CANCEL="20990101"
+PROMPTS_SHA="abc123def456"

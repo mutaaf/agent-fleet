@@ -1,0 +1,6 @@
+PROJECT_NAME="delta-fixture"
+SLUG="delta-fixture"
+NAMESPACE="com.delta-fixture"
+REPO_URL="https://github.com/example/delta-fixture"
+SELF_CANCEL="20990101"
+PROMPTS_SHA="abc123def456"

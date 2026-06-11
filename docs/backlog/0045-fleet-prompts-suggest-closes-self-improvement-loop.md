@@ -1,7 +1,7 @@
 ---
 id: 0045
 title: fleet prompts-suggest proposes PRINCIPLES.md additions from recurring lesson_draft clusters
-status: groomed
+status: in-progress
 priority: P1
 area: governance
 created: 2026-06-11
@@ -512,3 +512,5 @@ doesn't have to re-discover the architecture.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-11 — ticket filed by gtm-innovation
+- 2026-06-11 — implementation-dev started: branch feat/0045-prompts-suggest,
+  tests-first, pure reader, no `lib/`/`prompts/` edits

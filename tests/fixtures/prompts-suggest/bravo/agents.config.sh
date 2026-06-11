@@ -1,0 +1,6 @@
+PROJECT_NAME="bravo-fixture"
+SLUG="bravo-fixture"
+NAMESPACE="com.bravo-fixture"
+REPO_URL="https://github.com/example/bravo-fixture"
+SELF_CANCEL="20990101"
+PROMPTS_SHA="abc123def456"

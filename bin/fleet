@@ -55,6 +55,9 @@
 #   fleet streak              current + longest continuous green-day run per project
 #                             (ticket 0042 — pure reader of events.jsonl;
 #                              --since Nd|YYYY-MM-DD default 90d, --slug, --json)
+#   fleet prompts-suggest     propose PRINCIPLES.md additions from recurring send-back drafts
+#                             (ticket 0045 — fleet-wide reader of lesson_draft_emitted;
+#                              --since Nd|YYYY-MM-DD default 30d, --threshold N default 3, --json)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -5920,6 +5923,703 @@ USAGE
 
 if [ "$CMD" = "prompts-score" ]; then
   prompts_score "$@"
+fi
+
+# --- prompts-suggest (ticket 0045) ---------------------------------------
+# `fleet prompts-suggest [--since Nd|YYYY-MM-DD] [--threshold N] [--json]`
+# proposes PRINCIPLES.md additions (and EXPIRES markers) from recurring
+# `lesson_draft_emitted` events across every discovered project. Pure
+# reader — no events.jsonl writes, no PRINCIPLES.md writes, no
+# fleet_emit_event calls.
+#
+# Pipeline:
+#   1. discover slugs via the same two-root scan as `fleet rank`.
+#   2. for each slug, walk events.jsonl for `type=lesson_draft_emitted`
+#      events in window.
+#   3. normalize each event's `headline` field (lowercase, strip leading
+#      `pr=#N ` prefix, collapse whitespace, strip trailing punct).
+#   4. cluster by normalized headline; filter by threshold.
+#   5. for each cluster, decide kind:
+#        - "expires" if ≥4 events in the cluster mention an existing
+#          P-N in their body field.
+#        - otherwise "addition".
+#   6. compose the candidate (addition: pick the most-recent matching
+#      LESSONS.md paragraph, embed under `## P-<NEXT> — <Title>`;
+#      expires: emit a `<!-- EXPIRES: <date+90d> -->` block).
+#   7. render (text or JSON).
+#
+# Per LESSONS 2026-06-05 every helper this dispatcher calls is defined
+# ABOVE the dispatcher block — no forward references.
+# Per LESSONS 2026-06-01 the function MUST end with `exit 0`.
+# Per LESSONS 2026-06-08 every awk arr[ctr]=v; ctr++ inits `ctr` in BEGIN.
+# Per LESSONS 2026-06-03 every JSON escape goes through preflight_json_escape.
+# Per LESSONS 2026-05-28 every printf with a `-`-leading first arg uses `--`.
+# Per LESSONS 2026-05-30 every grep with `-`-leading pattern uses `--`.
+
+# Discover slugs + cache dirs. Same shape as rank_discover_slugs.
+prompts_suggest_discover_slugs() {
+  local _seen="" m slug
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    # Echo `slug<TAB>project_dir<TAB>cache_dir`. project_dir is the dir
+    # containing agents.config.sh (used to find docs/LESSONS.md).
+    local proj_dir; proj_dir="$(dirname "$m")"
+    printf -- '%s\t%s\t%s\n' "$slug" "$proj_dir" "$HOME/.cache/${slug}-agent"
+  done | sort -t $'\t' -k1,1
+}
+
+# Parse --since Nd|YYYY-MM-DD → seconds. Echoes seconds on success;
+# echoes empty + returns 1 on parse failure. Same shape as rank_parse_since
+# but accepts ONLY Nd (per AC#4) — no Nh. YYYY-MM-DD honors FLEET_NOW_OVERRIDE.
+prompts_suggest_parse_since() {
+  local raw="$1"
+  case "$raw" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+      # Pin the time component to 00:00:00 UTC so the parse is
+      # deterministic — macOS BSD date fills missing time fields with
+      # NOW-of-day, which makes the parse depend on wall-clock at
+      # invocation time. We append "T00:00:00" and use a full format.
+      local now target_epoch since
+      now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+      target_epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "${raw}T00:00:00" '+%s' 2>/dev/null \
+                      || date -u -d "${raw}T00:00:00Z" +%s 2>/dev/null \
+                      || echo "")"
+      [ -z "$target_epoch" ] && return 1
+      since=$(( now - target_epoch ))
+      [ "$since" -lt 0 ] && since=0
+      echo "$since"
+      ;;
+    *d)
+      local n="${raw%d}"
+      case "$n" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      echo $(( n * 86400 ))
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Normalize one raw headline. Lowercase, strip leading `pr=#N ` prefix,
+# collapse runs of whitespace, strip trailing punct (`.`, `,`, `;`, `:`,
+# `!`, `?`). Per LESSONS 2026-05-28 printf uses `--`.
+prompts_suggest_normalize_headline() {
+  local raw="${1-}"
+  # awk handles the strip + collapse + lowercase in one pass; safer than
+  # a chain of sed invocations on macOS BSD sed.
+  printf -- '%s' "$raw" | awk '
+    BEGIN { }
+    {
+      s = tolower($0)
+      # Strip leading pr=#N (with optional whitespace before/after).
+      sub(/^[[:space:]]*pr=#[0-9]+[[:space:]]*/, "", s)
+      # Collapse runs of whitespace to single space.
+      gsub(/[[:space:]]+/, " ", s)
+      # Trim leading + trailing spaces.
+      sub(/^ /, "", s); sub(/ $/, "", s)
+      # Strip trailing punctuation.
+      sub(/[.,;:!?]+$/, "", s)
+      printf "%s", s
+    }
+  '
+}
+
+# Walk one slug's events.jsonl for `lesson_draft_emitted` events in
+# [cutoff_epoch, now]. Emit one TSV record per match:
+#   slug<TAB>epoch<TAB>pr<TAB>normalized_headline<TAB>raw_body_or_-
+# Missing PR or body uses `-` sentinel (per LESSONS 2026-06-08 IFS=$'\t'
+# middle-empty-field trap).
+prompts_suggest_collect_drafts() {
+  local events="$1" slug="$2" cutoff="$3"
+  [ -f "$events" ] || return 0
+  # Per LESSONS 2026-06-08, declare counter in BEGIN. The awk script
+  # extracts the headline + body + pr via regex (no jq dependency).
+  awk -v cutoff="$cutoff" -v slug="$slug" '
+    BEGIN { count = 0 }
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    /"type":"lesson_draft_emitted"/ {
+      ts = ""; pr = "-"; headline = ""; body = "-"
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts)
+        sub(/".*/, "", ts)
+      }
+      if (match($0, /"pr"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        pr = substr($0, RSTART, RLENGTH)
+        sub(/.*"pr"[[:space:]]*:[[:space:]]*"/, "", pr)
+        sub(/".*/, "", pr)
+        if (pr == "") pr = "-"
+      }
+      if (match($0, /"headline"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        headline = substr($0, RSTART, RLENGTH)
+        sub(/.*"headline"[[:space:]]*:[[:space:]]*"/, "", headline)
+        sub(/".*/, "", headline)
+      }
+      if (match($0, /"body"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        body = substr($0, RSTART, RLENGTH)
+        sub(/.*"body"[[:space:]]*:[[:space:]]*"/, "", body)
+        sub(/".*/, "", body)
+        if (body == "") body = "-"
+      }
+      if (ts == "" || headline == "") next
+      ep = iso2ep(ts)
+      if (ep < cutoff) next
+      records_slug[count]     = slug
+      records_ep[count]       = ep
+      records_pr[count]       = pr
+      records_headline[count] = headline
+      records_body[count]     = body
+      count++
+    }
+    END {
+      for (i = 0; i < count; i++) {
+        printf "%s\t%s\t%s\t%s\t%s\n", \
+          records_slug[i], records_ep[i], records_pr[i], \
+          records_headline[i], records_body[i]
+      }
+    }
+  ' "$events"
+}
+
+# Read all collected raw TSV records from stdin and emit one TSV cluster
+# record per UNIQUE normalized headline:
+#   normalized<TAB>frequency<TAB>per_slug_csv<TAB>cites_p_n_csv<TAB>most_recent_epoch<TAB>most_recent_pr
+# - per_slug_csv: "slug:count,slug:count,..."
+# - cites_p_n_csv: empty OR "P-N:count,P-N:count" of every P-N matched in
+#   the cluster's bodies (cluster-level, summed).
+prompts_suggest_cluster() {
+  # We cannot use awk to normalize headlines (awk lacks the same Unicode-
+  # aware lowercase + collapse helper we have in shell). Instead we
+  # normalize each line in shell and pipe to awk.
+  local tmp_norm; tmp_norm="$(mktemp -t prompts-suggest-norm.XXXXXX)"
+  local slug ep pr headline body norm cites
+  while IFS=$'\t' read -r slug ep pr headline body; do
+    [ -z "$slug" ] && continue
+    norm="$(prompts_suggest_normalize_headline "$headline")"
+    [ -z "$norm" ] && continue
+    # Extract every P-N citation from the body (and headline as fallback).
+    # Use a sentinel `-` for "no citations" so the IFS=$'\t' middle field
+    # rule from LESSONS 2026-06-08 doesn't shift columns left.
+    cites="-"
+    local pn_list
+    pn_list="$(printf -- '%s %s' "$body" "$headline" \
+                 | grep -oE 'P-[0-9]+' \
+                 | sort -u \
+                 | tr '\n' ',' \
+                 | sed 's/,$//')"
+    [ -n "$pn_list" ] && cites="$pn_list"
+    printf -- '%s\t%s\t%s\t%s\t%s\n' "$norm" "$slug" "$ep" "$pr" "$cites" >> "$tmp_norm"
+  done
+  # Now aggregate via awk.
+  awk -F'\t' '
+    BEGIN { OFS = "\t"; n_clusters = 0 }
+    {
+      norm = $1; slug = $2; ep = $3 + 0; pr = $4; cites = $5
+      key = norm
+      if (!(key in seen)) {
+        seen[key] = 1
+        order[n_clusters++] = key
+      }
+      freq[key]++
+      slug_count[key, slug]++
+      if (!((key, slug) in slug_seen)) {
+        slug_seen[key, slug] = 1
+        slug_list[key] = slug_list[key] " " slug
+      }
+      if (ep > most_recent_ep[key]) {
+        most_recent_ep[key] = ep
+        most_recent_pr[key] = pr
+      }
+      if (cites != "-" && cites != "") {
+        # Split on comma + tally each P-N for this cluster.
+        nc = split(cites, ca, ",")
+        for (i = 1; i <= nc; i++) {
+          pn = ca[i]
+          if (pn == "") continue
+          if (!((key, pn) in cite_seen)) {
+            cite_seen[key, pn] = 1
+            cite_order[key] = cite_order[key] " " pn
+          }
+          cite_count[key, pn]++
+        }
+      }
+    }
+    END {
+      for (i = 0; i < n_clusters; i++) {
+        key = order[i]
+        # Build per_slug CSV.
+        per_slug = ""
+        n_slugs = split(slug_list[key], sl, " ")
+        for (j = 1; j <= n_slugs; j++) {
+          s = sl[j]
+          if (s == "") continue
+          c = slug_count[key, s]
+          if (per_slug == "") per_slug = s ":" c
+          else                per_slug = per_slug "," s ":" c
+        }
+        # Build cites CSV.
+        cites_csv = "-"
+        n_cites = split(cite_order[key], cl, " ")
+        for (j = 1; j <= n_cites; j++) {
+          pn = cl[j]
+          if (pn == "") continue
+          c = cite_count[key, pn]
+          if (cites_csv == "-") cites_csv = pn ":" c
+          else                  cites_csv = cites_csv "," pn ":" c
+        }
+        print key, freq[key], per_slug, cites_csv, most_recent_ep[key], most_recent_pr[key]
+      }
+    }
+  ' "$tmp_norm"
+  rm -f "$tmp_norm"
+}
+
+# Given a cluster's normalized headline, walk every discovered project's
+# docs/LESSONS.md for the MOST-RECENT paragraph whose first heading line
+# normalizes to the same text. Filter out paragraphs preceded by a
+# `<!-- DRAFT: ...PR #N... -->` marker (per AC#11).
+#
+# Echo the paragraph BODY verbatim (heading line stripped) — empty when
+# no match. Per LESSONS 2026-05-27 we never use $(cat) for file content;
+# the awk pass reads the file directly.
+prompts_suggest_find_source_lesson() {
+  local norm_headline="$1"
+  shift  # remaining args are project dirs
+  local proj_dir best_path="" best_heading_date=""
+  for proj_dir in "$@"; do
+    local lessons="$proj_dir/docs/LESSONS.md"
+    [ -f "$lessons" ] || continue
+    # Find every ## YYYY-MM-DD heading whose normalized text matches.
+    # Stream heading + date + draft-status to a small TSV.
+    local entries
+    entries="$(awk -v want="$norm_headline" '
+      BEGIN { last_draft_line = -10 }
+      /<!-- DRAFT: / { last_draft_line = NR }
+      /^## [0-9]{4}-[0-9]{2}-[0-9]{2} / {
+        date_str = $0
+        sub(/^## /, "", date_str)
+        sub(/[[:space:]].*/, "", date_str)
+        text = $0
+        # Strip "## YYYY-MM-DD " prefix and everything up to and including
+        # the first non-space token after the date (the em-dash separator
+        # — we do not assume a particular byte sequence, just skip to the
+        # next whitespace boundary).
+        sub(/^## [0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+/, "", text)
+        sub(/^[^[:space:]]+[[:space:]]+/, "", text)
+        # Normalize text: lowercase, collapse whitespace, strip trailing punct.
+        lc = tolower(text)
+        gsub(/[[:space:]]+/, " ", lc)
+        sub(/^ /, "", lc); sub(/ $/, "", lc)
+        gsub(/[.,;:!?]+$/, "", lc)
+        is_draft = (last_draft_line >= NR - 1) ? 1 : 0
+        if (lc == want) {
+          print date_str "\t" NR "\t" is_draft
+        }
+      }
+    ' "$lessons")"
+    [ -z "$entries" ] && continue
+    # Pick the entry with the latest date AND is_draft=0.
+    local row date_str line is_draft
+    while IFS=$'\t' read -r date_str line is_draft; do
+      [ -z "$date_str" ] && continue
+      [ "$is_draft" = "1" ] && continue
+      if [ -z "$best_heading_date" ] || [ "$date_str" \> "$best_heading_date" ]; then
+        best_heading_date="$date_str"
+        best_path="$lessons"
+        best_line="$line"
+      fi
+    done <<EOF
+$entries
+EOF
+  done
+  [ -z "$best_path" ] && return 0
+  # Extract the paragraph body from best_path starting at best_line.
+  awk -v start="$best_line" '
+    BEGIN { capture = 0 }
+    NR == start { capture = 1; next }
+    capture == 1 && /^## / { exit }
+    capture == 1 { print }
+  ' "$best_path"
+}
+
+# Read PRINCIPLES.md and echo the largest P-N integer found in `## P-N`
+# headings. Echoes 0 on empty / missing file. Per LESSONS 2026-06-01
+# the counter is initialized in BEGIN.
+prompts_suggest_principles_max_pn() {
+  local path="$1"
+  [ -f "$path" ] || { echo 0; return 0; }
+  awk '
+    BEGIN { max = 0 }
+    /^## P-[0-9]+/ {
+      n = $0
+      sub(/^## P-/, "", n)
+      sub(/[^0-9].*/, "", n)
+      if (n + 0 > max) max = n + 0
+    }
+    END { print max + 0 }
+  ' "$path"
+}
+
+# Title-case a lowercase string. Each word's first letter uppercase; rest
+# lowercase. Per LESSONS 2026-05-28, every printf with a `-`-leading first
+# arg uses `--`. Pure ASCII safe.
+prompts_suggest_title_case() {
+  local s="${1-}"
+  printf -- '%s' "$s" | awk '
+    function tc_word(w,   parts, m, i, segment, head, rest, out) {
+      # Split each space-separated word on hyphens so "non-isolated"
+      # becomes "Non-Isolated", not "Non-isolated". Each segment is
+      # head-uppered + rest-lowered.
+      m = split(w, parts, "-")
+      out = ""
+      for (i = 1; i <= m; i++) {
+        segment = parts[i]
+        if (length(segment) == 0) {
+          # Preserve consecutive hyphens.
+          if (out == "") out = ""
+          continue
+        }
+        head = toupper(substr(segment, 1, 1))
+        rest = tolower(substr(segment, 2))
+        if (out == "") out = head rest
+        else           out = out "-" head rest
+      }
+      return out
+    }
+    {
+      n = split($0, words, " ")
+      out = ""
+      for (i = 1; i <= n; i++) {
+        w = words[i]
+        if (length(w) == 0) continue
+        tc = tc_word(w)
+        if (out == "") out = tc
+        else           out = out " " tc
+      }
+      printf "%s", out
+    }
+  '
+}
+
+# Resolve the EXPIRES date as the day-of-fire + 90 days. Echoes
+# YYYY-MM-DD. Honors FLEET_NOW_OVERRIDE for deterministic tests.
+prompts_suggest_expires_date() {
+  local now expires_epoch
+  now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  expires_epoch=$(( now + 90 * 86400 ))
+  date -u -r "$expires_epoch" +%F 2>/dev/null || date -u -d "@$expires_epoch" +%F
+}
+
+# Look up the existing principle heading line for one P-N. Echoes the
+# full `## P-N — <title>` line, or empty when not found.
+prompts_suggest_principle_heading() {
+  local path="$1" pn="$2"
+  [ -f "$path" ] || return 0
+  awk -v want="^## $pn( |$)" '$0 ~ want { print; exit }' "$path"
+}
+
+# Pick the candidate kind for a cluster: "expires" when the cluster's
+# cite list contains some `P-N:c` where c >= 4 AND that P-N exists in
+# PRINCIPLES.md; otherwise "addition".
+# Echoes "kind<TAB>target_p_n" — target_p_n is empty for additions.
+prompts_suggest_pick_kind() {
+  local cites_csv="$1" principles_path="$2"
+  [ -z "$cites_csv" ] || [ "$cites_csv" = "-" ] && { printf -- 'addition\t\n'; return 0; }
+  local entry pn count
+  # Split on comma. Pick the largest count ≥4 whose P-N exists in
+  # PRINCIPLES.md.
+  local best_pn="" best_count=0
+  IFS=',' read -ra entries <<<"$cites_csv"
+  for entry in "${entries[@]}"; do
+    pn="${entry%%:*}"
+    count="${entry#*:}"
+    [ -z "$pn" ] && continue
+    [ "$count" -lt 4 ] && continue
+    # Confirm the principle exists in the file.
+    local heading
+    heading="$(prompts_suggest_principle_heading "$principles_path" "$pn")"
+    [ -z "$heading" ] && continue
+    if [ "$count" -gt "$best_count" ]; then
+      best_count="$count"
+      best_pn="$pn"
+    fi
+  done
+  if [ -n "$best_pn" ]; then
+    printf -- 'expires\t%s\n' "$best_pn"
+  else
+    printf -- 'addition\t\n'
+  fi
+}
+
+# Render one candidate block in TEXT mode. Args:
+#   $1 = index, $2 = kind, $3 = headline, $4 = frequency,
+#   $5 = per_slug_csv, $6 = target_p_n, $7 = proposed_text (multi-line)
+prompts_suggest_render_text_block() {
+  local idx="$1" kind="$2" headline="$3" freq="$4" per_slug_csv="$5" target_pn="$6"
+  local proposed="$7"
+  # Per-slug breakdown rendered as "slug (count) · slug (count)".
+  local entry slug count per_slug_line=""
+  IFS=',' read -ra entries <<<"$per_slug_csv"
+  for entry in "${entries[@]}"; do
+    slug="${entry%%:*}"
+    count="${entry##*:}"
+    if [ -z "$per_slug_line" ]; then per_slug_line="$slug ($count)"
+    else                              per_slug_line="$per_slug_line · $slug ($count)"
+    fi
+  done
+  printf -- '[%s] FREQUENCY %s events · %s\n' "$idx" "$freq" "$per_slug_line"
+  printf -- '    HEADLINE: "%s"\n' "$headline"
+  if [ "$kind" = "expires" ]; then
+    printf -- '    PROPOSED EXPIRES on existing principle:\n'
+    printf -- '    (target: %s)\n' "$target_pn"
+  else
+    printf -- '    PROPOSED ADDITION TO PRINCIPLES.md:\n'
+  fi
+  # Indent every line of the proposed block by 6 spaces.
+  printf -- '%s\n' "$proposed" | awk '{ print "      " $0 }'
+}
+
+# Compose the "addition" candidate text (markdown block). Args:
+#   $1 = next_pn (integer), $2 = title_cased_headline, $3 = source_body
+prompts_suggest_compose_addition() {
+  local next_pn="$1" title="$2" body="$3"
+  printf -- '## P-%s — %s\n' "$next_pn" "$title"
+  if [ -n "$body" ]; then
+    printf -- '%s\n' "$body"
+  fi
+}
+
+# Compose the "expires" candidate text. Args:
+#   $1 = existing_principle_heading (full line), $2 = expires_date,
+#   $3 = headline
+prompts_suggest_compose_expires() {
+  local heading="$1" expires_date="$2" headline="$3"
+  printf -- '%s\n' "$heading"
+  printf -- '<!-- EXPIRES: %s -->\n' "$expires_date"
+  printf -- '(reason: every recent send-back citing this principle actually\n'
+  printf -- ' points to "%s", not the principle'\''s intent.)\n' "$headline"
+}
+
+# Main subcommand body. Per LESSONS 2026-06-01, every code path ends with
+# `exit 0` so the dispatcher cannot fall through to the default status
+# rendering.
+prompts_suggest() {
+  shift  # drop "prompts-suggest"
+  local since="30d" threshold=3 want_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)         want_json=1; shift ;;
+      --since)        since="${2:-}"; shift 2 ;;
+      --since=*)      since="${1#--since=}"; shift ;;
+      --threshold)    threshold="${2:-}"; shift 2 ;;
+      --threshold=*)  threshold="${1#--threshold=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet prompts-suggest — propose PRINCIPLES.md additions from recurring
+                        lesson_draft_emitted clusters.
+
+Usage:
+  fleet prompts-suggest                       default --since 30d, threshold 3
+  fleet prompts-suggest --since 14d           narrow the window (Nd or YYYY-MM-DD)
+  fleet prompts-suggest --since 2026-05-01    explicit start date
+  fleet prompts-suggest --threshold 5         only clusters with ≥5 events
+  fleet prompts-suggest --threshold 1         list every cluster (debug)
+  fleet prompts-suggest --json                one JSON object per candidate, summary last
+
+Each candidate proposes either:
+  - a new ## P-NEXT principle (default), composed from the most-recent
+    matching docs/LESSONS.md paragraph across every discovered project, OR
+  - a <!-- EXPIRES: YYYY-MM-DD --> marker on an existing principle whose
+    recent send-backs mis-cite it (≥4 events in the cluster reference the
+    same P-N AND the recurring headline maps to a different principle).
+
+Pure reader: no events.jsonl writes, no PRINCIPLES.md writes, no
+fleet_emit_event calls. The operator owns the paste.
+USAGE
+        exit 0 ;;
+      --)             shift ;;
+      -*)
+        echo "prompts-suggest: unknown flag '$1'" >&2
+        exit 2 ;;
+      *)
+        echo "prompts-suggest: unexpected extra argument '$1'" >&2
+        exit 2 ;;
+    esac
+  done
+
+  # Validate --threshold is a positive integer.
+  case "$threshold" in
+    ''|*[!0-9]*)
+      echo "prompts-suggest: --threshold must be a positive integer" >&2
+      exit 2 ;;
+  esac
+  [ "$threshold" -lt 1 ] && threshold=1
+
+  local since_seconds
+  since_seconds="$(prompts_suggest_parse_since "$since")" || {
+    echo "prompts-suggest: invalid --since \"$since\" (use Nd or YYYY-MM-DD)" >&2
+    exit 2
+  }
+
+  local now cutoff
+  now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  cutoff=$(( now - since_seconds ))
+
+  # Resolve PRINCIPLES.md path. Test seam:
+  # FLEET_PROMPTS_SUGGEST_PRINCIPLES_PATH. Default: kit's prompts/PRINCIPLES.md.
+  local principles_path="${FLEET_PROMPTS_SUGGEST_PRINCIPLES_PATH:-}"
+  if [ -z "$principles_path" ]; then
+    local self; self="$(cd "$(dirname "$0")" && pwd)"
+    if [ -f "$self/../prompts/PRINCIPLES.md" ]; then
+      principles_path="$self/../prompts/PRINCIPLES.md"
+    elif [ -f "$HOME/.local/share/agent-fleet/prompts/PRINCIPLES.md" ]; then
+      principles_path="$HOME/.local/share/agent-fleet/prompts/PRINCIPLES.md"
+    fi
+  fi
+  local p_max
+  p_max="$(prompts_suggest_principles_max_pn "$principles_path")"
+
+  # --- Discovery -------------------------------------------------------
+  local discover_rows
+  discover_rows="$(prompts_suggest_discover_slugs)"
+  if [ -z "$discover_rows" ]; then
+    echo "prompts-suggest: no projects discovered. run \`fleet onboard\` to adopt one."
+    exit 0
+  fi
+
+  # --- Collect raw drafts ---------------------------------------------
+  local drafts_tmp; drafts_tmp="$(mktemp -t prompts-suggest-drafts.XXXXXX)"
+  local proj_dirs=""
+  local slug proj_dir cache_dir events
+  while IFS=$'\t' read -r slug proj_dir cache_dir; do
+    [ -z "$slug" ] && continue
+    proj_dirs="$proj_dirs $proj_dir"
+    events="$cache_dir/events.jsonl"
+    prompts_suggest_collect_drafts "$events" "$slug" "$cutoff" >> "$drafts_tmp"
+  done <<<"$discover_rows"
+
+  local total_events
+  total_events="$(awk 'END { print NR + 0 }' "$drafts_tmp")"
+  if [ "$total_events" -eq 0 ]; then
+    rm -f "$drafts_tmp"
+    echo "prompts-suggest: no lesson_draft_emitted events in the trailing $since; nothing to suggest."
+    exit 0
+  fi
+
+  # --- Cluster ---------------------------------------------------------
+  local clusters_tmp; clusters_tmp="$(mktemp -t prompts-suggest-clusters.XXXXXX)"
+  prompts_suggest_cluster < "$drafts_tmp" > "$clusters_tmp"
+
+  # Filter by threshold; sort by frequency desc, headline asc for ties.
+  local filtered_tmp; filtered_tmp="$(mktemp -t prompts-suggest-filtered.XXXXXX)"
+  awk -F'\t' -v th="$threshold" '($2 + 0) >= th { print }' "$clusters_tmp" \
+    | sort -t $'\t' -k2,2nr -k1,1 > "$filtered_tmp"
+
+  local n_clusters
+  n_clusters="$(awk 'END { print NR + 0 }' "$filtered_tmp")"
+  if [ "$n_clusters" -eq 0 ]; then
+    rm -f "$drafts_tmp" "$clusters_tmp" "$filtered_tmp"
+    echo "prompts-suggest: $total_events events found but none recur ≥$threshold times; the loop is learning one-shot lessons, not principle-shaped patterns."
+    exit 0
+  fi
+
+  # --- Compose + render -----------------------------------------------
+  # JSON mode: one object per candidate, summary last.
+  # Text mode: banner, blank, then per-candidate blocks separated by blanks.
+  if [ "$want_json" != "1" ]; then
+    printf -- 'prompts-suggest: %s candidate addition(s) found in the trailing %s.\n' \
+      "$n_clusters" "$since"
+    printf -- '\n'
+  fi
+
+  local idx=0 next_pn=$(( p_max + 1 ))
+  local norm freq per_slug cites_csv recent_pr
+  local kind target_pn proposed_text title source_body
+  local expires_date heading_line _recent_ep
+  while IFS=$'\t' read -r norm freq per_slug cites_csv _recent_ep recent_pr; do
+    [ -z "$norm" ] && continue
+    idx=$(( idx + 1 ))
+    # shellcheck disable=SC2046
+    set -- $proj_dirs
+    local kind_pair
+    kind_pair="$(prompts_suggest_pick_kind "$cites_csv" "$principles_path")"
+    kind="${kind_pair%%$'\t'*}"
+    target_pn="${kind_pair#*$'\t'}"
+    # Trim possible trailing newline from kind_pair tail.
+    target_pn="${target_pn%%$'\n'*}"
+    if [ "$kind" = "expires" ]; then
+      expires_date="$(prompts_suggest_expires_date)"
+      heading_line="$(prompts_suggest_principle_heading "$principles_path" "$target_pn")"
+      proposed_text="$(prompts_suggest_compose_expires "$heading_line" "$expires_date" "$norm")"
+    else
+      title="$(prompts_suggest_title_case "$norm")"
+      source_body="$(prompts_suggest_find_source_lesson "$norm" "$@")"
+      proposed_text="$(prompts_suggest_compose_addition "$next_pn" "$title" "$source_body")"
+      next_pn=$(( next_pn + 1 ))
+    fi
+
+    if [ "$want_json" = "1" ]; then
+      # Build per_slug as a JSON object. cites_csv → target_p_n.
+      local per_slug_json="{}"
+      if [ -n "$per_slug" ]; then
+        local p_entry pj=""
+        IFS=',' read -ra pents <<<"$per_slug"
+        for p_entry in "${pents[@]}"; do
+          local p_s="${p_entry%%:*}" p_c="${p_entry##*:}"
+          [ -z "$p_s" ] && continue
+          local esc_s; esc_s="$(preflight_json_escape "$p_s")"
+          if [ -z "$pj" ]; then pj="\"$esc_s\":$p_c"
+          else                  pj="$pj,\"$esc_s\":$p_c"
+          fi
+        done
+        per_slug_json="{$pj}"
+      fi
+      local esc_headline esc_proposed
+      esc_headline="$(preflight_json_escape "$norm")"
+      esc_proposed="$(preflight_json_escape "$proposed_text")"
+      local tpn_field="null"
+      [ -n "$target_pn" ] && tpn_field="\"$target_pn\""
+      local lesson_pr_field="null"
+      [ "$recent_pr" != "-" ] && [ -n "$recent_pr" ] && lesson_pr_field="$recent_pr"
+      printf -- '{"cluster_id":%s,"headline":"%s","frequency":%s,"per_slug":%s,"kind":"%s","target_p_n":%s,"proposed_text":"%s","lesson_source_pr":%s}\n' \
+        "$idx" "$esc_headline" "$freq" "$per_slug_json" "$kind" \
+        "$tpn_field" "$esc_proposed" "$lesson_pr_field"
+    else
+      prompts_suggest_render_text_block "$idx" "$kind" "$norm" "$freq" \
+        "$per_slug" "$target_pn" "$proposed_text"
+      printf -- '\n'
+    fi
+  done < "$filtered_tmp"
+
+  if [ "$want_json" = "1" ]; then
+    printf -- '{"summary":{"window":"%s","threshold":%s,"candidates_found":%s,"principles_md_p_max":%s}}\n' \
+      "$since" "$threshold" "$n_clusters" "$p_max"
+  fi
+
+  rm -f "$drafts_tmp" "$clusters_tmp" "$filtered_tmp"
+  exit 0
+}
+
+if [ "$CMD" = "prompts-suggest" ]; then
+  prompts_suggest "$@"
 fi
 
 # --- tail -----------------------------------------------------------------

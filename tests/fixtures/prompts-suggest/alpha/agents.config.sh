@@ -1,0 +1,6 @@
+PROJECT_NAME="alpha-fixture"
+SLUG="alpha-fixture"
+NAMESPACE="com.alpha-fixture"
+REPO_URL="https://github.com/example/alpha-fixture"
+SELF_CANCEL="20990101"
+PROMPTS_SHA="abc123def456"
