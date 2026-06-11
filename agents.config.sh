@@ -23,3 +23,6 @@ ENG_ENABLED=0
 ENG_HOURS="0"
 ENG_MINUTE="23"
 SHIP_HOURS="0 6 12 18"
+
+# Ticket 0044 — dogfood the per-merge ROI footer on this kit's own PRs.
+PR_FOOTER_ENABLED=1

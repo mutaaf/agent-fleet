@@ -454,6 +454,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet weekly                  # Sunday ROI rollup over the trailing 7d — SHIPPED/$SPEND/DRAFTS↑/HEAL/INFRA/PAUSED/SELF-CANCEL
 ~/code/agent-fleet/bin/fleet inbox                   # what the fleet owes you today (drafts, expirations, paused, budgets, stuck PRs)
 ~/code/agent-fleet/bin/fleet badge agent-fleet       # one-line ROI badge for the project's README (md/svg/txt; network-free)
+~/code/agent-fleet/bin/fleet pr-footer 99            # post a per-merge ROI receipt comment on a shipped agent PR (ticket 0044 — default-on via PR_FOOTER_ENABLED=1)
 ~/code/agent-fleet/bin/fleet tail                    # stream live events from every project (Ctrl-C to stop)
 ~/code/agent-fleet/bin/fleet rollback courtiq        # revert the last agent-shipped commit (revert/<id>-<slug> PR)
 ~/code/agent-fleet/bin/fleet prompts-revert ee94b3a --reason "8a20547 regression"  # pin prompts/ back to a known-good SHA (opens revert/prompts-<short> PR)

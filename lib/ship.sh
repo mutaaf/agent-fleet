@@ -51,6 +51,50 @@ fleet_check_sendback_streak || true
 fleet_run_claude ship < "$FLEET_PROMPTS/ship.prompt.md"
 EXIT=$?
 
+# Ticket 0044 — per-merge ROI footer hook. The dev agent runs `gh pr
+# create` and `gh pr merge --auto --squash` inside the ship prompt; we
+# fire `bin/fleet pr-footer <pr>` here, after fleet_run_claude returns,
+# for the most-recent `pr_opened` event in this slug's events.jsonl.
+# `pr-footer` itself refuses non-merged PRs (exit 2), so a ship run
+# that only opens a PR (auto-merge still pending CI) is a silent
+# no-op on this hook — the operator can re-fire it post-hoc, or the
+# next ship run will catch it once the PR merges.
+#
+# PR_FOOTER_ENABLED is a manifest knob defaulting to 1 (the v1
+# acquisition bet — see ticket 0044's growth lens). Set
+# PR_FOOTER_ENABLED=0 in agents.config.sh to opt out.
+#
+# Per LESSONS 2026-05-26 (actions silent flake) a footer-post failure
+# is NOT a heal trigger — the merge has already happened (or not).
+# Per LESSONS 2026-05-28 every `printf` of a user-derived string
+# uses `printf --`. The background fork via `&` means the merge
+# path doesn't wait on the gh REST roundtrip.
+if [ "${PR_FOOTER_ENABLED:-1}" = "1" ] && [ "$EXIT" = "0" ]; then
+  PR_FOOTER_PR=""
+  if [ -f "$CACHE_DIR/events.jsonl" ]; then
+    PR_FOOTER_PR="$(awk '
+      function jv(line, key,    re, val) {
+        re = "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+        if (match(line, re)) {
+          val = substr(line, RSTART, RLENGTH)
+          sub(/.*:[[:space:]]*"/, "", val); sub(/".*/, "", val)
+          return val
+        }
+        return ""
+      }
+      { if (jv($0, "type") == "pr_opened") last = jv($0, "number") }
+      END { if (last != "") print last }
+    ' "$CACHE_DIR/events.jsonl")"
+  fi
+  if [ -n "$PR_FOOTER_PR" ]; then
+    FLEET_BIN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/../bin" 2>/dev/null && pwd )"
+    if [ -x "$FLEET_BIN_DIR/fleet" ]; then
+      ( "$FLEET_BIN_DIR/fleet" pr-footer "$PR_FOOTER_PR" \
+          >> "$FLEET_LOG" 2>&1 || true ) &
+    fi
+  fi
+fi
+
 echo
 echo "=== ${SLUG}-ship complete $(date -u) — exit=$EXIT ==="
 # Ticket 0010: in dry-run mode, fleet_run_claude already emitted run_dry_run

@@ -13,6 +13,9 @@
 #                             (ticket 0025 — pure consumer of telemetry)
 #   fleet badge <slug>        one-line ROI badge for the project's README
 #                             (ticket 0027 — md/svg/txt; network-free)
+#   fleet pr-footer <pr>      post a per-merge ROI receipt comment on a shipped PR
+#                             (ticket 0044 — six values from local telemetry;
+#                              opt out via PR_FOOTER_ENABLED=0 in manifest)
 #   fleet prompts-sha         print the SHA256 of the kit's prompts/ tree
 #                             (ticket 0005 — for PROMPTS_SHA pinning)
 #   fleet prompts-revert <sha> --reason "<text>"
@@ -4403,6 +4406,533 @@ USAGE
 
 if [ "$CMD" = "badge" ]; then
   badge "$@"
+fi
+
+# --- pr-footer (ticket 0044) ---------------------------------------------
+# `fleet pr-footer <pr>` posts a single per-merge ROI receipt comment on
+# every agent-shipped PR. Composes six values:
+#
+#   cost            from the runs.jsonl row whose result_head cites the PR
+#   duration        same row's duration_ms, formatted Nm`Ns`
+#   ticket-to-date  sum of total_cost_usd over trailing 30 days (per slug)
+#   pr-count        count of `pr_opened` events in the same 30d window
+#   prompts_pin     manifest's PROMPTS_SHA short form (or `unset`)
+#   lessons_lines   `wc -l < docs/LESSONS.md` from the kit's checkout
+#   kit_sha         `git rev-parse --short HEAD` from the kit's checkout
+#
+# Posts via `gh pr comment <pr> --body "<body>"` (NOT --edit-last). The
+# body starts with `<!-- fleet-roi-footer v1 -->` so re-runs detect the
+# prior post via `gh pr view <pr> --json comments` and skip silently
+# (the AC's idempotency contract).
+#
+# Refusals (exit 2): PR not merged → "is not merged"; branch prefix not
+# in the agent set (feat/, chore/gtm-, eng/) → "is not an agent PR".
+# Secret-shaped substring (e.g. `ghp_` PAT prefix accidentally captured
+# in result_head) → exit 3, NO post.
+#
+# Pure WRITER of one PR comment — never writes to events.jsonl (per the
+# AC and P-6: pr-footer is a side effect of the ship/merge path, not a
+# telemetry signal of its own).
+#
+# All helpers are defined ABOVE the dispatcher per LESSONS 2026-06-05
+# (dispatcher forward-reference trap). Use `preflight_json_escape`
+# (~line 1076) for JSON-body escaping per LESSONS 2026-06-03 (UTF-8
+# sign-extension guard) — no provenance_json_escape forward-reference.
+# Per LESSONS 2026-05-26 the function name `pr_footer` does NOT collide
+# with a coreutils binary.
+
+# Find the runs.jsonl row whose result_head cites the requested PR
+# number. Echoes `cost<TAB>duration_ms` on a single line, or the
+# `-<TAB>-` sentinel (NOT empty fields — LESSONS 2026-06-08 IFS=$'\t'
+# middle-empty-field trap). The caller maps `-` back to the "unknown"
+# render token in the composed body. The match is on `PR #<N>` OR
+# `pull/<N>` OR `pulls/<N>` (covering the three shapes ship.prompt.md
+# allows in its final report line).
+pr_footer_find_runs_row() {
+  local runs="$1" want_pr="$2"
+  [ -f "$runs" ] || { printf -- '-\t-\n'; return 0; }
+  awk -v want="$want_pr" '
+    BEGIN { found = 0; cost = "-"; dur = "-" }
+    {
+      head = ""; this_cost = ""; this_dur = ""
+      if (match($0, /"result_head"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        head = substr($0, RSTART, RLENGTH)
+        sub(/.*"result_head"[[:space:]]*:[[:space:]]*"/, "", head)
+        sub(/".*/, "", head)
+      }
+      if (head == "") next
+      # The result_head must cite the PR number in one of three shapes.
+      pat_hash    = "PR #" want
+      pat_pulls   = "pulls/" want
+      pat_pull    = "pull/"  want
+      if (index(head, pat_hash) == 0 \
+          && index(head, pat_pulls) == 0 \
+          && index(head, pat_pull)  == 0) next
+      # Must also be followed by a non-digit (so PR #9 does not match
+      # PR #99). Use a regex with a digit-boundary check.
+      digit_bound_hash  = "PR #" want "[^0-9]"
+      digit_bound_pulls = "pulls/" want "[^0-9]"
+      digit_bound_pull  = "pull/"  want "[^0-9]"
+      tail = head " "  # append space so end-of-string also satisfies [^0-9]
+      if (match(tail, digit_bound_hash)  == 0 \
+          && match(tail, digit_bound_pulls) == 0 \
+          && match(tail, digit_bound_pull)  == 0) next
+      if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        c = substr($0, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*/, "", c)
+        this_cost = c
+      }
+      if (match($0, /"duration_ms"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        d = substr($0, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*/, "", d)
+        this_dur = d
+      }
+      if (this_cost != "") cost = this_cost
+      if (this_dur  != "") dur  = this_dur
+      found = 1
+    }
+    END {
+      printf "%s\t%s\n", cost, dur
+    }
+  ' "$runs"
+}
+
+# Sum total_cost_usd over runs.jsonl whose ts_start falls in the
+# trailing 30 days, AND count `pr_opened` events in events.jsonl in
+# the same window. Echoes `<spend>\t<pr_count>` (sentinel `-\t-`
+# when both files are missing). The 30d cutoff is computed from
+# `${FLEET_NOW_OVERRIDE:-$(date -u +%s)}` so tests stay deterministic.
+# Per LESSONS 2026-06-08 the awk script declares `BEGIN { cost = 0;
+# pr_count = 0 }` so the first +=/++ does not store under "" key.
+# Per LESSONS 2026-06-01 the count goes through `END { print n+0 }`.
+pr_footer_30d_rollup() {
+  local runs="$1" events="$2"
+  local now cutoff
+  now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  cutoff=$(( now - 30 * 86400 ))
+  local spend="0.00" pr_count="0"
+  if [ -f "$runs" ]; then
+    spend="$(awk -v cutoff="$cutoff" '
+      function iso2ep(ts,    cmd, out) {
+        gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+        cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+        cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+        if ((cmd | getline out) <= 0) out = 0
+        close(cmd)
+        return out + 0
+      }
+      BEGIN { total = 0 }
+      {
+        ts = ""; cost = 0
+        if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts)
+          sub(/".*/, "", ts)
+        }
+        if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+          c = substr($0, RSTART, RLENGTH)
+          sub(/.*:[[:space:]]*/, "", c)
+          cost = c + 0
+        }
+        if (ts == "") next
+        ep = iso2ep(ts)
+        if (ep >= cutoff) total += cost
+      }
+      END { printf("%.2f", total + 0) }
+    ' "$runs")"
+  fi
+  if [ -f "$events" ]; then
+    pr_count="$(awk -v cutoff="$cutoff" '
+      function iso2ep(ts,    cmd, out) {
+        gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+        cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+        cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+        if ((cmd | getline out) <= 0) out = 0
+        close(cmd)
+        return out + 0
+      }
+      BEGIN { n = 0 }
+      {
+        ts = ""; type = ""
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          type = substr($0, RSTART, RLENGTH)
+          sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+        }
+        if (type != "pr_opened") next
+        if (iso2ep(ts) < cutoff) next
+        n++
+      }
+      END { print (n + 0) }
+    ' "$events")"
+  fi
+  printf -- '%s\t%s\n' "$spend" "$pr_count"
+}
+
+# Run the composed body through the same regex set as
+# `fleet_install_prepush_hook` (lib/common.sh, ticket 0008). Echoes
+# the matched pattern name on a hit (so the caller can surface
+# "regex: <which>" in the refusal message) and exits 0; otherwise
+# echoes empty and exits 0. Per LESSONS 2026-05-30 `grep -qE --`
+# guards leading-dash patterns. Per LESSONS 2026-05-28 every
+# `printf` of user-derived bytes uses `printf --`.
+pr_footer_secret_check() {
+  local body="$1"
+  # Order matches lib/common.sh; the first hit wins.
+  if printf -- '%s' "$body" | grep -qE -- 'sk-ant-[A-Za-z0-9_-]{30,}'; then
+    echo "anthropic"; return 0
+  fi
+  if printf -- '%s' "$body" | grep -qE -- 'ghp_[A-Za-z0-9]{36}'; then
+    echo "github_pat"; return 0
+  fi
+  if printf -- '%s' "$body" | grep -qE -- 'gho_[A-Za-z0-9]{36}'; then
+    echo "github_oauth"; return 0
+  fi
+  if printf -- '%s' "$body" | grep -qE -- 'AKIA[0-9A-Z]{16}'; then
+    echo "aws_access_key"; return 0
+  fi
+  if printf -- '%s' "$body" | grep -qE -- 'sk-[A-Za-z0-9]{20,}'; then
+    echo "openai"; return 0
+  fi
+  if printf -- '%s' "$body" \
+       | grep -qE -- '([Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]|[Bb][Ee][Aa][Rr][Ee][Rr])[[:space:]]*[:=][[:space:]]*"?[A-Za-z0-9_/+=-]{20,}'; then
+    echo "generic_kv"; return 0
+  fi
+  echo ""
+}
+
+# Detect an existing fleet-roi-footer comment on a PR. Echoes "1" if
+# found, "0" otherwise. Reads `gh pr view <pr> --json comments` and
+# walks the body field of each entry for the sentinel string.
+pr_footer_already_posted() {
+  local pr="$1"
+  local json
+  json="$(gh pr view "$pr" --json comments 2>/dev/null)" || { echo 0; return 0; }
+  [ -n "$json" ] || { echo 0; return 0; }
+  if printf -- '%s' "$json" | grep -qF -- 'fleet-roi-footer v1'; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# Compose the markdown body. Six values passed positionally:
+#   $1 cost ($X.XX or "unknown")
+#   $2 duration (NmNs or "unknown")
+#   $3 ticket_to_date (X.XX or "unknown")
+#   $4 pr_count (integer or "unknown")
+#   $5 prompts_pin (short SHA or "unset")
+#   $6 lessons_lines (integer)
+#   $7 kit_sha (short SHA)
+#   $8 repo (owner/name, e.g. "mutaaf/agent-fleet")
+#
+# The repo arg is used for the relative tree-link in the markdown
+# (`../tree/<sha>/prompts`). Per LESSONS 2026-05-28 every `printf` of a
+# user-derived string uses `printf --`. The first line MUST be the
+# sentinel for the idempotency check.
+pr_footer_compose_body() {
+  local cost="$1" duration="$2" ttd="$3" pr_count="$4"
+  local prompts_pin="$5" lessons_lines="$6" kit_sha="$7" repo="$8"
+  local cost_render duration_render ttd_render pr_count_render
+  case "$cost" in
+    unknown) cost_render="**unknown**" ;;
+    *)       cost_render="**\$${cost}**" ;;
+  esac
+  case "$duration" in
+    unknown) duration_render="**unknown**" ;;
+    *)       duration_render="**${duration}**" ;;
+  esac
+  case "$ttd" in
+    unknown) ttd_render="**unknown**" ;;
+    *)       ttd_render="**\$${ttd}**" ;;
+  esac
+  case "$pr_count" in
+    unknown) pr_count_render="**unknown** PRs" ;;
+    *)       pr_count_render="**${pr_count}** PRs" ;;
+  esac
+  # Pinned prompts link: when prompts_pin is "unset" render a plain
+  # `unset` label; otherwise link to the tree at that SHA via a
+  # relative URL so the comment works regardless of base repo.
+  local prompts_render
+  if [ "$prompts_pin" = "unset" ]; then
+    prompts_render="\`unset\`"
+  else
+    prompts_render="[\`${prompts_pin}\`](../tree/${prompts_pin}/prompts)"
+  fi
+  # Body. ASCII-only outside the one permitted emoji line. The middle-
+  # dot separators in the ticket's example renderer are converted to
+  # ASCII pipes here so AC#4's "every other body character is ASCII"
+  # check holds. The one permitted multi-byte sequence is the robot
+  # emoji on the "fleet receipt" line.
+  printf -- '<!-- fleet-roi-footer v1 -->\n'
+  printf -- '\xf0\x9f\xa4\x96 **fleet receipt** | cost %s | duration %s\n' \
+    "$cost_render" "$duration_render"
+  printf -- 'ticket-to-date | %s / %s in the last 30d\n' \
+    "$ttd_render" "$pr_count_render"
+  printf -- 'pinned prompts: %s | LESSONS: %s lines | kit: [`%s`](../commit/%s)\n' \
+    "$prompts_render" "$lessons_lines" "$kit_sha" "$kit_sha"
+  printf -- '\n'
+  printf -- '_powered by [agent-fleet](https://github.com/mutaaf/agent-fleet) - this footer is appended automatically and contains no secrets._\n'
+}
+
+# Format a duration_ms value into `<N>m<N>s`. `unknown` passes through.
+# Negative or non-numeric input also yields `unknown` (defensive).
+pr_footer_format_duration() {
+  local ms="$1"
+  case "$ms" in
+    ''|'-'|unknown|*[!0-9]*) echo "unknown"; return 0 ;;
+  esac
+  local total_s=$(( ms / 1000 ))
+  local m=$(( total_s / 60 ))
+  local s=$(( total_s % 60 ))
+  printf -- '%dm%ds\n' "$m" "$s"
+}
+
+# Format a raw cost value into `X.XX`. Handles the sentinel "-".
+pr_footer_format_cost() {
+  local raw="$1"
+  case "$raw" in
+    ''|'-'|unknown) echo "unknown"; return 0 ;;
+  esac
+  awk -v c="$raw" 'BEGIN { printf "%.2f", c + 0 }'
+}
+
+pr_footer() {
+  shift  # drop the leading "pr-footer"
+  local pr_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<USAGE
+fleet pr-footer — post a per-merge ROI receipt comment on a shipped PR.
+
+Usage:
+  fleet pr-footer <pr>             post a fleet-roi-footer v1 comment
+  fleet pr-footer --help           print this banner and exit
+
+A single GitHub PR comment of the shape:
+  <!-- fleet-roi-footer v1 -->
+  fleet receipt - cost \$X.XX - duration NmNs
+  ticket-to-date - \$X.XX / N PRs in the last 30d
+  pinned prompts: <sha> - LESSONS: N lines - kit: <sha>
+
+Refuses (exit 2) when the PR is not merged, or when its branch is
+not one of the agent prefixes (feat/, chore/gtm-, eng/).
+
+Refuses (exit 3) when the composed body contains a secret-shaped
+substring (regex set from fleet_install_prepush_hook, ticket 0008).
+
+idempotent: a second invocation on the same PR detects the prior
+comment via the <!-- fleet-roi-footer v1 --> sentinel and skips.
+
+Knob:
+  PR_FOOTER_ENABLED=1  (manifest default-on) — lib/ship.sh invokes
+                       this command in the background after every
+                       claude ship run that opens or merges a PR.
+                       Set PR_FOOTER_ENABLED=0 to opt out.
+
+Reads runs.jsonl, events.jsonl, agents.config.sh, docs/LESSONS.md,
+and \`git rev-parse --short HEAD\`. No new event types. Pure writer
+of one PR comment.
+USAGE
+        exit 0 ;;
+      --) shift ;;
+      -*)
+        printf -- 'fleet pr-footer: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$pr_arg" ]; then pr_arg="$1"; shift
+        else
+          printf -- 'fleet pr-footer: unexpected extra argument %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$pr_arg" ]; then
+    echo "fleet pr-footer: missing <pr> argument (usage: fleet pr-footer <pr>)" >&2
+    exit 2
+  fi
+  case "$pr_arg" in
+    ''|*[!0-9]*)
+      printf -- 'fleet pr-footer: <pr> must be a positive integer (got "%s")\n' "$pr_arg" >&2
+      exit 2 ;;
+  esac
+
+  # Look up PR metadata via gh. The JSON has: number, title, mergedAt,
+  # mergeCommit, baseRepository.nameWithOwner, headRefName.
+  local pr_json
+  pr_json="$(gh pr view "$pr_arg" --json number,title,mergedAt,mergeCommit,baseRepository,headRefName 2>/dev/null)" \
+    || { echo "fleet pr-footer: gh pr view failed for PR #$pr_arg" >&2; exit 2; }
+  if [ -z "$pr_json" ]; then
+    echo "fleet pr-footer: gh pr view returned empty for PR #$pr_arg" >&2
+    exit 2
+  fi
+
+  # Merged check: mergedAt is a non-null string when merged.
+  local merged_at
+  merged_at="$(printf -- '%s' "$pr_json" \
+                 | sed -nE 's/.*"mergedAt"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+                 | head -1)"
+  if [ -z "$merged_at" ]; then
+    # Try to pull the state from the title block for the message.
+    local state
+    state="$(printf -- '%s' "$pr_json" \
+              | sed -nE 's/.*"state"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+              | head -1)"
+    [ -z "$state" ] && state="open"
+    printf -- 'pr-footer: PR #%s is not merged (state: %s); footer is only posted on merged PRs\n' \
+      "$pr_arg" "$state" >&2
+    exit 2
+  fi
+
+  # Branch prefix check: must be feat/, chore/gtm-, or eng/.
+  local branch
+  branch="$(printf -- '%s' "$pr_json" \
+              | sed -nE 's/.*"headRefName"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+              | head -1)"
+  case "$branch" in
+    feat/*|chore/gtm-*|eng/*) ;;
+    *)
+      printf -- 'pr-footer: PR #%s is not an agent PR (branch: %s); only feat/, chore/gtm-, eng/ branches get a footer\n' \
+        "$pr_arg" "$branch" >&2
+      exit 2 ;;
+  esac
+
+  # Idempotency check: skip if a fleet-roi-footer already exists.
+  local already
+  already="$(pr_footer_already_posted "$pr_arg")"
+  if [ "$already" = "1" ]; then
+    printf -- 'pr-footer: PR #%s already has a fleet-roi-footer (skipping)\n' "$pr_arg"
+    exit 0
+  fi
+
+  # Resolve cache paths. The kit's own slug today; in production the
+  # slug comes from the project's manifest (the same one lib/ship.sh
+  # has already loaded). For operator-side invocation we resolve via
+  # FLEET_DISCOVERY_ROOT — same convention as `fleet provenance`.
+  local slug=""
+  if [ -n "${SLUG:-}" ]; then
+    slug="$SLUG"
+  else
+    # Pick the first project under the discovery root. v1 only supports
+    # one project; multi-project support is a v2 ticket (a future
+    # `fleet pr-footer --slug` flag).
+    local m
+    m="$(badge_resolve_manifest "agent-fleet" 2>/dev/null || true)"
+    if [ -n "$m" ]; then
+      # shellcheck disable=SC1090
+      slug="$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )"
+    fi
+  fi
+  if [ -z "$slug" ]; then
+    # As a last resort fall back to the first manifest the discover
+    # walker finds — the kit's own SLUG is "agent-fleet" so this
+    # almost always resolves.
+    slug="agent-fleet"
+  fi
+  local cache_dir="$HOME/.cache/${slug}-agent"
+  local runs="$cache_dir/runs.jsonl"
+  local events="$cache_dir/events.jsonl"
+
+  # (1) cost, (2) duration — per-PR row.
+  local row cost_raw dur_raw
+  row="$(pr_footer_find_runs_row "$runs" "$pr_arg")"
+  cost_raw="$(printf -- '%s\n' "$row" | awk -F'\t' '{print $1}')"
+  dur_raw="$(printf -- '%s\n'  "$row" | awk -F'\t' '{print $2}')"
+  local cost_render duration_render
+  cost_render="$(pr_footer_format_cost "$cost_raw")"
+  duration_render="$(pr_footer_format_duration "$dur_raw")"
+
+  # (3) ticket-to-date + (4) pr-count — trailing 30d.
+  local rollup ttd pr_count
+  rollup="$(pr_footer_30d_rollup "$runs" "$events")"
+  ttd="$(printf -- '%s\n'      "$rollup" | awk -F'\t' '{print $1}')"
+  pr_count="$(printf -- '%s\n' "$rollup" | awk -F'\t' '{print $2}')"
+  # Degrade gracefully when there's no per-PR runs row AND no 30d
+  # signal — print `unknown` instead of lying with 0.00 / 0.
+  if [ "$cost_render" = "unknown" ] && [ "$ttd" = "0.00" ]; then
+    ttd="unknown"
+  fi
+  if [ "$cost_render" = "unknown" ] && [ "$pr_count" = "0" ]; then
+    pr_count="unknown"
+  fi
+
+  # (5) prompts pin from manifest.
+  local prompts_pin="unset"
+  local manifest
+  manifest="$(badge_resolve_manifest "$slug" 2>/dev/null || true)"
+  if [ -n "$manifest" ]; then
+    # shellcheck disable=SC1090
+    local pin_full
+    pin_full="$( (source "$manifest" 2>/dev/null; echo "${PROMPTS_SHA:-}") )"
+    if [ -n "$pin_full" ]; then
+      prompts_pin="${pin_full:0:7}"
+    fi
+  fi
+
+  # (6) lessons lines — from the kit's docs/LESSONS.md. Honour
+  # FLEET_PR_FOOTER_LESSONS_FILE for tests.
+  local lessons_file lessons_lines
+  if [ -n "${FLEET_PR_FOOTER_LESSONS_FILE:-}" ]; then
+    lessons_file="$FLEET_PR_FOOTER_LESSONS_FILE"
+  else
+    local kit_root
+    kit_root="$( cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd )"
+    lessons_file="$kit_root/docs/LESSONS.md"
+  fi
+  if [ -f "$lessons_file" ]; then
+    lessons_lines="$(awk 'END { print NR + 0 }' "$lessons_file")"
+  else
+    lessons_lines="0"
+  fi
+
+  # (7) kit SHA — env override (tests) or `git rev-parse --short HEAD`.
+  local kit_sha
+  if [ -n "${FLEET_PR_FOOTER_KIT_SHA:-}" ]; then
+    kit_sha="$FLEET_PR_FOOTER_KIT_SHA"
+  else
+    kit_sha="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+  fi
+
+  # repo for the relative-link anchors.
+  local repo
+  repo="$(printf -- '%s' "$pr_json" \
+            | sed -nE 's/.*"nameWithOwner"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+            | head -1)"
+  [ -z "$repo" ] && repo="mutaaf/agent-fleet"
+
+  # Compose the body.
+  local body
+  body="$(pr_footer_compose_body \
+    "$cost_render" "$duration_render" "$ttd" "$pr_count" \
+    "$prompts_pin" "$lessons_lines" "$kit_sha" "$repo")"
+
+  # Secret-scan the composed body BEFORE posting.
+  local secret_hit
+  secret_hit="$(pr_footer_secret_check "$body")"
+  if [ -n "$secret_hit" ]; then
+    printf -- 'pr-footer: refusing - composed body contains secret-shaped substring (regex: %s); this is a bug, please open an issue\n' \
+      "$secret_hit" >&2
+    exit 3
+  fi
+
+  # Post. We use --body, NOT --edit-last and NOT --body-file (the
+  # body fits in one argv slot comfortably). Per LESSONS 2026-06-03
+  # the body content is ASCII outside the one emoji line, so the
+  # gh CLI's UTF-8 handling is the only multi-byte path.
+  gh pr comment "$pr_arg" --body "$body" >/dev/null 2>&1 \
+    || { echo "fleet pr-footer: gh pr comment failed for PR #$pr_arg" >&2; exit 2; }
+
+  printf -- 'pr-footer: posted fleet-roi-footer on PR #%s\n' "$pr_arg"
+  exit 0
+}
+
+if [ "$CMD" = "pr-footer" ]; then
+  pr_footer "$@"
 fi
 
 # --- inbox (ticket 0026) -------------------------------------------------

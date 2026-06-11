@@ -1,0 +1,6 @@
+PROJECT_NAME="Agent Fleet"
+SLUG="agent-fleet"
+NAMESPACE="com.agent-fleet"
+REPO_URL="https://github.com/mutaaf/agent-fleet"
+SELF_CANCEL="20990101"
+PROMPTS_SHA="ee94b3afabcdef0123456789abcdef0123456789abcdef0123456789abcdef01"
