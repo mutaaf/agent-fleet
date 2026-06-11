@@ -30,6 +30,15 @@ SELF_CANCEL="20260628"
 # Unset (the default) = no cap, current behavior. Ticket 0004.
 # MAX_DAILY_USD=5
 
+# Per-merge ROI footer (ticket 0044). When set to 1 (the default) lib/ship.sh
+# invokes `bin/fleet pr-footer <pr>` in the background after every claude ship
+# run that opens a PR, posting a single fleet-roi-footer v1 comment with cost,
+# duration, 30d rollup, pinned prompts SHA, LESSONS line count, and kit SHA.
+# This is the kit's "every shipped PR is its own trust artifact" acquisition
+# surface — the comment lives where skeptical engineers actually read code.
+# Set 0 to opt out (the footer is also idempotent + secret-scanned).
+PR_FOOTER_ENABLED=1
+
 # Optional trainee-mode gate: the first N feature PRs require manual merge by
 # the operator (the dev agent posts a `[FLEET trainee mode K/N]` PR comment
 # instead of arming auto-merge). The count graduates automatically once N
