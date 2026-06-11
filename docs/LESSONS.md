@@ -410,3 +410,30 @@ delimiter where `read` "does the right thing" with consecutive
 delimiters is whitespace IFS (the default), where adjacent
 whitespace IS treated as one separator — but that's the OPPOSITE
 problem and only safe when no column can contain spaces.
+
+## 2026-06-11 — macOS BSD `date -j -f '%Y-%m-%d' <date> '+%s'` fills missing time fields with NOW-of-day, not midnight
+
+While shipping ticket 0045's `prompts_suggest_parse_since`, the first
+cut accepted `--since YYYY-MM-DD` and resolved the target epoch via
+`date -u -j -f '%Y-%m-%d' "$raw" '+%s'`. macOS BSD date, when the
+input format omits time components, silently fills the missing fields
+with the CURRENT wall-clock time-of-day (not 00:00:00). So
+`date -u -j -f '%Y-%m-%d' '2026-06-06' '+%s'` returns the epoch of
+"2026-06-06 at HH:MM:SS RIGHT NOW (UTC)" rather than the epoch of
+"2026-06-06 00:00:00 UTC". Symptom in `tests/prompts-suggest.sh` AC#4:
+the test passed on the first run (when wall-clock matched the fixture's
+`FLEET_NOW_OVERRIDE=2026-06-11T12:00:00Z` closely) but FAILED on the
+next run minutes later because the parsed epoch had shifted by a few
+minutes, dragging the `since` value across the cluster's boundary so a
+"none recur ≥3" diagnostic flipped to "no events found in window".
+GNU `date -d "$raw"` has the same quirk on some Linux distros (it
+defaults to midnight, but the behavior is GNU-version-dependent and not
+contractual). Fix: pin the time component explicitly — append
+`T00:00:00` to the input and use the full format
+`'%Y-%m-%dT%H:%M:%S'`. The resulting epoch is locale- and wall-clock-
+stable. Cheap defensive habit: any user-facing `YYYY-MM-DD` arg that
+gets passed to `date -j -f` MUST be normalized to a full
+`YYYY-MM-DDTHH:MM:SS` (with `00:00:00`) before the date call, and the
+format string must list every field. Same rule applies to
+`%Y-%m-%dT%H:%M` (missing seconds) and `%Y` (missing month/day) —
+anywhere BSD date has to invent a value, it invents NOW-of-day.
