@@ -1,7 +1,7 @@
 ---
 id: 0044
 title: fleet pr-footer posts a per-merge ROI comment on every agent-shipped PR
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-11
@@ -427,3 +427,9 @@ doesn't have to re-discover the architecture.
   this run's events.jsonl and invokes `bin/fleet pr-footer <pr>` in the
   background. `pr-footer` itself refuses non-merged PRs (exit 2), so a
   ship-without-merge run is a silent no-op on the hook.
+- 2026-06-11 — shipped via PR #91 (merge f54676c). Both gating checks
+  (shellcheck, validate) green. AC#4 sidebar: the ticket's middle-dot
+  (`·`) separators in the user-story example would have failed the
+  ASCII-only assertion; the rendered body uses ASCII pipe (`|`)
+  separators throughout, with the one permitted emoji (🤖) on the
+  "fleet receipt" header line.
