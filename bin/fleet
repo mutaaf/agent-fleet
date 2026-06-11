@@ -31,6 +31,9 @@
 #                             (ticket 0029 — text/md/json; network-free reader)
 #   fleet resume <slug>       re-enable a ship_paused project (safety-checked)
 #                             (ticket 0030 — --force/--reason for audited override)
+#   fleet vacation --until D --reason "<text>"
+#                             suspend ship/eng across the fleet; auto-resume on D
+#                             (ticket 0046 — --return ends early, --status, --help)
 #   fleet atlas               fleet-wide infra-flake catalog with per-pattern frequency (text/json)
 #                             (ticket 0031 — --since/--slug/--json; pure reader, no new event types)
 #   fleet preflight <repo>    dry-adopt a candidate project; print what install.sh would do (read-only)
@@ -15182,6 +15185,605 @@ USAGE
 
 if [ "$CMD" = "resume" ]; then
   resume "$@"
+fi
+
+# --- vacation -------------------------------------------------------------
+# Ticket 0046. `bin/fleet vacation --until <YYYY-MM-DD> --reason "<text>"`
+# suspends ship+eng work across the WHOLE fleet (review keeps polling so
+# any in-flight PR finishes), schedules an auto-resume launchd job for
+# `<until> 00:00 UTC`, and prints a one-paragraph briefing. The state
+# lives in ONE file at $HOME/.cache/fleet/vacation-state. Every ship/eng
+# runner reads it at PHASE 0 via `_fleet_check_vacation` (lib/common.sh)
+# and `exit 0`s with one `vacation_skip` event when active.
+#
+# Hard NOs that govern this surface:
+#   - LESSONS 2026-06-01: every code path ends with explicit
+#     `exit 0`/`exit 2` (dispatcher fall-through trap).
+#   - LESSONS 2026-06-05: every helper used by `vacation()` is defined
+#     BEFORE the dispatcher block (forward-reference window is narrow
+#     but real in this dispatcher-interleaved file).
+#   - LESSONS 2026-05-27: the state file is written via `cp` of a tmp
+#     file, never `> "$state"` directly, so a mid-write interrupt
+#     never leaves a half-written JSON document.
+#   - LESSONS 2026-06-03: the reason text is ASCII-only (rejected in
+#     `vacation()` if a high byte appears) AND JSON-escaped through
+#     `preflight_json_escape` (which has the >=0 guard).
+#   - LESSONS 2026-05-28: every `printf` of `$reason` uses
+#     `printf -- '%s'`.
+#   - LESSONS 2026-06-08: any awk we use here BEGINs with explicit
+#     counter initialization.
+# Naming: `vacation` does not shadow any coreutils binary on macOS or
+# Ubuntu — safe per LESSONS 2026-05-26.
+
+vacation_discover_slugs() {
+  # Union of working-tree manifests (FLEET_DISCOVERY_ROOT, default
+  # ~/Desktop/projects) and installed manifests
+  # (~/.local/share/agent-fleet/projects), de-duped by SLUG. Echoes one
+  # slug per line in discovery order. Same shape as
+  # `overview_discover` but slug-only (we don't need the manifest path).
+  local root1 root2 _seen="" m slug
+  root1="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  root2="$HOME/.local/share/agent-fleet/projects"
+  { [ -d "$root1" ] && find "$root1" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    [ -d "$root2" ] && find "$root2" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; printf -- '%s' "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf -- '%s\n' "$slug"
+  done
+}
+
+vacation_state_path() {
+  printf -- '%s' "${FLEET_VACATION_STATE:-$HOME/.cache/fleet/vacation-state}"
+}
+
+vacation_plist_path() {
+  printf -- '%s' "$HOME/Library/LaunchAgents/com.agent-fleet.vacation-resume.plist"
+}
+
+vacation_now_epoch() {
+  # Honor FLEET_NOW_OVERRIDE (ISO8601 with Z or +/-OFFSET) so tests can
+  # freeze the clock. Otherwise live UTC epoch. Uses the same parser as
+  # _fleet_check_vacation via lib/common.sh's _fleet_iso_to_epoch when
+  # available (sourced once below from a subshell — we never source
+  # lib/common.sh in the dispatcher's parent shell because it resets PATH
+  # and that would break the agent's PATH-stub tests).
+  local override="${FLEET_NOW_OVERRIDE:-}"
+  if [ -n "$override" ]; then
+    # Fast-path: parse the ASCII form ourselves so we don't need
+    # lib/common.sh on PATH. This duplicates the per-component math in
+    # _fleet_iso_to_epoch by design — LESSONS 2026-06-05 says forward-
+    # reference to a later helper is unsafe, and we want the dispatcher
+    # to be self-contained.
+    case "$override" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*) ;;
+      *) date -u +%s; return 0 ;;
+    esac
+    local yr="${override:0:4}" mo="${override:5:2}" da="${override:8:2}"
+    local hr="${override:11:2}" mi="${override:14:2}" se="${override:17:2}"
+    local tail="${override:19}"
+    local yr_n="$((10#$yr))" mo_n="$((10#$mo))" da_n="$((10#$da))"
+    local hr_n="$((10#$hr))" mi_n="$((10#$mi))" se_n="$((10#$se))"
+    local mdays=(0 0 31 59 90 120 151 181 212 243 273 304 334)
+    local doy=$(( ${mdays[$mo_n]} + da_n - 1 ))
+    if [ "$mo_n" -gt 2 ]; then
+      if [ $(( yr_n % 4 )) -eq 0 ] && { [ $(( yr_n % 100 )) -ne 0 ] || [ $(( yr_n % 400 )) -eq 0 ]; }; then
+        doy=$(( doy + 1 ))
+      fi
+    fi
+    local leaps=$(( (yr_n - 1) / 4 - (yr_n - 1) / 100 + (yr_n - 1) / 400 - 477 ))
+    local days_from_epoch=$(( (yr_n - 1970) * 365 + leaps + doy ))
+    local epoch=$(( days_from_epoch * 86400 + hr_n * 3600 + mi_n * 60 + se_n ))
+    case "$tail" in
+      ""|Z) ;;
+      [+-][0-9][0-9][0-9][0-9])
+        local sign="${tail:0:1}" oh="${tail:1:2}" om="${tail:3:2}"
+        local off=$(( (10#$oh) * 3600 + (10#$om) * 60 ))
+        if [ "$sign" = "+" ]; then epoch=$(( epoch - off )); else epoch=$(( epoch + off )); fi
+        ;;
+      [+-][0-9][0-9]:[0-9][0-9])
+        local sign2="${tail:0:1}" oh2="${tail:1:2}" om2="${tail:4:2}"
+        local off2=$(( (10#$oh2) * 3600 + (10#$om2) * 60 ))
+        if [ "$sign2" = "+" ]; then epoch=$(( epoch - off2 )); else epoch=$(( epoch + off2 )); fi
+        ;;
+      *) ;;
+    esac
+    printf '%d' "$epoch"
+    return 0
+  fi
+  date -u +%s
+}
+
+vacation_today_iso() {
+  # YYYY-MM-DD form of "now" in UTC, honoring FLEET_NOW_OVERRIDE for
+  # determinism in tests. Used by the past-date refusal banner.
+  local override="${FLEET_NOW_OVERRIDE:-}"
+  if [ -n "$override" ]; then
+    case "$override" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*)
+        printf -- '%s' "${override:0:10}"
+        return 0 ;;
+    esac
+  fi
+  date -u +%Y-%m-%d
+}
+
+vacation_now_iso() {
+  # Full ISO8601 UTC stamp for the `since` field. Honors override (uses
+  # the override string verbatim when it's already ISO8601, otherwise
+  # appends `T00:00:00Z`).
+  local override="${FLEET_NOW_OVERRIDE:-}"
+  if [ -n "$override" ]; then
+    case "$override" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*) printf -- '%s' "$override"; return 0 ;;
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) printf -- '%sT00:00:00Z' "$override"; return 0 ;;
+    esac
+  fi
+  date -u +%FT%TZ
+}
+
+vacation_ascii_only() {
+  # Echo 1 if the argument is pure-ASCII (every byte < 0x80), 0 otherwise.
+  # We use `LC_ALL=C wc -c` for the byte count and `LC_ALL=C grep -c` for
+  # the high-byte count via `[^\x00-\x7f]` — but BSD grep doesn't support
+  # the \xNN range, so we walk via awk under LC_ALL=C (locale-stable per
+  # LESSONS 2026-06-05). awk counter init via BEGIN per LESSONS 2026-06-08.
+  local s="${1-}"
+  local hi
+  hi="$(printf -- '%s' "$s" | LC_ALL=C awk '
+    BEGIN {
+      for (k=0; k<256; k++) ord[sprintf("%c", k)] = k
+      n = 0
+    }
+    {
+      for (i=1; i<=length($0); i++) {
+        v = ord[substr($0, i, 1)]
+        if (v >= 128) n++
+      }
+    }
+    END { print n+0 }
+  ')"
+  if [ "$hi" -gt 0 ]; then
+    printf '%s' "0"
+  else
+    printf '%s' "1"
+  fi
+}
+
+vacation_write_state() {
+  # vacation_write_state <since_iso> <until_iso> <reason> <slug_csv>
+  # Writes the JSON state file via cp-of-tmp (LESSONS 2026-05-27 so a
+  # mid-write interrupt never leaves a half-written file). JSON values
+  # go through preflight_json_escape (LESSONS 2026-06-03 — short-
+  # circuits high bytes; we already refuse non-ASCII reasons upstream,
+  # so this is belt-and-suspenders).
+  local since="$1" until="$2" reason="$3" slugs="$4"
+  local state_path; state_path="$(vacation_state_path)"
+  local state_dir; state_dir="$(dirname "$state_path")"
+  mkdir -p "$state_dir"
+
+  # Slugs CSV → JSON array literal.
+  local arr="[" first=1 s
+  local OLDIFS="$IFS"; IFS=','
+  # shellcheck disable=SC2086  # intentional word-split on commas
+  for s in $slugs; do
+    [ -z "$s" ] && continue
+    if [ "$first" = "1" ]; then first=0; else arr="$arr,"; fi
+    arr="$arr\"$(preflight_json_escape "$s")\""
+  done
+  IFS="$OLDIFS"
+  arr="$arr]"
+
+  local tmp; tmp="$(mktemp -t fleet-vacation-state.XXXXXX)"
+  {
+    printf '{"since":"%s","until":"%s","reason":"%s","slugs_suspended":%s}\n' \
+      "$(preflight_json_escape "$since")" \
+      "$(preflight_json_escape "$until")" \
+      "$(preflight_json_escape "$reason")" \
+      "$arr"
+  } > "$tmp"
+  cp "$tmp" "$state_path"
+  chmod 0644 "$state_path" 2>/dev/null || true
+  rm -f "$tmp"
+}
+
+vacation_install_resume_plist() {
+  # vacation_install_resume_plist <until_yyyy_mm_dd>
+  # Writes ~/Library/LaunchAgents/com.agent-fleet.vacation-resume.plist
+  # with a StartCalendarInterval that fires once at <until> 00:00 UTC and
+  # runs `bin/fleet vacation --return`. Idempotent (bootout the prior
+  # plist first, then bootstrap).
+  local until_ymd="$1"
+  local plist; plist="$(vacation_plist_path)"
+  local plist_dir; plist_dir="$(dirname "$plist")"
+  mkdir -p "$plist_dir"
+  local yr="${until_ymd:0:4}" mo="${until_ymd:5:2}" da="${until_ymd:8:2}"
+  local yr_n="$((10#$yr))" mo_n="$((10#$mo))" da_n="$((10#$da))"
+
+  local kit_bin
+  kit_bin="$(cd "$(dirname "$0")" && pwd)/fleet"
+  if [ ! -x "$kit_bin" ]; then
+    # Fall back to the script's invoked path; the plist still works
+    # since the operator's PATH always finds `bin/fleet` on the host.
+    kit_bin="$0"
+  fi
+
+  # Bootout the prior plist (silent if absent) for idempotency.
+  local uid="${UID:-$(id -u)}"
+  local label="gui/${uid}/com.agent-fleet.vacation-resume"
+  if [ -f "$plist" ]; then
+    launchctl bootout "$label" 2>/dev/null || true
+  fi
+
+  local tmp; tmp="$(mktemp -t fleet-vacation-plist.XXXXXX)"
+  cat > "$tmp" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-fleet.vacation-resume</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$kit_bin</string>
+    <string>vacation</string>
+    <string>--return</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FLEET_VACATION_AUTO_RESUME</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Year</key>
+    <integer>$yr_n</integer>
+    <key>Month</key>
+    <integer>$mo_n</integer>
+    <key>Day</key>
+    <integer>$da_n</integer>
+    <key>Hour</key>
+    <integer>0</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>$HOME/.cache/fleet/vacation-resume.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/.cache/fleet/vacation-resume.log</string>
+</dict>
+</plist>
+PLIST
+  cp "$tmp" "$plist"
+  rm -f "$tmp"
+
+  launchctl bootstrap "gui/${uid}" "$plist" 2>/dev/null || true
+}
+
+vacation_remove_resume_plist() {
+  # Idempotent: bootout the label (silent on already-absent) and remove
+  # the plist file.
+  local plist; plist="$(vacation_plist_path)"
+  local uid="${UID:-$(id -u)}"
+  local label="gui/${uid}/com.agent-fleet.vacation-resume"
+  launchctl bootout "$label" 2>/dev/null || true
+  rm -f "$plist"
+}
+
+vacation_compose_briefing() {
+  # Reads the state file and prints the user-story-style briefing block.
+  # Width via preflight_visible_width (LESSONS 2026-06-05). Counters in
+  # any inline awk start in BEGIN (LESSONS 2026-06-08).
+  local state_path; state_path="$(vacation_state_path)"
+  [ -f "$state_path" ] || return 0
+  local raw; raw="$(head -n1 "$state_path" 2>/dev/null || echo "")"
+  local since until reason slugs_json
+  since="$(printf -- '%s' "$raw" | sed -n 's/.*"since"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  until="$(printf -- '%s' "$raw" | sed -n 's/.*"until"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  reason="$(printf -- '%s' "$raw" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  slugs_json="$(printf -- '%s' "$raw" | sed -n 's/.*"slugs_suspended"[[:space:]]*:[[:space:]]*\(\[[^]]*\]\).*/\1/p')"
+
+  # Slug array → space-separated for the row block.
+  local slugs_line
+  slugs_line="$(printf -- '%s' "$slugs_json" \
+    | tr -d '[]' | tr ',' '\n' | sed -e 's/^"//' -e 's/"$//' | sed -e '/^$/d')"
+  local slug_count
+  slug_count="$(printf -- '%s\n' "$slugs_line" | awk 'BEGIN { n = 0 } /./ { n++ } END { print n+0 }')"
+
+  printf -- 'vacation: active until %s\n' "$until"
+  printf -- '  reason: '
+  printf -- '%s' "$reason"
+  printf -- '\n'
+  printf -- '  since: %s\n' "$since"
+  printf -- '  suspended slugs (%s):\n' "$slug_count"
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    printf -- '    %s\n' "$s"
+  done <<<"$slugs_line"
+  printf -- '\nwhile you'\''re away:\n'
+  printf -- '  - ship + eng PHASE 0 reads the state file and exits 0 with one vacation_skip event.\n'
+  printf -- '  - review keeps polling so any in-flight PR finishes.\n'
+  printf -- '  - groom keeps refreshing the backlog (harmless during PTO).\n'
+  printf -- '  - budget caps (MAX_DAILY_USD) remain in force per project.\n'
+  printf -- '  - SELF_CANCEL dates remain in force.\n\n'
+  printf -- 'return checklist (auto-resume fires %s 00:00 UTC):\n' "${until:0:10}"
+  printf -- '  fleet vacation --return   # cancels suspension early if needed\n'
+  printf -- '  fleet morning             # see what happened while away\n'
+}
+
+vacation_emit_returned_per_slug() {
+  # vacation_emit_returned_per_slug <since_iso> <duration_h> <forced> <slug1> <slug2> ...
+  # Emits one `vacation_returned {since, duration_h, forced}` event into
+  # each slug's events.jsonl by sourcing lib/common.sh in a subshell with
+  # SLUG/CACHE_DIR/FLEET_PHASE scoped to the emit. Same pattern as
+  # resume()'s ship_resumed emit (LESSONS 2026-06-05 forward-reference:
+  # the subshell isolates the source so the dispatcher's environment is
+  # not polluted).
+  local since="$1" duration_h="$2" forced="$3"
+  shift 3
+  local kit_root; kit_root="$( cd "$( dirname "$0" )/.." && pwd )"
+  [ -f "$kit_root/lib/common.sh" ] || return 0
+  local slug cache_dir
+  for slug in "$@"; do
+    [ -z "$slug" ] && continue
+    cache_dir="$HOME/.cache/${slug}-agent"
+    mkdir -p "$cache_dir"
+    # shellcheck disable=SC1091
+    (
+      export SLUG="$slug"
+      export CACHE_DIR="$cache_dir"
+      export FLEET_PHASE="vacation"
+      # shellcheck disable=SC1090
+      source "$kit_root/lib/common.sh" >/dev/null 2>&1
+      fleet_emit_event vacation_returned \
+        "since=$since" "duration_h=$duration_h" "forced=$forced"
+    ) || true
+  done
+}
+
+vacation() {
+  shift  # drop the leading "vacation"
+  local until_arg="" reason_arg="" mode="set"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --until)
+        until_arg="${2:-}"; shift 2 ;;
+      --until=*)
+        until_arg="${1#--until=}"; shift ;;
+      --reason)
+        reason_arg="${2:-}"; shift 2 ;;
+      --reason=*)
+        reason_arg="${1#--reason=}"; shift ;;
+      --return)
+        mode="return"; shift ;;
+      --status)
+        mode="status"; shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet vacation — suspend ship/eng work across the whole fleet for PTO.
+
+Usage:
+  fleet vacation --until YYYY-MM-DD --reason "<one-line>"
+                                          arm the suspension; auto-resume
+                                          fires at <YYYY-MM-DD> 00:00 UTC
+  fleet vacation --return                 end the suspension early (or
+                                          fired by the auto-resume plist)
+  fleet vacation --status                 print the active state or
+                                          "vacation: not active"
+  fleet vacation --help                   print this block, exit 0
+
+While active, every ship and eng runner reads
+\$HOME/.cache/fleet/vacation-state at PHASE 0, emits one
+\`vacation_skip {until, reason}\` event, and exit 0. review keeps polling
+(in-flight PRs finish), groom keeps refreshing the backlog. Budget caps
+and SELF_CANCEL dates remain in force per project.
+
+On --return (manual or auto), the state file is deleted, the launchd
+auto-resume plist is bootout-ed, and one
+\`vacation_returned {since, duration_h, forced}\` event lands in each
+suspended slug's events.jsonl (forced=1 for manual, forced=0 for the
+auto-resume plist firing on the until date).
+USAGE
+        exit 0 ;;
+      --) shift ;;
+      -*)
+        printf -- 'fleet vacation: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        printf -- 'fleet vacation: unexpected argument %s\n' "$1" >&2
+        exit 2 ;;
+    esac
+  done
+
+  case "$mode" in
+    status)
+      local state_path; state_path="$(vacation_state_path)"
+      if [ ! -f "$state_path" ]; then
+        echo "vacation: not active"
+        exit 0
+      fi
+      vacation_compose_briefing
+      exit 0
+      ;;
+    return)
+      local state_path; state_path="$(vacation_state_path)"
+      if [ ! -f "$state_path" ]; then
+        echo "vacation: not active — nothing to return from."
+        # Belt-and-suspenders: still bootout the plist in case the operator
+        # killed the state file by hand.
+        vacation_remove_resume_plist
+        exit 0
+      fi
+      local raw since slugs_json forced
+      raw="$(head -n1 "$state_path" 2>/dev/null || echo "")"
+      since="$(printf -- '%s' "$raw" | sed -n 's/.*"since"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      slugs_json="$(printf -- '%s' "$raw" | sed -n 's/.*"slugs_suspended"[[:space:]]*:[[:space:]]*\(\[[^]]*\]\).*/\1/p')"
+      local slugs_line
+      slugs_line="$(printf -- '%s' "$slugs_json" \
+        | tr -d '[]' | tr ',' '\n' | sed -e 's/^"//' -e 's/"$//' | sed -e '/^$/d')"
+
+      if [ "${FLEET_VACATION_AUTO_RESUME:-}" = "1" ]; then
+        forced=0
+      else
+        forced=1
+      fi
+      # Duration in hours rounded to one integer.
+      local since_epoch now_epoch duration_h
+      since_epoch="$(_vacation_iso_to_epoch_local "$since")"
+      now_epoch="$(vacation_now_epoch)"
+      if [ -n "$since_epoch" ] && [ "$since_epoch" -gt 0 ] && [ "$now_epoch" -gt "$since_epoch" ]; then
+        duration_h=$(( ( now_epoch - since_epoch ) / 3600 ))
+      else
+        duration_h=0
+      fi
+
+      # Per-slug emit BEFORE deleting the state file (so the SLUG list is
+      # still available). Convert newline-separated slug list to argv.
+      local slugs_argv=()
+      while IFS= read -r s; do
+        [ -z "$s" ] && continue
+        slugs_argv+=("$s")
+      done <<<"$slugs_line"
+
+      if [ "${#slugs_argv[@]}" -gt 0 ]; then
+        vacation_emit_returned_per_slug "$since" "$duration_h" "$forced" "${slugs_argv[@]}"
+      fi
+
+      # Clean up state file + plist.
+      rm -f "$state_path"
+      vacation_remove_resume_plist
+
+      printf -- 'fleet vacation: returned (forced=%s, duration=%sh, slugs=%s).\n' \
+        "$forced" "$duration_h" "${#slugs_argv[@]}"
+      printf -- '  the fleet will pick up its next ship/eng cycle at the next launchd interval.\n'
+      exit 0
+      ;;
+    set)
+      # Required flags.
+      if [ -z "$until_arg" ]; then
+        echo 'vacation: usage: bin/fleet vacation --until YYYY-MM-DD --reason "<one-line>"' >&2
+        exit 2
+      fi
+      if [ -z "$reason_arg" ]; then
+        echo 'vacation: --reason is required (one-line ASCII) for the audit trail' >&2
+        exit 2
+      fi
+      # ASCII-only guard for reason (LESSONS 2026-06-03).
+      local is_ascii; is_ascii="$(vacation_ascii_only "$reason_arg")"
+      if [ "$is_ascii" != "1" ]; then
+        echo 'vacation: --reason must be ASCII for v1 (per LESSONS 2026-06-03 sign-extension guard)' >&2
+        exit 2
+      fi
+      # Until must be YYYY-MM-DD.
+      case "$until_arg" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *)
+          echo 'vacation: --until must be YYYY-MM-DD' >&2
+          exit 2 ;;
+      esac
+
+      local today; today="$(vacation_today_iso)"
+      # Past-date refusal.
+      if [ "$until_arg" \< "$today" ] || [ "$until_arg" = "$today" ]; then
+        printf -- 'vacation: --until %s is in the past (today is %s UTC); use a future date.\n' \
+          "$until_arg" "$today" >&2
+        exit 2
+      fi
+
+      # Days-from-now warning (>90 days).
+      local until_epoch today_epoch days_away
+      until_epoch="$(_vacation_iso_to_epoch_local "${until_arg}T00:00:00Z")"
+      today_epoch="$(_vacation_iso_to_epoch_local "${today}T00:00:00Z")"
+      if [ -n "$until_epoch" ] && [ -n "$today_epoch" ]; then
+        days_away=$(( ( until_epoch - today_epoch ) / 86400 ))
+      else
+        days_away=0
+      fi
+      if [ "$days_away" -gt 90 ]; then
+        printf -- 'vacation: warning — %s is %sd away; this is unusually long. If this is a true long absence consider bumping SELF_CANCEL on each project manually instead. Continuing.\n' \
+          "$until_arg" "$days_away" >&2
+      fi
+
+      # Discover slugs.
+      local slugs_csv="" slug
+      while IFS= read -r slug; do
+        [ -z "$slug" ] && continue
+        if [ -z "$slugs_csv" ]; then
+          slugs_csv="$slug"
+        else
+          slugs_csv="$slugs_csv,$slug"
+        fi
+      done < <(vacation_discover_slugs)
+
+      local since_iso="$(vacation_now_iso)"
+      local until_iso="${until_arg}T00:00:00Z"
+      vacation_write_state "$since_iso" "$until_iso" "$reason_arg" "$slugs_csv"
+      vacation_install_resume_plist "$until_arg"
+
+      printf -- 'vacation: suspending until %s (%sd from now).\n\n' "$until_arg" "$days_away"
+      vacation_compose_briefing
+      exit 0
+      ;;
+  esac
+
+  # Should be unreachable, but guard against the dispatcher fall-through
+  # trap per LESSONS 2026-06-01.
+  exit 0
+}
+
+# Local copy of the ISO → epoch helper, intentionally duplicated from
+# lib/common.sh's _fleet_iso_to_epoch (LESSONS 2026-06-05 forward-
+# reference window). The dispatcher does NOT source lib/common.sh in
+# its parent shell because that would reset PATH and break the agent's
+# stub fixtures. Keeping the logic in sync is a one-line edit pattern;
+# add a LESSONS entry when the format changes.
+_vacation_iso_to_epoch_local() {
+  local raw="${1:-}"
+  [ -n "$raw" ] || { echo ""; return 0; }
+  case "$raw" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*) ;;
+    *) echo ""; return 0 ;;
+  esac
+  local yr="${raw:0:4}" mo="${raw:5:2}" da="${raw:8:2}"
+  local hr="${raw:11:2}" mi="${raw:14:2}" se="${raw:17:2}"
+  local tail="${raw:19}"
+  local yr_n="$((10#$yr))" mo_n="$((10#$mo))" da_n="$((10#$da))"
+  local hr_n="$((10#$hr))" mi_n="$((10#$mi))" se_n="$((10#$se))"
+  local mdays=(0 0 31 59 90 120 151 181 212 243 273 304 334)
+  local doy=$(( ${mdays[$mo_n]} + da_n - 1 ))
+  if [ "$mo_n" -gt 2 ]; then
+    if [ $(( yr_n % 4 )) -eq 0 ] && { [ $(( yr_n % 100 )) -ne 0 ] || [ $(( yr_n % 400 )) -eq 0 ]; }; then
+      doy=$(( doy + 1 ))
+    fi
+  fi
+  local leaps=$(( (yr_n - 1) / 4 - (yr_n - 1) / 100 + (yr_n - 1) / 400 - 477 ))
+  local days_from_epoch=$(( (yr_n - 1970) * 365 + leaps + doy ))
+  local epoch=$(( days_from_epoch * 86400 + hr_n * 3600 + mi_n * 60 + se_n ))
+  case "$tail" in
+    ""|Z) ;;
+    [+-][0-9][0-9][0-9][0-9])
+      local sign="${tail:0:1}" oh="${tail:1:2}" om="${tail:3:2}"
+      local off=$(( (10#$oh) * 3600 + (10#$om) * 60 ))
+      if [ "$sign" = "+" ]; then epoch=$(( epoch - off )); else epoch=$(( epoch + off )); fi
+      ;;
+    [+-][0-9][0-9]:[0-9][0-9])
+      local sign2="${tail:0:1}" oh2="${tail:1:2}" om2="${tail:4:2}"
+      local off2=$(( (10#$oh2) * 3600 + (10#$om2) * 60 ))
+      if [ "$sign2" = "+" ]; then epoch=$(( epoch - off2 )); else epoch=$(( epoch + off2 )); fi
+      ;;
+    *) ;;
+  esac
+  printf '%d' "$epoch"
+}
+
+if [ "$CMD" = "vacation" ]; then
+  vacation "$@"
 fi
 
 if [ "$CMD" = "list" ]; then

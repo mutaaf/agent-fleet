@@ -299,6 +299,50 @@ postcard.
     to reconstruct why `docs/LESSONS.md` shrank in a given week.
     Consumed by `fleet provenance` and any future
     "LESSONS read-cost over time" rollup.
+  - `vacation_skip {until, reason}` — emitted by `lib/ship.sh` and
+    `lib/eng.sh` (ticket 0046) on every fire that lands while the
+    operator-declared PTO state file
+    (`$HOME/.cache/fleet/vacation-state`, written by
+    `bin/fleet vacation --until <YYYY-MM-DD> --reason "<text>"`) is
+    active and the current UTC clock has not yet crossed `until`.
+    `until` is the ISO8601 `YYYY-MM-DDTHH:MM:SSZ` end-of-vacation
+    boundary; `reason` is the operator's one-line ASCII rationale,
+    recorded verbatim through `preflight_json_escape`. The runner
+    emits exactly one event per process (guarded by
+    `FLEET_VACATION_SKIP_EMITTED`, same shape as
+    `FLEET_QUIET_HOURS_EMITTED` from ticket 0033) and `exit 0`s
+    immediately after — no claude, no gh, no git, no `heal:` counter
+    advance. `review` and `groom` are EXEMPT by design (review keeps
+    polling so any in-flight PR finishes; groom is harmless) — the
+    helper is NOT called from `lib/review.sh` or `lib/groom.sh`, so
+    this event NEVER carries `phase=review` or `phase=groom`. The
+    PHASE 0 hook is no-op when the state file is absent (the default
+    for every install), so v1 vacation mode is opt-in via a single
+    operator command. Carries `phase=ship` or `phase=eng` (the
+    runner the helper short-circuited). Mirrors the shape of
+    `quiet_hours_skip` (0033): one operator-declared policy, one
+    typed event, no transcript scraping required to reconstruct why
+    a run no-op'd during PTO.
+  - `vacation_returned {since, duration_h, forced}` — emitted by
+    `bin/fleet vacation --return` (ticket 0046) once per slug whose
+    `slugs_suspended` list included it, on every successful end of
+    the suspension. `since` is the ISO8601 timestamp the vacation
+    started (read from the state file before deletion);
+    `duration_h` is the elapsed hours from `since` to "now" rounded
+    to one integer; `forced` is `1` when invoked manually by the
+    operator before `until` and `0` when fired by the auto-resume
+    plist (`FLEET_VACATION_AUTO_RESUME=1` in the plist's
+    EnvironmentVariables). The command also deletes the state file
+    and `launchctl bootout`s the
+    `com.agent-fleet.vacation-resume` plist before emitting, so the
+    event marks the FLEET state having returned to normal. Carries
+    `phase=vacation` and lives in each per-slug `events.jsonl` (one
+    emit per suspended slug — per P-6: project is the unit of
+    telemetry, not the kit). Idempotent: `--return` with no
+    state file present is a silent no-op (no events). Mirrors the
+    shape of `ship_resumed` (0030) and `lesson_promoted` (0028):
+    one operator-/auto-initiated recovery action, one typed event
+    per affected slug.
   - `self_check_failed {pattern, lesson_date, file, line}` — emitted
     by `bin/fleet self-check` (ticket 0040) once per hit when the
     operator (or pre-push gate) invokes it with

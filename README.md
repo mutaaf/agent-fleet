@@ -459,6 +459,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet rollback courtiq        # revert the last agent-shipped commit (revert/<id>-<slug> PR)
 ~/code/agent-fleet/bin/fleet prompts-revert ee94b3a --reason "8a20547 regression"  # pin prompts/ back to a known-good SHA (opens revert/prompts-<short> PR)
 ~/code/agent-fleet/bin/fleet resume courtiq          # re-enable a ship_paused project (--force --reason "…" for audited override)
+~/code/agent-fleet/bin/fleet vacation --until 2026-06-21 --reason "10-day trip"  # suspend ship/eng across the fleet (ticket 0046 — auto-resume on --until; --return/--status/--help)
 ~/code/agent-fleet/bin/fleet atlas                   # fleet-wide infra-flake catalog with per-pattern frequency (text/json)
 ~/code/agent-fleet/bin/fleet incident --since 72h    # assemble a post-mortem from the event channel — timeline + cluster summary + open recovery actions (text/json/--out)
 ~/code/agent-fleet/bin/fleet diff agent-fleet courtiq # side-by-side ROI / posture comparison of two projects — 8 metric rows + DIVERGENCE + HYPOTHESES (--since Nh|Nd; --json)
