@@ -15,6 +15,22 @@ fleet_emit_event run_started "pid=$$" || true
 fleet_self_cancel || exit 0
 fleet_check_budget || exit 0
 
+# Ticket 0046 — operator-declared fleet-wide PTO suspension. The helper
+# reads $HOME/.cache/fleet/vacation-state (written by `bin/fleet vacation
+# --until <date> --reason "<text>"`), emits one `vacation_skip {until,
+# reason}` on the first skip per process (guarded by
+# FLEET_VACATION_SKIP_EMITTED), and writes its verdict to the exported
+# global FLEET_VACATION_VERDICT. We call WITHOUT `$(…)` so the side
+# effects (emit + guard) land in this shell rather than a discarded
+# subshell (LESSONS 2026-06-05). Lands BEFORE fleet_acquire_lock +
+# fleet_checkout so the skip path never touches gh/git/launchctl.
+# Review and groom IGNORE the state file by design.
+_fleet_check_vacation >/dev/null
+if [ "${FLEET_VACATION_VERDICT:-pass}" = "skip" ]; then
+  echo "vacation active — $FLEET_PHASE no-op until the operator returns (fleet vacation --status)"
+  exit 0
+fi
+
 # Ticket 0033 — operator-declared local-time quiet hours. The helper emits
 # one `quiet_hours_skip` event on the first suppress per process (guarded
 # by FLEET_QUIET_HOURS_EMITTED) and writes its verdict to the exported

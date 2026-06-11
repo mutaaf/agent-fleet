@@ -803,6 +803,172 @@ fleet_check_quiet_hours() {
   return 0
 }
 
+# --- vacation PTO mode (ticket 0046) --------------------------------------
+# _fleet_check_vacation — operator-declared whole-fleet PTO suspension for
+# the worker phases (ship/eng). Review and groom IGNORE the state file by
+# design — review keeps grading any in-flight PR so vacation never leaves
+# the operator with a stuck PR they cannot close, and groom is harmless.
+#
+# Calling convention mirrors fleet_check_quiet_hours (ticket 0033): the
+# helper has SIDE EFFECTS (emits the `vacation_skip` event on first skip,
+# sets a process-scoped guard) that MUST land in the parent shell.
+# Production runners (ship/eng) MUST call this WITHOUT command
+# substitution and branch on the exported FLEET_VACATION_VERDICT global —
+# bash exports inside `$(…)` never leak back out, so calling this as
+# `v=$(_fleet_check_vacation)` would drop the FLEET_VACATION_SKIP_EMITTED
+# guard and a second call could re-emit (LESSONS 2026-06-05).
+#
+# Contract (writes to BOTH stdout and FLEET_VACATION_VERDICT; ALWAYS
+# returns 0):
+#   skip — vacation state file exists AND "now" is between since and until;
+#          caller should print a banner and `exit 0` without invoking
+#          claude/gh/git. One `vacation_skip {until, reason}` event is
+#          emitted on the FIRST call per process and the
+#          FLEET_VACATION_SKIP_EMITTED guard is set so a defensive second
+#          call cannot duplicate the event.
+#   pass — no state file, or current time is past `until` (auto-resume
+#          has not been triggered yet but the window has closed), or
+#          the state file is unreadable/malformed. Runner proceeds.
+#
+# Now-source: FLEET_NOW_OVERRIDE (ISO8601 with `Z` or +/- offset) is the
+# test seam. Otherwise live `date -u +%s`. The "until" field is parsed
+# as `YYYY-MM-DDTHH:MM:SSZ`; we slice byte positions and compute the
+# UTC epoch via the same per-component math used by
+# `resume_sendback_count_24h` (bin/fleet) so the helper is locale-stable
+# and works under BSD awk / bash 3.2 (LESSONS 2026-06-05 LC_ALL caching).
+#
+# State file path is hard-coded to `$HOME/.cache/fleet/vacation-state`
+# (shared across the fleet — same shape as the inbox-state file from
+# ticket 0026). Override via FLEET_VACATION_STATE for test isolation.
+_fleet_check_vacation() {
+  local state_path
+  state_path="${FLEET_VACATION_STATE:-$HOME/.cache/fleet/vacation-state}"
+  if [ ! -f "$state_path" ]; then
+    FLEET_VACATION_VERDICT="pass"; export FLEET_VACATION_VERDICT
+    printf '%s\n' "pass"
+    return 0
+  fi
+
+  # Extract until + reason from the single-line JSON. We parse via shell
+  # `sed` rather than jq because lib/common.sh has zero non-coreutils
+  # deps (jq is a reader-only allowance, not a writer one). The state
+  # file is written by `vacation_write_state` in bin/fleet through
+  # `preflight_json_escape`, so embedded quotes are `\"` and backslashes
+  # are `\\` — sed's non-greedy substring extraction is safe here.
+  local raw until_str reason_str
+  raw="$(head -n1 "$state_path" 2>/dev/null || echo "")"
+  if [ -z "$raw" ]; then
+    FLEET_VACATION_VERDICT="pass"; export FLEET_VACATION_VERDICT
+    printf '%s\n' "pass"
+    return 0
+  fi
+  # Pull "until":"...". We tolerate either order in the JSON object.
+  until_str="$(printf -- '%s' "$raw" | sed -n 's/.*"until"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  reason_str="$(printf -- '%s' "$raw" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [ -z "$until_str" ]; then
+    # Unreadable state — treat as pass so an operator's typo cannot trap
+    # the whole fleet. The vacation command itself validates input shape.
+    FLEET_VACATION_VERDICT="pass"; export FLEET_VACATION_VERDICT
+    printf '%s\n' "pass"
+    return 0
+  fi
+
+  # Resolve "now" in UTC epoch seconds.
+  local now_epoch override
+  override="${FLEET_NOW_OVERRIDE:-}"
+  if [ -n "$override" ]; then
+    now_epoch="$(_fleet_iso_to_epoch "$override")"
+  fi
+  if [ -z "${now_epoch:-}" ]; then
+    now_epoch="$(date -u +%s 2>/dev/null || echo 0)"
+  fi
+
+  local until_epoch
+  until_epoch="$(_fleet_iso_to_epoch "$until_str")"
+  if [ -z "$until_epoch" ] || [ "$until_epoch" -eq 0 ]; then
+    FLEET_VACATION_VERDICT="pass"; export FLEET_VACATION_VERDICT
+    printf '%s\n' "pass"
+    return 0
+  fi
+
+  if [ "$now_epoch" -ge "$until_epoch" ]; then
+    # Window closed; the auto-resume plist will (or did) fire `--return`.
+    # Until then, don't suppress — pretend the file isn't there.
+    FLEET_VACATION_VERDICT="pass"; export FLEET_VACATION_VERDICT
+    printf '%s\n' "pass"
+    return 0
+  fi
+
+  # Inside the window: skip. First call in the process emits exactly
+  # one vacation_skip event; subsequent calls short-circuit through the
+  # guard (mirrors FLEET_QUIET_HOURS_EMITTED / FLEET_PROMPTS_DRIFT_EMITTED).
+  if [ -z "${FLEET_VACATION_SKIP_EMITTED:-}" ]; then
+    fleet_emit_event vacation_skip \
+      "until=$until_str" "reason=$reason_str" || true
+    FLEET_VACATION_SKIP_EMITTED=1
+    export FLEET_VACATION_SKIP_EMITTED
+  fi
+  FLEET_VACATION_VERDICT="skip"; export FLEET_VACATION_VERDICT
+  printf '%s\n' "skip"
+  return 0
+}
+
+# _fleet_iso_to_epoch — parse YYYY-MM-DDTHH:MM:SS[Z|+/-OFFSET] → UTC epoch
+# seconds. Pure shell + arithmetic so it works under BSD `date` (macOS) and
+# GNU `date` (Ubuntu) without branching. Offset, when present, is folded
+# into the result (subtracted as signed minutes). Echoes empty on parse
+# failure. Used by _fleet_check_vacation for both `now` and `until`.
+_fleet_iso_to_epoch() {
+  local raw="${1:-}"
+  [ -n "$raw" ] || { echo ""; return 0; }
+  # Allow the substring extraction to be byte-mode (LESSONS 2026-06-05);
+  # our format is ASCII so bash 3.2's locale caching is harmless here,
+  # but we guard with case patterns rather than ${#}/${s:i:1} arithmetic.
+  case "$raw" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*) ;;
+    *) echo ""; return 0 ;;
+  esac
+  local yr="${raw:0:4}" mo="${raw:5:2}" da="${raw:8:2}"
+  local hr="${raw:11:2}" mi="${raw:14:2}" se="${raw:17:2}"
+  local tail="${raw:19}"
+
+  # Day-of-year by month (non-leap), +1 for leap-year correction past Feb.
+  local mdays doy yr_n mo_n da_n hr_n mi_n se_n
+  yr_n="$((10#$yr))"; mo_n="$((10#$mo))"; da_n="$((10#$da))"
+  hr_n="$((10#$hr))"; mi_n="$((10#$mi))"; se_n="$((10#$se))"
+  mdays=(0 0 31 59 90 120 151 181 212 243 273 304 334)
+  doy="$(( ${mdays[$mo_n]} + da_n - 1 ))"
+  if [ "$mo_n" -gt 2 ]; then
+    if [ $(( yr_n % 4 )) -eq 0 ] && { [ $(( yr_n % 100 )) -ne 0 ] || [ $(( yr_n % 400 )) -eq 0 ]; }; then
+      doy=$(( doy + 1 ))
+    fi
+  fi
+  # Leap-days strictly BEFORE this year.
+  local leaps
+  leaps=$(( (yr_n - 1) / 4 - (yr_n - 1) / 100 + (yr_n - 1) / 400 - 477 ))
+  # 477 = (1969/4) - (1969/100) + (1969/400) — leap-days from year 0..1969.
+  local days_from_epoch epoch
+  days_from_epoch=$(( (yr_n - 1970) * 365 + leaps + doy ))
+  epoch=$(( days_from_epoch * 86400 + hr_n * 3600 + mi_n * 60 + se_n ))
+
+  # Fold a +/-HHMM or +/-HH:MM offset back to UTC. `Z` and empty are no-ops.
+  case "$tail" in
+    ""|Z) ;;
+    [+-][0-9][0-9][0-9][0-9])
+      local sign="${tail:0:1}" oh="${tail:1:2}" om="${tail:3:2}"
+      local off=$(( (10#$oh) * 3600 + (10#$om) * 60 ))
+      if [ "$sign" = "+" ]; then epoch=$(( epoch - off )); else epoch=$(( epoch + off )); fi
+      ;;
+    [+-][0-9][0-9]:[0-9][0-9])
+      local sign2="${tail:0:1}" oh2="${tail:1:2}" om2="${tail:4:2}"
+      local off2=$(( (10#$oh2) * 3600 + (10#$om2) * 60 ))
+      if [ "$sign2" = "+" ]; then epoch=$(( epoch - off2 )); else epoch=$(( epoch + off2 )); fi
+      ;;
+    *) ;;
+  esac
+  printf '%d' "$epoch"
+}
+
 # --- logging --------------------------------------------------------------
 # $1 = phase (ship/groom/review/eng). Redirects all output to a timestamped log.
 fleet_log_init() {

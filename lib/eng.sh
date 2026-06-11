@@ -18,6 +18,16 @@ fleet_emit_event run_started "pid=$$" || true
 fleet_self_cancel || exit 0
 fleet_check_budget || exit 0
 
+# Ticket 0046 — operator-declared fleet-wide PTO suspension. See
+# lib/common.sh § vacation PTO mode and lib/ship.sh for the contract.
+# Called WITHOUT command substitution so the emit + guard land in this
+# shell (LESSONS 2026-06-05). skip IS the no-op path.
+_fleet_check_vacation >/dev/null
+if [ "${FLEET_VACATION_VERDICT:-pass}" = "skip" ]; then
+  echo "vacation active — $FLEET_PHASE no-op until the operator returns (fleet vacation --status)"
+  exit 0
+fi
+
 # Ticket 0033 — operator-declared local-time quiet hours. See lib/common.sh
 # § quiet hours and lib/ship.sh for the contract. The helper owns the emit
 # + guard; the runner just reads $FLEET_QUIET_HOURS_VERDICT (set by the

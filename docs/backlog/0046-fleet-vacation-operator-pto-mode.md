@@ -1,7 +1,7 @@
 ---
 id: 0046
 title: fleet vacation suspends ship/eng work during operator PTO and prints a return briefing
-status: groomed
+status: shipped
 priority: P2
 area: governance
 created: 2026-06-11
@@ -531,3 +531,5 @@ doesn't have to re-discover the architecture.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-11 — ticket filed by gtm-innovation
+- 2026-06-11 — implementation-dev: started on feat/0046-fleet-vacation-pto-mode. Plan: write `tests/vacation.sh` first (12 ACs), then add `vacation()` dispatcher + six helpers in `bin/fleet` above the dispatcher, `_fleet_check_vacation` in `lib/common.sh`, PHASE 0 hooks in `lib/ship.sh` + `lib/eng.sh`, AGENTS.md telemetry entries for `vacation_skip` and `vacation_returned`, README "Daily ops" line, and `bin/fleet` help banner line.
+- 2026-06-11 — implementation-dev: shipped. Local gate green (shellcheck, bash -n, check-backlog, vacation.sh 12/12 ACs, quiet-hours.sh regression-free). Self-check hits are pre-existing on main (not from this PR). PR body carries `Reinstall: all projects` per LESSONS 2026-05-25.
