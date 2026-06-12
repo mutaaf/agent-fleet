@@ -61,6 +61,9 @@
 #   fleet prompts-suggest     propose PRINCIPLES.md additions from recurring send-back drafts
 #                             (ticket 0045 — fleet-wide reader of lesson_draft_emitted;
 #                              --since Nd|YYYY-MM-DD default 30d, --threshold N default 3, --json)
+#   fleet ticket-cost <id>    attribute every $ spent shipping one ticket
+#                             (ticket 0047 — pure reader of runs.jsonl + pr_opened events;
+#                              --slug, --since Nd|YYYY-MM-DD default 30d, --json)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -4133,6 +4136,624 @@ USAGE
 
 if [ "$CMD" = "weekly" ]; then
   weekly "$@"
+fi
+
+# --- ticket-cost (ticket 0047) ------------------------------------------
+# `fleet ticket-cost <id> [--slug <name>] [--since <Nd|YYYY-MM-DD>] [--json]`
+# attributes every $ in runs.jsonl to the ticket it shipped. Two filters
+# compose:
+#   (a) runs.jsonl row's result_head substring contains the zero-padded id
+#   (b) row cites a PR number AND pr_opened in the same slug's events.jsonl
+#       carries branch matching `^(feat|chore/gtm-|eng|revert)/<id>-`
+#
+# All helpers + dispatcher placed ABOVE the inline `if` block per LESSONS
+# 2026-06-05 (forward-reference trap). Every printf of an input that may
+# start with `-` uses `printf -- '%s'` per LESSONS 2026-05-28. Every count
+# uses `awk … END { print n+0 }` per LESSONS 2026-06-01. Every awk
+# accumulator declares `BEGIN { count = 0 }` per LESSONS 2026-06-08. Every
+# `IFS=$'\t' read` uses sentinel `-` for empty middle fields per LESSONS
+# 2026-06-08. JSON escape goes through `preflight_json_escape` per LESSONS
+# 2026-06-03. Help-text greps in the test use `grep -qF --` per LESSONS
+# 2026-05-30. Pure reader — no fleet_emit_event calls, no events.jsonl
+# writes, no `lib/` or `prompts/` edits.
+
+# Normalize raw id input to the canonical 4-digit zero-padded form. Accepts
+# `42`, `0042`, `#0042`, `#42`. Returns the zero-padded id on stdout. Per
+# LESSONS 2026-05-28, every printf goes through `printf -- '%s'`.
+ticket_cost_normalize_id() {
+  local raw="${1-}"
+  # Strip a single leading '#' if present.
+  case "$raw" in
+    '#'*) raw="${raw#\#}" ;;
+  esac
+  # Require a positive-integer-looking value.
+  case "$raw" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  # printf -- '%s' guards against a leading-dash future; zero-pad to 4.
+  printf -- '%04d' "$((10#$raw))"
+}
+
+# Discover every project slug under FLEET_DISCOVERY_ROOT and the installed
+# tree. Same shape as weekly_discover / overview_discover; emits one
+# `slug<TAB>manifest` per line. Reused by the dispatcher's default-walk path
+# and the disambiguation branch.
+ticket_cost_discover_slugs() {
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  local _seen="" m slug
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf -- '%s\t%s\n' "$slug" "$m"
+  done | sort -t $'\t' -k1,1
+}
+
+# Walk one slug's runs.jsonl and apply the attribution filter for ticket
+# `<id>`. Emits one TSV record per attributable row:
+#
+#   ts_start<TAB>phase<TAB>cost<TAB>duration_ms<TAB>result_head<TAB>is_heal<TAB>pr_number
+#
+# `is_heal` is 1 when result_head starts with `HEAL`, 0 otherwise. Empty
+# middle fields use sentinel `-` per LESSONS 2026-06-08. The optional
+# events.jsonl arg lets the awk script bring the pr_opened branch map in
+# via `getline … < file` so the filter can promote a row that cites
+# `PR #<n>` whose `pr_opened` event has a branch starting with the
+# ticket's prefix.
+#
+# Per LESSONS 2026-06-08 the awk BEGIN block declares `count = 0` so
+# accumulator arrays index from 0 cleanly. Per LESSONS 2026-06-01 every
+# count uses END { print n+0 } (this helper is upstream of a count;
+# callers use that pattern downstream).
+ticket_cost_attribute_runs_for_slug() {
+  local runs="$1" events="$2" id="$3" cutoff="$4"
+  [ -f "$runs" ] || return 0
+  # Pre-compute the cutoff as an ISO8601 string so awk can string-compare
+  # ts_start lexicographically (ISO sorts correctly) — sidesteps the
+  # per-row `date -j -f` subshell that dominated the test runtime budget.
+  # date -u -r is BSD-only; the GNU fallback uses -d "@<epoch>". Both
+  # produce a deterministic UTC string with a trailing Z — no operator-
+  # supplied YYYY-MM-DD goes through this branch, so the BSD "fill missing
+  # time with NOW-of-day" trap from LESSONS 2026-06-11 does not apply.
+  local cutoff_iso
+  cutoff_iso="$(date -u -r "$cutoff" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                 || date -u -d "@$cutoff" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                 || echo "1970-01-01T00:00:00Z")"
+  # Build the per-slug PR→branch map in a tmp file so awk can `getline`
+  # it without bash variables that might contain newlines (LESSONS
+  # 2026-06-01 awk -v multiline trap).
+  local pr_map_file=""
+  if [ -f "$events" ]; then
+    pr_map_file="$(mktemp -t fleet-ticket-cost-prmap.XXXXXX)"
+    # Extract `pr_opened` events as `number<TAB>branch` lines.
+    awk '
+      BEGIN { count = 0 }
+      /"type"[[:space:]]*:[[:space:]]*"pr_opened"/ {
+        num=""; branch=""
+        if (match($0, /"number"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          num=substr($0, RSTART, RLENGTH)
+          sub(/.*"number"[[:space:]]*:[[:space:]]*"/, "", num); sub(/".*/, "", num)
+        }
+        if (match($0, /"branch"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          branch=substr($0, RSTART, RLENGTH)
+          sub(/.*"branch"[[:space:]]*:[[:space:]]*"/, "", branch); sub(/".*/, "", branch)
+        }
+        if (num != "" && branch != "") {
+          printf("%s\t%s\n", num, branch)
+          count++
+        }
+      }
+    ' "$events" > "$pr_map_file"
+  fi
+
+  awk -v id="$id" -v cutoff_iso="$cutoff_iso" -v pr_map_file="$pr_map_file" '
+    BEGIN {
+      count = 0
+      # Load the pr_map_file into pr_branch[number] = branch.
+      if (pr_map_file != "") {
+        while ((getline line < pr_map_file) > 0) {
+          n = index(line, "\t")
+          if (n > 0) {
+            key = substr(line, 1, n-1)
+            val = substr(line, n+1)
+            pr_branch[key] = val
+          }
+        }
+        close(pr_map_file)
+      }
+    }
+    function extract_pr_number(head,    s, m) {
+      # Look for "PR #<n>" or "#<n>" or "pr=#<n>" / "pr=<n>".
+      s = head
+      if (match(s, /PR #[0-9]+/)) {
+        m = substr(s, RSTART, RLENGTH); sub(/PR #/, "", m); return m
+      }
+      if (match(s, /pr=#?[0-9]+/)) {
+        m = substr(s, RSTART, RLENGTH); sub(/pr=#?/, "", m); return m
+      }
+      if (match(s, /#[0-9]+/)) {
+        m = substr(s, RSTART, RLENGTH); sub(/#/, "", m); return m
+      }
+      return ""
+    }
+    function branch_matches_id(branch, ticket,    pat) {
+      # ^(feat|chore/gtm-|eng|revert)/<ticket>-
+      pat = "^(feat|chore/gtm-|eng|revert)/" ticket "-"
+      return match(branch, pat) ? 1 : 0
+    }
+    {
+      ts=""; head=""; cost=0; dur=0; phase=""
+      if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"result_head"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        head=substr($0, RSTART, RLENGTH)
+        sub(/.*"result_head"[[:space:]]*:[[:space:]]*"/, "", head); sub(/".*/, "", head)
+      }
+      if (match($0, /"phase"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        phase=substr($0, RSTART, RLENGTH)
+        sub(/.*"phase"[[:space:]]*:[[:space:]]*"/, "", phase); sub(/".*/, "", phase)
+      }
+      if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        c=substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", c)
+        cost = c + 0
+      }
+      if (match($0, /"duration_ms"[[:space:]]*:[[:space:]]*[0-9]+/)) {
+        d=substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", d)
+        dur = d + 0
+      }
+      if (ts == "") next
+      # Normalize ts for string comparison: ensure it ends in Z and strip
+      # sub-second fractions. ISO8601 sorts lexicographically.
+      norm_ts = ts
+      sub(/\.[0-9]+Z$/, "Z", norm_ts)
+      if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+      if (norm_ts < cutoff_iso) next
+
+      # Filter (a): substring match.
+      hit_substring = (index(head, id) > 0) ? 1 : 0
+
+      # Filter (b): PR-branch correlation.
+      hit_branch = 0
+      pr_num = extract_pr_number(head)
+      if (pr_num != "" && (pr_num in pr_branch)) {
+        if (branch_matches_id(pr_branch[pr_num], id)) hit_branch = 1
+      }
+
+      if (!hit_substring && !hit_branch) next
+
+      # Heal flag.
+      is_heal = (substr(head, 1, 4) == "HEAL") ? 1 : 0
+
+      # Sentinels for empty middle fields (LESSONS 2026-06-08).
+      out_phase = (phase == "") ? "-" : phase
+      out_head  = (head  == "") ? "-" : head
+      out_pr    = (pr_num == "") ? "-" : pr_num
+
+      printf("%s\t%s\t%.4f\t%d\t%s\t%d\t%s\n", \
+        ts, out_phase, cost, dur, out_head, is_heal, out_pr)
+      count++
+    }
+    END { }
+  ' "$runs"
+
+  [ -n "$pr_map_file" ] && rm -f "$pr_map_file"
+}
+
+# Compute the per-slug median ticket cost over the trailing `<cutoff>`
+# window. The median is the middle value of per-ticket sums for every
+# 4-digit id that has at least one attributable run in the window.
+# Echoes `0.00` when the per-ticket set is empty.
+#
+# Per LESSONS 2026-06-08, the awk BEGIN block declares `n = 0` so the
+# first sum doesn't land under sums[""].
+ticket_cost_median_for_slug() {
+  local runs="$1" cutoff="$2"
+  [ -f "$runs" ] || { echo "0.00"; return 0; }
+  local cutoff_iso
+  cutoff_iso="$(date -u -r "$cutoff" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                 || date -u -d "@$cutoff" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                 || echo "1970-01-01T00:00:00Z")"
+  awk -v cutoff_iso="$cutoff_iso" '
+    BEGIN { n = 0 }
+    {
+      ts=""; head=""; cost=0
+      if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"result_head"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        head=substr($0, RSTART, RLENGTH)
+        sub(/.*"result_head"[[:space:]]*:[[:space:]]*"/, "", head); sub(/".*/, "", head)
+      }
+      if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        c=substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", c)
+        cost = c + 0
+      }
+      if (ts == "" || head == "") next
+      norm_ts = ts
+      sub(/\.[0-9]+Z$/, "Z", norm_ts)
+      if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+      if (norm_ts < cutoff_iso) next
+      # Find every 4-digit id occurrence in head; attribute the cost to
+      # each (so a row whose head cites "0042" once contributes its
+      # cost to 0042).
+      s = head
+      seen = ""
+      while (match(s, /[0-9][0-9][0-9][0-9]/)) {
+        id = substr(s, RSTART, RLENGTH)
+        # Dedup within this row so a single cost is not double-counted
+        # against the same id.
+        if (index(seen, "<" id ">") == 0) {
+          if (!(id in sums)) {
+            sums[id] = 0
+            n++
+          }
+          sums[id] = sums[id] + cost
+          seen = seen "<" id ">"
+        }
+        s = substr(s, RSTART + RLENGTH)
+      }
+    }
+    END {
+      if (n == 0) { printf("%.2f\n", 0); exit }
+      # Pack sums into an array we can sort.
+      k = 0
+      for (id in sums) { arr[k] = sums[id] + 0; k++ }
+      # Simple insertion sort — n is tiny (number of distinct tickets).
+      for (i=1; i<k; i++) {
+        v = arr[i]; j = i - 1
+        while (j >= 0 && arr[j] > v) { arr[j+1] = arr[j]; j-- }
+        arr[j+1] = v
+      }
+      if (k % 2 == 1) {
+        printf("%.4f\n", arr[int(k/2)])
+      } else {
+        printf("%.4f\n", (arr[k/2 - 1] + arr[k/2]) / 2)
+      }
+    }
+  ' "$runs"
+}
+
+# Format a duration_ms value as "MmSSs" (e.g. 6m12s). Tiny helper, used by
+# both text and json renderers (the json renderer keeps the raw ms but
+# the text one prints the formatted shape).
+ticket_cost_format_duration() {
+  local ms="$1"
+  [ -z "$ms" ] && { echo "—"; return 0; }
+  case "$ms" in *[!0-9]*) echo "—"; return 0 ;; esac
+  local secs=$(( ms / 1000 ))
+  local m=$(( secs / 60 ))
+  local s=$(( secs % 60 ))
+  printf '%dm%02ds' "$m" "$s"
+}
+
+# Render the per-run table + summary line in text mode. Reads the TSV
+# record stream from ticket_cost_attribute_runs_for_slug on stdin.
+# Per LESSONS 2026-06-08 every IFS=$'\t' read maps the sentinel `-` back
+# to empty for the optional middle field (here: phase, result_head,
+# pr_number). Per LESSONS 2026-06-05 visible-width math goes through
+# `preflight_visible_width` when we need it (the table uses fixed-width
+# columns whose values stay ASCII so we keep it simple).
+ticket_cost_render_text() {
+  local id="$1" slug="$2" total="$3" run_count="$4" heal_count="$5"
+  local non_heal_count="$6" review_count="$7" median="$8" ratio_str="$9"
+  shift 9
+  local heal_cost="$1" ratio_value="$2" follow_up="$3"
+  # Print the rows (already streamed before this; here we render only the
+  # trailing summary block — caller streams rows in the loop).
+  printf -- '\nticket-cost: $%.2f across %d runs ' "$total" "$run_count"
+  printf -- '(%d ship + %d heals + %d review)\n' \
+    "$non_heal_count" "$heal_count" "$review_count"
+  printf -- '             vs median ticket cost in %s: $%.2f\n' "$slug" "$median"
+  printf -- '             ratio: %sx\n' "$ratio_str"
+  # Heal-share line when heal_cost / total >= 25%.
+  if [ "$run_count" -gt 0 ]; then
+    local heal_pct
+    heal_pct="$(awk -v hc="$heal_cost" -v t="$total" 'BEGIN { if (t > 0) printf("%d", (hc/t)*100 + 0.5); else print 0 }')"
+    if [ "$heal_pct" -ge 25 ]; then
+      printf -- '             heals account for %d%% of cost\n' "$heal_pct"
+    fi
+  fi
+  if [ -n "$follow_up" ]; then
+    printf -- '%s\n' "$follow_up"
+  fi
+  # Quiet the unused param so shellcheck does not warn — ratio_value reserved
+  # for a future render mode (e.g. colour thresholds in fleet-control).
+  : "$ratio_value" "$id"
+}
+
+# Render one JSON object per attributable run on stdin (the same TSV
+# record stream) plus a single summary line. Per LESSONS 2026-06-03 every
+# escaped string runs through `preflight_json_escape` (UTF-8 high-byte
+# sign-extension guard).
+ticket_cost_render_json() {
+  local id="$1" slug="$2" total="$3" run_count="$4" heal_count="$5"
+  local median="$6" ratio_value="$7"
+  local esc_slug esc_id
+  esc_slug="$(preflight_json_escape "$slug")"
+  esc_id="$(preflight_json_escape "$id")"
+  local ts phase cost dur head is_heal pr
+  while IFS=$'\t' read -r ts phase cost dur head is_heal pr; do
+    [ -z "$ts" ] && continue
+    # Map sentinels back to empty per LESSONS 2026-06-08.
+    [ "$phase" = "-" ] && phase=""
+    [ "$head"  = "-" ] && head=""
+    [ "$pr"    = "-" ] && pr=""
+    local esc_phase esc_head
+    esc_phase="$(preflight_json_escape "$phase")"
+    esc_head="$(preflight_json_escape "$head")"
+    local is_heal_json="false"
+    [ "$is_heal" = "1" ] && is_heal_json="true"
+    printf -- '{"slug":"%s","ts":"%s","phase":"%s","cost":%s,"duration_ms":%s,"result_head":"%s","is_heal":%s}\n' \
+      "$esc_slug" "$ts" "$esc_phase" "$cost" "$dur" "$esc_head" "$is_heal_json"
+    : "$pr"  # PR captured for the in-process tally; not in v1 schema.
+  done
+  # Summary object on its own line.
+  printf -- '{"summary":{"ticket":"%s","slug":"%s","total_cost":%.2f,"run_count":%d,"heal_count":%d,"median_30d":%.2f,"ratio":%.1f}}\n' \
+    "$esc_id" "$esc_slug" "$total" "$run_count" "$heal_count" "$median" "$ratio_value"
+}
+
+ticket_cost() {
+  shift  # drop the leading "ticket-cost"
+  local id_arg="" slug_filter="" since_raw="30d" want_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)     want_json=1; shift ;;
+      --slug)     slug_filter="${2:-}"; shift 2 ;;
+      --slug=*)   slug_filter="${1#--slug=}"; shift ;;
+      --since)    since_raw="${2:-}"; shift 2 ;;
+      --since=*)  since_raw="${1#--since=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet ticket-cost — attribute every $ spent shipping one ticket.
+
+Usage:
+  fleet ticket-cost <id>                     default --since 30d, all slugs
+  fleet ticket-cost <id> --slug NAME         restrict to one project
+  fleet ticket-cost <id> --since 7d          override window (Nd or YYYY-MM-DD)
+  fleet ticket-cost <id> --since 2026-05-01  walk from a specific UTC day
+  fleet ticket-cost <id> --json              one JSON object per run + summary
+
+Attribution filter (a row in runs.jsonl is attributable to <id> when):
+  (a) result_head field contains the zero-padded id substring, OR
+  (b) result_head cites PR #<n> AND that PR's pr_opened event in the same
+      slug's events.jsonl carries a branch matching
+      ^(feat|chore/gtm-|eng|revert)/<id>-
+
+Columns (text mode, one row per attributable run, chronological):
+  UTC-DATE TIME  PHASE  $COST  DURATION  RESULT_HEAD (first 80 chars)
+
+Summary line:
+  ticket-cost: $<sum> across <N> runs (<ship> ship + <heals> heals + <review>)
+               vs median ticket cost in <slug>: $<median>
+               ratio: <X.Y>x
+               heals account for <N>% of cost   (only when >= 25%)
+               (optional) → fleet prompts-suggest / fleet provenance hint
+
+Pure consumer of runs.jsonl + events.jsonl. No new event types, no
+fleet_* signature changes, no lib/ or prompts/ edits. Exit code: 0 on
+success (including the empty-window case), 2 on flag / arg errors.
+USAGE
+        exit 0 ;;
+      --*)
+        printf -- 'fleet ticket-cost: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$id_arg" ]; then id_arg="$1"; shift
+        else
+          printf -- 'fleet ticket-cost: unexpected positional %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$id_arg" ]; then
+    printf -- 'ticket-cost: usage: bin/fleet ticket-cost <id> [--slug <name>] [--since Nd] [--json]\n' >&2
+    exit 2
+  fi
+
+  local id
+  if ! id="$(ticket_cost_normalize_id "$id_arg")"; then
+    printf -- 'ticket-cost: invalid id %s (use NN, NNNN, or #NNNN)\n' "$id_arg" >&2
+    exit 2
+  fi
+
+  # Resolve cutoff via FLEET_NOW_OVERRIDE for deterministic tests.
+  local now cutoff
+  now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  local since_seconds
+  case "$since_raw" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+      # YYYY-MM-DD: pin the time to 00:00:00 UTC per LESSONS 2026-06-11
+      # (BSD `date -j -f` fills missing time with NOW-of-day).
+      local target_epoch
+      target_epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "${since_raw}T00:00:00" '+%s' 2>/dev/null \
+                       || date -u -d "${since_raw}T00:00:00Z" +%s 2>/dev/null \
+                       || echo "")"
+      if [ -z "$target_epoch" ]; then
+        printf -- 'ticket-cost: invalid --since "%s" (YYYY-MM-DD or Nd)\n' "$since_raw" >&2
+        exit 2
+      fi
+      since_seconds=$(( now - target_epoch ))
+      [ "$since_seconds" -lt 0 ] && since_seconds=0
+      ;;
+    *d)
+      local n="${since_raw%d}"
+      case "$n" in
+        ''|*[!0-9]*)
+          printf -- 'ticket-cost: invalid --since "%s" (YYYY-MM-DD or Nd)\n' "$since_raw" >&2
+          exit 2 ;;
+      esac
+      since_seconds=$(( n * 86400 ))
+      ;;
+    *)
+      printf -- 'ticket-cost: invalid --since "%s" (YYYY-MM-DD or Nd)\n' "$since_raw" >&2
+      exit 2 ;;
+  esac
+  cutoff=$(( now - since_seconds ))
+
+  # First pass when no --slug filter: scan every project and find which
+  # slugs have at least one attributable row. Multi-slug → disambiguation
+  # table; single-slug → continue with that slug.
+  local resolved_slug="" resolved_manifest=""
+  if [ -z "$slug_filter" ]; then
+    local hits_file
+    hits_file="$(mktemp -t fleet-ticket-cost-hits.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -f '$hits_file'" RETURN
+    local slug manifest
+    while IFS=$'\t' read -r slug manifest; do
+      [ -z "$slug" ] && continue
+      local cache="$HOME/.cache/${slug}-agent"
+      local runs="$cache/runs.jsonl"
+      local events="$cache/events.jsonl"
+      [ -f "$runs" ] || continue
+      local rows
+      rows="$(ticket_cost_attribute_runs_for_slug "$runs" "$events" "$id" "$cutoff" \
+              | awk 'BEGIN { count = 0 } { count++ } END { print count+0 }')"
+      if [ "$rows" -gt 0 ]; then
+        printf -- '%s\t%s\t%s\n' "$slug" "$manifest" "$rows" >> "$hits_file"
+      fi
+    done < <(ticket_cost_discover_slugs)
+
+    local hit_count
+    hit_count=$(awk 'BEGIN { count = 0 } { count++ } END { print count+0 }' "$hits_file")
+    if [ "$hit_count" = "0" ]; then
+      printf -- 'ticket-cost: ticket %s has no attributable runs in %s. Either it hasn'\''t shipped yet, or runs.jsonl was rotated out (see `events.jsonl.archive/`).\n' \
+        "$id" "$since_raw"
+      exit 0
+    fi
+    if [ "$hit_count" -gt 1 ]; then
+      printf -- 'ticket-cost: ticket %s appears in %d projects:\n' "$id" "$hit_count"
+      while IFS=$'\t' read -r slug manifest rows; do
+        [ -z "$slug" ] && continue
+        printf -- '  %s (%s runs) — use `fleet ticket-cost %s --slug %s` to drill in\n' \
+          "$slug" "$rows" "$id" "$slug"
+        : "$manifest"
+      done < "$hits_file"
+      exit 0
+    fi
+    # Exactly one slug — use it.
+    resolved_slug="$(awk -F'\t' 'NR==1 { print $1 }' "$hits_file")"
+    resolved_manifest="$(awk -F'\t' 'NR==1 { print $2 }' "$hits_file")"
+  else
+    resolved_slug="$slug_filter"
+    # Resolve manifest for the slug (best-effort; not strictly needed).
+    while IFS=$'\t' read -r slug manifest; do
+      if [ "$slug" = "$slug_filter" ]; then
+        resolved_manifest="$manifest"
+        break
+      fi
+    done < <(ticket_cost_discover_slugs)
+  fi
+
+  local cache="$HOME/.cache/${resolved_slug}-agent"
+  local runs="$cache/runs.jsonl"
+  local events="$cache/events.jsonl"
+
+  # Collect attributable rows for the resolved slug.
+  local rows_file
+  rows_file="$(mktemp -t fleet-ticket-cost-rows.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$rows_file' '${resolved_manifest:-/dev/null}'" RETURN 2>/dev/null || true
+  ticket_cost_attribute_runs_for_slug "$runs" "$events" "$id" "$cutoff" \
+    | sort -t $'\t' -k1,1 > "$rows_file"
+
+  local row_count
+  row_count=$(awk 'BEGIN { count = 0 } { count++ } END { print count+0 }' "$rows_file")
+  if [ "$row_count" = "0" ]; then
+    printf -- 'ticket-cost: ticket %s has no attributable runs in %s. Either it hasn'\''t shipped yet, or runs.jsonl was rotated out (see `events.jsonl.archive/`).\n' \
+      "$id" "$since_raw"
+    rm -f "$rows_file"
+    exit 0
+  fi
+
+  # Aggregates.
+  local total heal_count heal_cost review_count ship_count non_heal_count
+  total="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $3; count++ } END { printf("%.4f", s+0) }' "$rows_file")"
+  heal_count="$(awk -F'\t' 'BEGIN { count = 0 } $6 == 1 { count++ } END { print count+0 }' "$rows_file")"
+  heal_cost="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } $6 == 1 { s += $3; count++ } END { printf("%.4f", s+0) }' "$rows_file")"
+  review_count="$(awk -F'\t' 'BEGIN { count = 0 } $2 == "review" { count++ } END { print count+0 }' "$rows_file")"
+  ship_count="$(awk -F'\t' 'BEGIN { count = 0 } $2 == "ship" { count++ } END { print count+0 }' "$rows_file")"
+  # Non-heal SHIP count = ship_count - heal_count.
+  non_heal_count=$(( ship_count - heal_count ))
+  [ "$non_heal_count" -lt 0 ] && non_heal_count=0
+
+  # Per-slug median across the window.
+  local median ratio_value ratio_str
+  median="$(ticket_cost_median_for_slug "$runs" "$cutoff")"
+  ratio_value="$(awk -v t="$total" -v m="$median" 'BEGIN { if (m > 0) printf("%.1f", t / m); else printf("0.0") }')"
+  ratio_str="$ratio_value"
+
+  # Outlier follow-up suggestion (AC#6). When ratio > 2.0x:
+  #   - if heal share >= 25%, suggest `fleet prompts-suggest`
+  #   - else suggest `fleet provenance <pr>` for the single biggest row
+  local follow_up=""
+  local ratio_gt2
+  ratio_gt2="$(awk -v r="$ratio_value" 'BEGIN { print (r > 2.0) ? 1 : 0 }')"
+  if [ "$ratio_gt2" = "1" ]; then
+    local heal_share_pct
+    heal_share_pct="$(awk -v hc="$heal_cost" -v t="$total" 'BEGIN { if (t > 0) printf("%d", (hc/t)*100 + 0.5); else print 0 }')"
+    if [ "$heal_share_pct" -ge 25 ]; then
+      follow_up="             → fleet prompts-suggest --since 30d  (recurring heal cluster)"
+    else
+      # Find the row with the largest cost; emit its pr_number if any.
+      local big_pr
+      big_pr="$(awk -F'\t' 'BEGIN { max = -1; pr = "-" } $3 + 0 > max { max = $3 + 0; pr = $7 } END { print pr }' "$rows_file")"
+      if [ "$big_pr" != "-" ] && [ -n "$big_pr" ]; then
+        follow_up="             → fleet provenance $resolved_slug $big_pr  (single high-cost run)"
+      else
+        follow_up="             → fleet provenance $resolved_slug <pr>  (single high-cost run)"
+      fi
+    fi
+  fi
+
+  if [ "$want_json" = "1" ]; then
+    ticket_cost_render_json "$id" "$resolved_slug" "$total" "$row_count" \
+      "$heal_count" "$median" "$ratio_value" < "$rows_file"
+    rm -f "$rows_file"
+    exit 0
+  fi
+
+  # Text mode: stream per-run rows first.
+  printf -- 'ticket %s — attribution in %s (window %s)\n\n' \
+    "$id" "$resolved_slug" "$since_raw"
+  local ts phase cost dur head is_heal pr
+  while IFS=$'\t' read -r ts phase cost dur head is_heal pr; do
+    [ -z "$ts" ] && continue
+    [ "$phase" = "-" ] && phase=""
+    [ "$head"  = "-" ] && head=""
+    [ "$pr"    = "-" ] && pr=""
+    : "$is_heal" "$pr"
+    # ts is ISO8601 — split into date + time for readability.
+    local date_part="${ts%%T*}" time_part
+    time_part="${ts#*T}"; time_part="${time_part%Z}"
+    local head80="${head:0:80}"
+    local dur_fmt
+    dur_fmt="$(ticket_cost_format_duration "$dur")"
+    printf -- '  %s %s  %-6s  $%5.2f  %-7s  %s\n' \
+      "$date_part" "$time_part" "$phase" "$cost" "$dur_fmt" "$head80"
+  done < "$rows_file"
+
+  ticket_cost_render_text "$id" "$resolved_slug" "$total" "$row_count" \
+    "$heal_count" "$non_heal_count" "$review_count" "$median" "$ratio_str" \
+    "$heal_cost" "$ratio_value" "$follow_up"
+
+  rm -f "$rows_file"
+  exit 0
+}
+
+if [ "$CMD" = "ticket-cost" ]; then
+  ticket_cost "$@"
+  exit $?
 fi
 
 # --- badge (ticket 0027) -------------------------------------------------
