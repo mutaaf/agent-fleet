@@ -1,7 +1,7 @@
 ---
 id: 0047
 title: fleet ticket-cost <id> attributes every dollar spent shipping one ticket
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-11
@@ -454,3 +454,4 @@ doesn't have to re-discover the architecture.
 
 - 2026-06-11 — ticket filed by gtm-innovation
 - 2026-06-11 — picked by implementation-dev on feat/0047-ticket-cost; tests-first then dispatcher + 6 helpers above the inline `if` block (LESSONS 2026-06-05 forward-reference trap).
+- 2026-06-11 — shipped via PR #97 (auto-merged after shellcheck+validate green). Cutoff comparison switched from per-row `date -j -f` subshell to ISO8601 lex-compare in awk so tests/ticket-cost.sh hits its <8s budget on macOS bash 3.2.

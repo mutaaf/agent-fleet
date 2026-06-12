@@ -65,4 +65,4 @@ ones, `review` grades them.
 | 0044 | fleet pr-footer posts a per-merge ROI comment on every agent-shipped PR | P1 | shipped | observability |
 | 0045 | fleet prompts-suggest proposes PRINCIPLES.md additions from recurring lesson_draft clusters | P1 | shipped | governance |
 | 0046 | fleet vacation suspends ship/eng work during operator PTO and prints a return briefing | P2 | shipped | governance |
-| 0047 | fleet ticket-cost <id> attributes every dollar spent shipping one ticket | P2 | in-progress | observability |
+| 0047 | fleet ticket-cost <id> attributes every dollar spent shipping one ticket | P2 | shipped | observability |
