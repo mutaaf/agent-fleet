@@ -1,7 +1,7 @@
 ---
 id: 0047
 title: fleet ticket-cost <id> attributes every dollar spent shipping one ticket
-status: proposed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-11
@@ -453,3 +453,4 @@ doesn't have to re-discover the architecture.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-11 — ticket filed by gtm-innovation
+- 2026-06-11 — picked by implementation-dev on feat/0047-ticket-cost; tests-first then dispatcher + 6 helpers above the inline `if` block (LESSONS 2026-06-05 forward-reference trap).
