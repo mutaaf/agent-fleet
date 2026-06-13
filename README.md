@@ -472,6 +472,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet lessons-prune --dry-run                           # list expired LESSONS entries; --commit --cause "<text>" moves them to LESSONS-ARCHIVE.md (ticket 0039)
 ~/code/agent-fleet/bin/fleet self-check                                        # run the LESSONS-derived static linter against the kit's own shell (ticket 0040 — 12 patterns; --list/--pattern/--json; FLEET_SELF_CHECK_GATE=1 in local gate)
 ~/code/agent-fleet/bin/fleet streak                                            # current + longest continuous green-day run per project (ticket 0042 — pure reader of events.jsonl; --since Nd|YYYY-MM-DD default 90d, --slug, --json)
+~/code/agent-fleet/bin/fleet milestone                                         # celebrate streak crossings and frame recoveries (ticket 0049 — pure reader; --since Nd|YYYY-MM-DD default 90d, --slug, --json; MILESTONE_THRESHOLDS + MILESTONE_BREAK_FLOOR knobs)
 ~/code/agent-fleet/bin/fleet ticket-cost 0042                                  # attribute every $ spent shipping one ticket (ticket 0047 — pure reader of runs.jsonl + pr_opened; --slug, --since Nd|YYYY-MM-DD default 30d, --json)
 ~/code/agent-fleet/bin/fleet recap --since 30d --public                         # shareable narrative snapshot of the last N days (ticket 0048 — pure reader; --since Nd|YYYY-MM-DD default 30d, --public anonymizes slugs, --json)
 ```
