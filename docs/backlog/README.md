@@ -68,5 +68,5 @@ ones, `review` grades them.
 | 0047 | fleet ticket-cost <id> attributes every dollar spent shipping one ticket | P2 | shipped | observability |
 | 0048 | fleet recap composes a screenshot-ready narrative snapshot of the last N days | P1 | shipped | observability |
 | 0049 | fleet milestone celebrates streak milestones and composes a one-line recovery nudge on streak break | P1 | shipped | observability |
-| 0050 | fleet tour walks a new operator through their first events.jsonl annotated by PRINCIPLES | P2 | in-progress | docs |
+| 0050 | fleet tour walks a new operator through their first events.jsonl annotated by PRINCIPLES | P2 | shipped | docs |
 | 0051 | fleet skill-gap <slug> diffs a project's PHASE 0 reads against the fleet-wide CROSS_LESSONS coverage | P2 | groomed | governance |
