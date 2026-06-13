@@ -437,3 +437,35 @@ gets passed to `date -j -f` MUST be normalized to a full
 format string must list every field. Same rule applies to
 `%Y-%m-%dT%H:%M` (missing seconds) and `%Y` (missing month/day) —
 anywhere BSD date has to invent a value, it invents NOW-of-day.
+
+## 2026-06-13 — a `*_json_escape`-suffixed wrapper around `preflight_json_escape` trips `fleet self-check` even when the body is just a delegation
+
+While shipping ticket 0048's `recap`, the first cut added a tiny
+`recap_json_escape() { preflight_json_escape "$1"; }` wrapper around
+the canonical JSON escaper so the recap helpers could call a
+locally-named function alongside its sibling `recap_*` family.
+`bin/fleet self-check`'s `json-escape-sign-extension` pattern walks
+every function matching `^[a-z_][a-z_0-9]*_json_escape\(\)` and
+flags those whose BODY does NOT contain the `code -ge 0` UTF-8
+sign-extension guard from LESSONS 2026-06-03. The linter explicitly
+excludes the canonical `_json_escape` name (no alpha prefix) but
+has no notion of "this body is a passthrough wrapper around a
+guarded helper" — so `recap_json_escape` trips the rule despite
+delegating to a function that does carry the guard. Symptom:
+`FLEET_SELF_CHECK_GATE=1 bin/fleet self-check` jumped from 3 hits
+(the on-main baseline) to 4 hits on the feature branch, and the
+local-gate composition `… && … && … && bin/fleet self-check`
+failed at the gate step. Fix: drop the wrapper entirely and call
+`preflight_json_escape` directly at each site. The wrapper bought
+nothing — the canonical name is already short, no other recap
+helper depends on the indirection. Cheap defensive habit: any
+NEW shell helper that needs JSON escaping in this kit MUST call
+`preflight_json_escape` directly (or `provenance_json_escape` /
+the local-inlined copy when the dispatcher forward-reference rule
+forces an inline duplicate, per LESSONS 2026-06-05). NEVER add a
+`<prefix>_json_escape() { canonical_helper "$@"; }` wrapper — the
+self-check pattern cannot see through the call and will flag every
+such wrapper as a regression. If a project really needs a
+prefixed name for stylistic consistency, the body must duplicate
+the guarded escape loop verbatim (then carry its own LESSONS
+2026-06-03 reference).
