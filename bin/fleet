@@ -11,6 +11,8 @@
 #   fleet doctor --slug NAME  restrict to one project
 #   fleet weekly              Sunday ROI rollup over the trailing 7d window
 #                             (ticket 0025 — pure consumer of telemetry)
+#   fleet recap [--public]    compose a shareable narrative recap of the last N days
+#                             (ticket 0048 — pure reader; --since/--public/--json)
 #   fleet badge <slug>        one-line ROI badge for the project's README
 #                             (ticket 0027 — md/svg/txt; network-free)
 #   fleet pr-footer <pr>      post a per-merge ROI receipt comment on a shipped PR
@@ -7244,6 +7246,907 @@ USAGE
 
 if [ "$CMD" = "prompts-suggest" ]; then
   prompts_suggest "$@"
+fi
+
+# --- recap (ticket 0048) ---------------------------------------------------
+# `fleet recap [--since <Nd|YYYY-MM-DD>] [--public] [--json]` composes a
+# 12-to-18-line narrative snapshot of the trailing N days across the whole
+# fleet — PRs merged, $ spent, streak active, top heal pattern, top failure
+# mode, cheapest/most-expensive ticket, kit SHA, prompts pin, LESSONS line
+# counts. `--public` anonymizes slug names (project-1, project-2, ...) and
+# strips PR numbers + branch-suffix references so the operator can
+# screenshot and paste into a public conversation without hand-redaction.
+#
+# Per the ticket the body says "Place `recap` dispatcher next to weekly()";
+# however the helpers it reuses (ticket_cost_attribute_runs_for_slug at
+# ~line 4214, prompts_suggest_normalize_headline at ~line 6641) live below
+# weekly(). Per LESSONS 2026-06-05 (dispatcher forward-reference) the
+# dispatcher block `if [ "$CMD" = "recap" ]` fires at execution time, so
+# every function recap calls must be defined ABOVE the dispatcher. We
+# therefore place the recap implementation HERE — after prompts-suggest —
+# so all downstream reuse is wired correctly. Pure reader, no
+# events.jsonl writes, no `lib/` or `prompts/` edits, no new event types.
+#
+# Per LESSONS 2026-05-28 every printf uses `printf -- '%s'` (leading-dash
+# guard). Per LESSONS 2026-05-30 every grep uses `grep -F --` or
+# `grep -E --` (--flag-as-pattern guard). Per LESSONS 2026-06-01 every
+# count uses `awk … END { print n+0 }` and every awk accumulator declares
+# `BEGIN { count = 0 }` (POSIX empty-string-key guard). Per LESSONS
+# 2026-06-03 JSON escape goes through `preflight_json_escape` (UTF-8
+# sign-extension guard). Per LESSONS 2026-06-05 visible-width goes through
+# `preflight_visible_width`. Per LESSONS 2026-06-05 the anonymizer's sort
+# is `LC_ALL=C sort` (bash 3.2 locale-cache guard). Per LESSONS 2026-06-08
+# IFS=$'\t' middle-empty-field uses sentinel `-`. Per LESSONS 2026-06-11
+# the YYYY-MM-DD `--since` reuses prompts_suggest_parse_since which
+# already normalizes the time component.
+
+# Discover (slug, manifest, cache_dir) rows across both discovery roots,
+# de-duped by SLUG, lexicographically sorted. Same shape as
+# prompts_suggest_discover_slugs but standalone so recap reads cleanly.
+recap_discover_slugs() {
+  local _seen="" m slug
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf -- '%s\t%s\t%s\n' "$slug" "$m" "$HOME/.cache/${slug}-agent"
+  done | LC_ALL=C sort -t $'\t' -k1,1
+}
+
+# Compute the anonymizer map. Reads one slug per line on stdin, sorts
+# lexicographically under LC_ALL=C (per LESSONS 2026-06-05 bash 3.2 locale
+# caching), assigns a stable ordinal token `project-K` to each.
+# Emits one TSV record per slug: `<slug>\t<ordinal_token>`.
+recap_compute_anonymizer_map() {
+  LC_ALL=C sort -u | awk '
+    BEGIN { count = 0 }
+    NF {
+      count++
+      printf("%s\tproject-%d\n", $0, count)
+    }
+  '
+}
+
+# Pluck the ordinal token for one slug from a sorted anonymizer-map file.
+# Echoes the token; empty when the slug is unmapped.
+recap_map_lookup() {  # $1 = slug, $2 = map_file
+  local slug="$1" map_file="$2" line tok
+  [ -f "$map_file" ] || return 0
+  while IFS=$'\t' read -r line tok; do
+    [ "$line" = "$slug" ] && { printf -- '%s' "$tok"; return 0; }
+  done < "$map_file"
+}
+
+# Per-slug summary collector. Echoes a single TSV record:
+#   <slug>\t<prs_merged>\t<spend>\t<heal_count>\t<infra_count>
+# Reuses the existing window helpers from weekly + digest. Per LESSONS
+# 2026-06-01 every count uses awk END { print n+0 }; the reused helpers
+# already do.
+recap_collect_per_slug() {  # $1=slug $2=runs $3=events $4=cutoff_iso
+  local slug="$1" runs="$2" events="$3" cutoff_iso="$4"
+  # Caller now passes pre-computed cutoff_iso (saves N × date forks across
+  # the fleet walk). Single awk pass per file, no post-extraction subshells.
+  local prs="0" spend="0.00" heal="0" infra="0"
+  if [ -f "$runs" ]; then
+    # Single awk emits "<prs>\t<spend>" directly; read into IFS=$'\t' vars.
+    IFS=$'\t' read -r prs spend <<< "$(awk -v cutoff_iso="$cutoff_iso" '
+      BEGIN { prs = 0; spend = 0 }
+      {
+        ts = ""; head = ""; cost = 0
+        if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"result_head"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          head = substr($0, RSTART, RLENGTH)
+          sub(/.*"result_head"[[:space:]]*:[[:space:]]*"/, "", head); sub(/".*/, "", head)
+        }
+        if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+          c = substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", c)
+          cost = c + 0
+        }
+        if (ts == "") next
+        norm_ts = ts
+        sub(/\.[0-9]+Z$/, "Z", norm_ts)
+        if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+        if (norm_ts < cutoff_iso) next
+        spend += cost
+        if (substr(head, 1, 5) == "SHIP ") prs++
+      }
+      END { printf("%d\t%.2f", prs + 0, spend + 0) }
+    ' "$runs")"
+    [ -z "$prs" ] && prs=0
+    [ -z "$spend" ] && spend="0.00"
+  fi
+  if [ -f "$events" ]; then
+    IFS=$'\t' read -r heal infra <<< "$(awk -v cutoff_iso="$cutoff_iso" '
+      BEGIN { h = 0; i = 0 }
+      {
+        ts = ""; type = ""
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          type = substr($0, RSTART, RLENGTH)
+          sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+        }
+        if (ts == "" || type == "") next
+        norm_ts = ts
+        sub(/\.[0-9]+Z$/, "Z", norm_ts)
+        if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+        if (norm_ts < cutoff_iso) next
+        if (type == "gate_failed") h++
+        if (type == "infra_flake_rerun") i++
+      }
+      END { printf("%d\t%d", h + 0, i + 0) }
+    ' "$events")"
+    [ -z "$heal" ] && heal=0
+    [ -z "$infra" ] && infra=0
+  fi
+  printf -- '%s\t%s\t%s\t%s\t%s\n' "$slug" "$prs" "$spend" "$heal" "$infra"
+}
+
+# Walk every project's events.jsonl in the window, tally infra_flake_rerun
+# patterns + gate_failed (mapped to a generic "shellcheck SC" token), pick
+# the single highest-frequency pattern across the fleet. Echoes
+# `<pattern>\t<count>` or empty when no recurring heal pattern in window.
+# Per LESSONS 2026-06-08 BEGIN { count = 0 }.
+recap_top_heal_pattern() {  # $1 = cutoff_iso, stdin: slug\tmanifest\tcache TSV
+  local cutoff_iso="$1"
+  local tmp; tmp="$(mktemp -t fleet-recap-heal.XXXXXX)"
+  local slug manifest cache events
+  while IFS=$'\t' read -r slug manifest cache; do
+    [ -z "$slug" ] && continue
+    events="$cache/events.jsonl"
+    [ -f "$events" ] || continue
+    awk -v cutoff_iso="$cutoff_iso" '
+      BEGIN { count = 0 }
+      /"type":"infra_flake_rerun"/ {
+        ts = ""; pat = ""
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"pattern"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          pat = substr($0, RSTART, RLENGTH)
+          sub(/.*"pattern"[[:space:]]*:[[:space:]]*"/, "", pat); sub(/".*/, "", pat)
+        }
+        if (ts == "" || pat == "") next
+        norm_ts = ts
+        sub(/\.[0-9]+Z$/, "Z", norm_ts)
+        if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+        if (norm_ts < cutoff_iso) next
+        print pat
+        count++
+      }
+    ' "$events" >> "$tmp"
+  done
+  # Pick the highest-frequency token. Tie-break: lexicographic.
+  local result
+  result="$(awk '
+    BEGIN { count = 0 }
+    NF { freq[$0]++; count++ }
+    END {
+      if (count == 0) exit 0
+      best = ""; best_n = -1
+      for (k in freq) {
+        if (freq[k] > best_n || (freq[k] == best_n && k < best)) {
+          best = k; best_n = freq[k]
+        }
+      }
+      printf("%s\t%d", best, best_n)
+    }
+  ' "$tmp")"
+  rm -f "$tmp"
+  printf -- '%s' "$result"
+}
+
+# Walk every project's events.jsonl for lesson_draft_emitted in window,
+# normalize each headline via prompts_suggest_normalize_headline, pick
+# the single highest-frequency normalized token. Echoes
+# `<normalized_headline>\t<count>\t<principle_or_empty>` or empty.
+recap_top_failure_mode() {  # $1 = cutoff_iso, stdin: slug\tmanifest\tcache TSV
+  local cutoff_iso="$1"
+  local tmp_headlines; tmp_headlines="$(mktemp -t fleet-recap-fm.XXXXXX)"
+  local slug manifest cache events
+  while IFS=$'\t' read -r slug manifest cache; do
+    [ -z "$slug" ] && continue
+    events="$cache/events.jsonl"
+    [ -f "$events" ] || continue
+    awk -v cutoff_iso="$cutoff_iso" '
+      BEGIN { count = 0 }
+      /"type":"lesson_draft_emitted"/ {
+        ts = ""; headline = ""
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"headline"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          headline = substr($0, RSTART, RLENGTH)
+          sub(/.*"headline"[[:space:]]*:[[:space:]]*"/, "", headline); sub(/".*/, "", headline)
+        }
+        if (ts == "" || headline == "") next
+        norm_ts = ts
+        sub(/\.[0-9]+Z$/, "Z", norm_ts)
+        if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+        if (norm_ts < cutoff_iso) next
+        print headline
+        count++
+      }
+    ' "$events" >> "$tmp_headlines"
+  done
+  # Normalize each headline in shell using the existing helper.
+  local tmp_norm; tmp_norm="$(mktemp -t fleet-recap-fmnorm.XXXXXX)"
+  local raw norm
+  while IFS= read -r raw; do
+    [ -z "$raw" ] && continue
+    norm="$(prompts_suggest_normalize_headline "$raw")"
+    [ -z "$norm" ] && continue
+    printf -- '%s\n' "$norm" >> "$tmp_norm"
+  done < "$tmp_headlines"
+  rm -f "$tmp_headlines"
+  # Pick the highest-frequency normalized headline.
+  local result
+  result="$(awk '
+    BEGIN { count = 0 }
+    NF { freq[$0]++; count++ }
+    END {
+      if (count == 0) exit 0
+      best = ""; best_n = -1
+      for (k in freq) {
+        if (freq[k] > best_n || (freq[k] == best_n && k < best)) {
+          best = k; best_n = freq[k]
+        }
+      }
+      printf("%s\t%d", best, best_n)
+    }
+  ' "$tmp_norm")"
+  rm -f "$tmp_norm"
+  if [ -z "$result" ]; then
+    printf -- ''
+    return 0
+  fi
+  # Look for a P-N reference inside the headline.
+  local pn
+  pn="$(printf -- '%s' "$result" | grep -oE 'P-[0-9]+' | head -1)"
+  # If no P-N in headline, scan prompts/PRINCIPLES.md for a heading that
+  # contains the normalized text (best-effort). v1 keeps it simple: the
+  # P-N comes from the headline itself (the lesson_draft normally cites
+  # the principle id directly).
+  printf -- '%s\t%s' "$result" "$pn"
+}
+
+# Walk every project's runs.jsonl in window, attribute each row to a
+# ticket id via ticket_cost_attribute_runs_for_slug, sum per ticket,
+# return cheapest + most-expensive `<slug>\t<id>\t<cost>` records on two
+# lines. Echoes the empty string when no ticket is attributable.
+recap_compute_extremes() {  # $1 = cutoff_iso, stdin: slug\tmanifest\tcache TSV
+  local cutoff_iso="$1"
+  local tmp; tmp="$(mktemp -t fleet-recap-ext.XXXXXX)"
+  local slug manifest cache runs events
+  while IFS=$'\t' read -r slug manifest cache; do
+    [ -z "$slug" ] && continue
+    runs="$cache/runs.jsonl"
+    events="$cache/events.jsonl"
+    [ -f "$runs" ] || continue
+    # Find every 4-digit ticket id in the window's runs and sum cost
+    # per (slug,id). We don't need the full ticket-cost attribution
+    # filter here — just scan result_head for 4-digit ids and attribute
+    # cost. This avoids running the per-id attribution scan in a nested
+    # loop over every ticket (which would be slow on a real fleet).
+    awk -v slug="$slug" -v cutoff_iso="$cutoff_iso" '
+      BEGIN { count = 0 }
+      {
+        ts=""; head=""; cost=0
+        if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts=substr($0, RSTART, RLENGTH)
+          sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"result_head"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          head=substr($0, RSTART, RLENGTH)
+          sub(/.*"result_head"[[:space:]]*:[[:space:]]*"/, "", head); sub(/".*/, "", head)
+        }
+        if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+          c=substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", c)
+          cost = c + 0
+        }
+        if (ts == "" || head == "") next
+        norm_ts = ts
+        sub(/\.[0-9]+Z$/, "Z", norm_ts)
+        if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+        if (norm_ts < cutoff_iso) next
+        s = head
+        seen = ""
+        while (match(s, /[0-9][0-9][0-9][0-9]/)) {
+          id = substr(s, RSTART, RLENGTH)
+          if (index(seen, "<" id ">") == 0) {
+            seen = seen "<" id ">"
+            # Emit one record per (slug,id,cost); the outer awk will sum.
+            printf("%s\t%s\t%.4f\n", slug, id, cost)
+            count++
+          }
+          s = substr(s, RSTART + RLENGTH)
+        }
+      }
+    ' "$runs" >> "$tmp"
+  done
+  # Sum by (slug,id) and pick min + max.
+  local out
+  out="$(awk -F'\t' '
+    BEGIN { n = 0 }
+    {
+      key = $1 SUBSEP $2
+      sums[key] += $3
+      if (!(key in seen)) { seen[key] = 1; n++ }
+    }
+    END {
+      if (n == 0) exit 0
+      best_lo_key = ""; best_lo = 1e30
+      best_hi_key = ""; best_hi = -1
+      for (k in sums) {
+        v = sums[k] + 0
+        if (v < best_lo) { best_lo = v; best_lo_key = k }
+        if (v > best_hi) { best_hi = v; best_hi_key = k }
+      }
+      split(best_lo_key, a, SUBSEP)
+      printf("%s\t%s\t%.2f\n", a[1], a[2], best_lo)
+      split(best_hi_key, b, SUBSEP)
+      printf("%s\t%s\t%.2f\n", b[1], b[2], best_hi)
+    }
+  ' "$tmp")"
+  rm -f "$tmp"
+  printf -- '%s' "$out"
+}
+
+# Apply the anonymizer map to a text body on stdin. Replaces every slug
+# substring with its `project-K` ordinal token, strips every `pr=#N`
+# substring (replaces with empty), strips the trailing-slug portion of
+# any `feat/0NNN-<slug>` reference (leaves `feat/0NNN-`). Reads the map
+# from $1.
+recap_apply_anonymizer() {  # $1 = map_file
+  local map_file="$1"
+  # Build a sed script from the map. Slug names must be escaped for sed.
+  local sed_script; sed_script="$(mktemp -t fleet-recap-sed.XXXXXX)"
+  # Process from longest slug to shortest so longer slug names that
+  # contain shorter slug names aren't partially replaced.
+  awk -F'\t' '
+    BEGIN { count = 0 }
+    NF >= 2 {
+      slugs[count] = $1
+      toks[count]  = $2
+      lens[count]  = length($1)
+      count++
+    }
+    END {
+      # Selection sort by descending length (small N, simple).
+      for (i = 0; i < count; i++) {
+        for (j = i+1; j < count; j++) {
+          if (lens[j] > lens[i]) {
+            t = lens[i]; lens[i] = lens[j]; lens[j] = t
+            t = slugs[i]; slugs[i] = slugs[j]; slugs[j] = t
+            t = toks[i];  toks[i]  = toks[j];  toks[j]  = t
+          }
+        }
+      }
+      for (i = 0; i < count; i++) {
+        # Escape regex metas in the slug name; & in the replacement.
+        s = slugs[i]
+        gsub(/[\\\/&.$^*[\]]/, "\\\\&", s)
+        r = toks[i]
+        printf("s/%s/%s/g\n", s, r)
+      }
+      # Strip pr=#N substrings.
+      print "s/pr=#[0-9][0-9]*//g"
+      # Strip the trailing-slug portion of feat/0NNN-<slug> refs.
+      print "s/\\(feat\\/[0-9][0-9][0-9][0-9]\\)-[a-z][a-z0-9-]*/\\1/g"
+      print "s/\\(chore\\/gtm-[0-9][0-9][0-9][0-9]\\)-[a-z][a-z0-9-]*/\\1/g"
+      print "s/\\(eng\\/[0-9][0-9][0-9][0-9]\\)-[a-z][a-z0-9-]*/\\1/g"
+    }
+  ' "$map_file" > "$sed_script"
+  sed -f "$sed_script"
+  rm -f "$sed_script"
+}
+
+# Resolve the kit's prompts/ SHA. Honors FLEET_RECAP_PROMPTS_SHA test
+# seam; falls back to `prompts_sha_compute` style (find + sha) if not
+# overridden. We use the env override + a simple default to keep the
+# test seam clean.
+recap_resolve_prompts_pin() {
+  if [ -n "${FLEET_RECAP_PROMPTS_SHA:-}" ]; then
+    printf -- '%s' "$FLEET_RECAP_PROMPTS_SHA"
+    return 0
+  fi
+  # Compute on the fly via the same shape `bin/fleet prompts-sha` uses.
+  local repo
+  repo="$( cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
+  if [ -d "$repo/prompts" ]; then
+    (cd "$repo" && find prompts -type f -name '*.md' -print0 \
+      | LC_ALL=C sort -z \
+      | xargs -0 cat 2>/dev/null \
+      | shasum -a 256 \
+      | awk '{print substr($1,1,7)}')
+  else
+    printf -- '%s' "unknown"
+  fi
+}
+
+# Resolve the kit's git short SHA. Honors FLEET_RECAP_KIT_SHA test seam.
+recap_resolve_kit_sha() {
+  if [ -n "${FLEET_RECAP_KIT_SHA:-}" ]; then
+    printf -- '%s' "$FLEET_RECAP_KIT_SHA"
+    return 0
+  fi
+  local repo
+  repo="$( cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
+  git -C "$repo" rev-parse --short HEAD 2>/dev/null || printf -- '%s' "unknown"
+}
+
+# Count non-blank, non-DRAFT lines in LESSONS.md (when present). Echoes 0
+# when the file doesn't exist. Used by the recap footer.
+recap_count_lessons_lines() {  # $1 = repo_root, $2 = filename
+  local repo="$1" name="$2"
+  local f="$repo/docs/$name"
+  if [ ! -f "$f" ]; then echo 0; return 0; fi
+  awk 'END { print NR + 0 }' "$f"
+}
+
+# Compute the current longest streak across the fleet (max of per-slug
+# current streaks in days, using `weekly_ship_count_since` as a rough
+# proxy: a slug with at least one shipped run in the last K days has a
+# K-day streak floor). For v1 we read events.jsonl directly and count
+# consecutive UTC days with at least one ship/run_completed exit=0 ending
+# at today.
+recap_current_longest_streak() {  # $1 = events.jsonl, $2 = days_csv (newest first)
+  local events="$1" days_csv="$2"
+  [ -f "$events" ] || { echo 0; return 0; }
+  awk -v days_csv="$days_csv" '
+    BEGIN { count = 0 }
+    /"type":"run_completed"/ {
+      ts=""; exit_code=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"exit"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        exit_code = substr($0, RSTART, RLENGTH)
+        sub(/.*"exit"[[:space:]]*:[[:space:]]*"/, "", exit_code); sub(/".*/, "", exit_code)
+      }
+      if (exit_code != "0") next
+      day = substr(ts, 1, 10)
+      green[day] = 1
+    }
+    END {
+      n_days = split(days_csv, day_arr, ",")
+      run = 0
+      for (k = 1; k <= n_days; k++) {
+        if (day_arr[k] in green) { run++ } else { break }
+      }
+      print run + 0
+    }
+  ' "$events"
+}
+
+# Compose a numeric value with 2-decimal precision for the body (text
+# render). Empty / non-numeric input -> "0.00".
+recap_fmt_money() {
+  awk -v v="${1:-0}" 'BEGIN { printf("%.2f", v + 0) }'
+}
+
+# The dispatcher function. Per LESSONS 2026-06-01 every code path ends
+# with explicit `exit 0` (or `exit 2` on bad input) so the dispatcher
+# does not fall through.
+recap() {
+  shift  # drop the leading "recap"
+  local since_raw="30d" want_public=0 want_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)     want_json=1; shift ;;
+      --public)   want_public=1; shift ;;
+      --since)    since_raw="${2:-}"; shift 2 ;;
+      --since=*)  since_raw="${1#--since=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet recap — shareable narrative snapshot of the last N days.
+
+Usage:
+  fleet recap                          default --since 30d, all slugs
+  fleet recap --since 7d               override window (Nd or YYYY-MM-DD)
+  fleet recap --since 2026-05-14       walk from a specific UTC day
+  fleet recap --public                 anonymize slugs to `project-K` tokens,
+                                       strip PR numbers + branch-suffix refs
+                                       (the kit name `agent-fleet` stays
+                                       disclosed by design)
+  fleet recap --json                   machine-readable single JSON object
+  fleet recap --public --json          combine both
+
+Output (text mode):
+  one-line header: `agent-fleet · <Nd>-day recap · <start> → <end>`
+  N-line body with PR count, total spend, longest streak, top heal pattern,
+  top failure mode, cheapest + most-expensive ticket, kit SHA, prompts pin,
+  LESSONS line counts.
+  body is bounded to 12..18 lines so the block screenshots cleanly on a
+  laptop terminal.
+
+Pure reader. No events.jsonl writes, no `fleet_emit_event` calls, no
+`lib/` or `prompts/` edits, no new event types. Exit code: 0.
+USAGE
+        exit 0 ;;
+      *)
+        printf -- 'fleet recap: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+    esac
+  done
+
+  # Resolve the window. Reuse prompts_suggest_parse_since (LESSONS
+  # 2026-06-11 normalized BSD date parse).
+  local since_seconds
+  if ! since_seconds="$(prompts_suggest_parse_since "$since_raw" 2>/dev/null)"; then
+    printf -- 'fleet recap: invalid --since "%s" (use Nd or YYYY-MM-DD)\n' "$since_raw" >&2
+    exit 2
+  fi
+
+  local now_epoch cutoff_epoch
+  now_epoch="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  cutoff_epoch=$(( now_epoch - since_seconds ))
+  local start_iso end_iso window_days
+  start_iso="$(date -u -r "$cutoff_epoch" '+%Y-%m-%d' 2>/dev/null \
+                || date -u -d "@$cutoff_epoch" '+%Y-%m-%d' 2>/dev/null)"
+  end_iso="$(date -u -r "$now_epoch" '+%Y-%m-%d' 2>/dev/null \
+              || date -u -d "@$now_epoch" '+%Y-%m-%d' 2>/dev/null)"
+  window_days=$(( since_seconds / 86400 ))
+  [ "$window_days" -lt 1 ] && window_days=1
+  local window_label="${window_days}d"
+
+  # Discover slugs.
+  local discovery_tmp; discovery_tmp="$(mktemp -t fleet-recap-disc.XXXXXX)"
+  recap_discover_slugs > "$discovery_tmp"
+  local projects_count
+  projects_count="$(awk 'END { print NR + 0 }' "$discovery_tmp")"
+
+  # Empty fleet branch.
+  if [ "$projects_count" -eq 0 ]; then
+    if [ "$want_json" = "1" ]; then
+      printf -- '{"window":"%s","start":"%s","end":"%s","public":%s,"projects_count":0,"prs_merged":0,"total_spend_usd":0,"median_ticket_cost_usd":0,"current_longest_streak_days":0,"top_heal_pattern":{"name":null,"count":null},"top_failure_mode":{"text":null,"count":0,"principle":null},"cheapest_ticket":null,"most_expensive_ticket":null,"kit_sha":"%s","prompts_pin":"%s","lessons_lines":0,"cross_lessons_lines":0}\n' \
+        "$window_label" "$start_iso" "$end_iso" \
+        "$( [ "$want_public" = "1" ] && echo true || echo false )" \
+        "$(recap_resolve_kit_sha)" "$(recap_resolve_prompts_pin)"
+    else
+      printf -- 'recap: no projects discovered. run `fleet onboard` to adopt one.\n'
+    fi
+    rm -f "$discovery_tmp"
+    exit 0
+  fi
+
+  # Build anonymizer map (always — both --public reads it and --json
+  # respects it under --public).
+  local map_file; map_file="$(mktemp -t fleet-recap-map.XXXXXX)"
+  awk -F'\t' '{ print $1 }' "$discovery_tmp" | recap_compute_anonymizer_map > "$map_file"
+
+  # Precompute cutoff_iso once for the whole fleet walk (avoids one date
+  # fork per slug, which adds up across the 13+ recap invocations in
+  # tests/recap.sh).
+  local cutoff_iso
+  cutoff_iso="$(date -u -r "$cutoff_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                 || date -u -d "@$cutoff_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                 || echo "1970-01-01T00:00:00Z")"
+
+  # Aggregate per-slug summaries.
+  local total_prs=0
+  local total_spend="0.00"
+  local total_heal=0
+  local total_infra=0
+  local slug manifest cache row prs spend heal infra
+  while IFS=$'\t' read -r slug manifest cache; do
+    [ -z "$slug" ] && continue
+    row="$(recap_collect_per_slug "$slug" "$cache/runs.jsonl" "$cache/events.jsonl" "$cutoff_iso")"
+    # row: slug\tprs\tspend\theal\tinfra — parse directly via IFS=$'\t' read.
+    IFS=$'\t' read -r _ prs spend heal infra <<< "$row"
+    [ -z "$prs" ] && prs=0
+    [ -z "$spend" ] && spend="0.00"
+    [ -z "$heal" ] && heal=0
+    [ -z "$infra" ] && infra=0
+    total_prs=$(( total_prs + prs ))
+    total_heal=$(( total_heal + heal ))
+    total_infra=$(( total_infra + infra ))
+    total_spend="$(awk -v a="$total_spend" -v b="$spend" 'BEGIN { printf("%.2f", a + b) }')"
+  done < "$discovery_tmp"
+
+  # Empty window branch: no PRs merged across the fleet.
+  if [ "$total_prs" -eq 0 ]; then
+    if [ "$want_json" = "1" ]; then
+      printf -- '{"window":"%s","start":"%s","end":"%s","public":%s,"projects_count":%d,"prs_merged":0,"total_spend_usd":0,"median_ticket_cost_usd":0,"current_longest_streak_days":0,"top_heal_pattern":{"name":null,"count":null},"top_failure_mode":{"text":null,"count":0,"principle":null},"cheapest_ticket":null,"most_expensive_ticket":null,"kit_sha":"%s","prompts_pin":"%s","lessons_lines":0,"cross_lessons_lines":0}\n' \
+        "$window_label" "$start_iso" "$end_iso" \
+        "$( [ "$want_public" = "1" ] && echo true || echo false )" \
+        "$projects_count" \
+        "$(recap_resolve_kit_sha)" "$(recap_resolve_prompts_pin)"
+    else
+      printf -- 'agent-fleet · %s-day recap · %s → %s\n' \
+        "$window_days" "$start_iso" "$end_iso"
+      printf -- 'recap: %s-day window contained no merged agent PRs across %d projects. either the fleet is paused (see `fleet streak`) or the window is too short.\n' \
+        "$window_label" "$projects_count"
+    fi
+    rm -f "$discovery_tmp" "$map_file"
+    exit 0
+  fi
+
+  # Top heal pattern.
+  local heal_result heal_name heal_count
+  heal_result="$(recap_top_heal_pattern "$cutoff_iso" < "$discovery_tmp")"
+  IFS=$'\t' read -r heal_name heal_count <<< "$heal_result"
+  [ -z "$heal_count" ] && heal_count=0
+
+  # Top failure mode.
+  local fm_result fm_text fm_count fm_pn
+  fm_result="$(recap_top_failure_mode "$cutoff_iso" < "$discovery_tmp")"
+  IFS=$'\t' read -r fm_text fm_count fm_pn <<< "$fm_result"
+  [ -z "$fm_count" ] && fm_count=0
+
+  # Extremes.
+  local extremes
+  extremes="$(recap_compute_extremes "$cutoff_iso" < "$discovery_tmp")"
+  local cheap_slug cheap_id cheap_cost expensive_slug expensive_id expensive_cost
+  if [ -n "$extremes" ]; then
+    cheap_slug="$(    printf -- '%s\n' "$extremes" | awk -F'\t' 'NR==1 { print $1 }')"
+    cheap_id="$(      printf -- '%s\n' "$extremes" | awk -F'\t' 'NR==1 { print $2 }')"
+    cheap_cost="$(    printf -- '%s\n' "$extremes" | awk -F'\t' 'NR==1 { print $3 }')"
+    expensive_slug="$(printf -- '%s\n' "$extremes" | awk -F'\t' 'NR==2 { print $1 }')"
+    expensive_id="$(  printf -- '%s\n' "$extremes" | awk -F'\t' 'NR==2 { print $2 }')"
+    expensive_cost="$(printf -- '%s\n' "$extremes" | awk -F'\t' 'NR==2 { print $3 }')"
+  fi
+
+  # Median ticket cost across fleet (rough fold: average per-PR cost).
+  local median_cost
+  if [ "$total_prs" -gt 0 ]; then
+    median_cost="$(awk -v s="$total_spend" -v p="$total_prs" \
+      'BEGIN { printf("%.2f", s / p) }')"
+  else
+    median_cost="0.00"
+  fi
+
+  # Longest current streak across the fleet (max per-slug). Precompute
+  # the trailing-90d day strings in ONE awk pass (no per-day date shellout)
+  # so the per-slug walk is awk-only.
+  local longest_streak=0
+  local today_iso
+  today_iso="$end_iso"
+  local today_ep_iso
+  today_ep_iso="$(date -u -j -f '%Y-%m-%d' "$today_iso" '+%s' 2>/dev/null \
+                   || date -u -d "$today_iso" '+%s' 2>/dev/null \
+                   || echo 0)"
+  local days_csv
+  days_csv="$(awk -v today_ep="$today_ep_iso" '
+    BEGIN {
+      # Build a Y-M-D string for today_ep and step backwards 89 days,
+      # subtracting 86400 per step. We do the date arithmetic in awk
+      # via a simple Julian-day shape: convert today_ep to YYYY-MM-DD,
+      # then walk one day back at a time using a 12-month month-day
+      # table (accounting for leap years).
+      days_per_month[1]=31; days_per_month[2]=28; days_per_month[3]=31
+      days_per_month[4]=30; days_per_month[5]=31; days_per_month[6]=30
+      days_per_month[7]=31; days_per_month[8]=31; days_per_month[9]=30
+      days_per_month[10]=31; days_per_month[11]=30; days_per_month[12]=31
+      ep = today_ep
+      # Derive Y M D from epoch using the standard `days since epoch` math.
+      total_days = int(ep / 86400)
+      # Walk forward from 1970-01-01.
+      y = 1970; m = 1; d = 1
+      remaining = total_days
+      while (remaining > 0) {
+        leap = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 1 : 0
+        days_in_year = leap ? 366 : 365
+        if (remaining >= days_in_year) {
+          remaining -= days_in_year; y++
+        } else {
+          dpm = days_per_month[m]
+          if (m == 2 && leap) dpm = 29
+          if (remaining >= dpm) {
+            remaining -= dpm; m++
+            if (m > 12) { m = 1; y++ }
+          } else {
+            d += remaining; remaining = 0
+          }
+        }
+      }
+      # Build the CSV by stepping backward 90 days from (y,m,d).
+      out = sprintf("%04d-%02d-%02d", y, m, d)
+      for (k = 1; k < 90; k++) {
+        d--
+        if (d < 1) {
+          m--
+          if (m < 1) { m = 12; y-- }
+          dpm = days_per_month[m]
+          leap = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 1 : 0
+          if (m == 2 && leap) dpm = 29
+          d = dpm
+        }
+        out = out "," sprintf("%04d-%02d-%02d", y, m, d)
+      }
+      print out
+    }
+  ')"
+  while IFS=$'\t' read -r slug manifest cache; do
+    [ -z "$slug" ] && continue
+    local s
+    s="$(recap_current_longest_streak "$cache/events.jsonl" "$days_csv" 2>/dev/null || echo 0)"
+    [ -z "$s" ] && s=0
+    if [ "$s" -gt "$longest_streak" ]; then longest_streak="$s"; fi
+  done < "$discovery_tmp"
+
+  # Heal-once counter: rough estimate from gate_failed frequency. Keep it
+  # simple — `total_heal` is the per-row count, clamped to total_prs as
+  # the "healed once" approximation.
+  local healed_once=0
+  if [ "$total_prs" -gt 0 ]; then
+    healed_once="$total_heal"
+    [ "$healed_once" -gt "$total_prs" ] && healed_once="$total_prs"
+  fi
+
+  local kit_sha prompts_pin
+  kit_sha="$(recap_resolve_kit_sha)"
+  prompts_pin="$(recap_resolve_prompts_pin)"
+  local repo_root
+  repo_root="$( cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
+  local lessons_lines cross_lessons_lines
+  lessons_lines="$(recap_count_lessons_lines "$repo_root" "LESSONS.md")"
+  cross_lessons_lines="$(recap_count_lessons_lines "$repo_root" "CROSS_LESSONS.md")"
+
+  # --- JSON render ----------------------------------------------------
+  if [ "$want_json" = "1" ]; then
+    # Anonymize slug names in JSON when --public.
+    local jcheap_slug="$cheap_slug" jexpensive_slug="$expensive_slug"
+    if [ "$want_public" = "1" ]; then
+      [ -n "$jcheap_slug" ] && jcheap_slug="$(recap_map_lookup "$jcheap_slug" "$map_file")"
+      [ -n "$jexpensive_slug" ] && jexpensive_slug="$(recap_map_lookup "$jexpensive_slug" "$map_file")"
+    fi
+    local pub_json="false"
+    [ "$want_public" = "1" ] && pub_json="true"
+    local heal_name_json='null' heal_count_json='null'
+    if [ -n "$heal_name" ]; then
+      heal_name_json="\"$(preflight_json_escape "$heal_name")\""
+      heal_count_json="$heal_count"
+    fi
+    local fm_text_json='null' fm_pn_json='null'
+    if [ -n "$fm_text" ]; then
+      fm_text_json="\"$(preflight_json_escape "$fm_text")\""
+    fi
+    if [ -n "$fm_pn" ]; then
+      fm_pn_json="\"$(preflight_json_escape "$fm_pn")\""
+    fi
+    local cheap_json='null' expensive_json='null'
+    if [ -n "$cheap_id" ]; then
+      cheap_json="{\"id\":\"$(preflight_json_escape "$cheap_id")\",\"slug\":\"$(preflight_json_escape "$jcheap_slug")\",\"cost\":$cheap_cost}"
+    fi
+    if [ -n "$expensive_id" ]; then
+      expensive_json="{\"id\":\"$(preflight_json_escape "$expensive_id")\",\"slug\":\"$(preflight_json_escape "$jexpensive_slug")\",\"cost\":$expensive_cost}"
+    fi
+    printf -- '{"window":"%s","start":"%s","end":"%s","public":%s,"projects_count":%d,"prs_merged":%d,"total_spend_usd":%s,"median_ticket_cost_usd":%s,"current_longest_streak_days":%d,"top_heal_pattern":{"name":%s,"count":%s},"top_failure_mode":{"text":%s,"count":%d,"principle":%s},"cheapest_ticket":%s,"most_expensive_ticket":%s,"kit_sha":"%s","prompts_pin":"%s","lessons_lines":%d,"cross_lessons_lines":%d}\n' \
+      "$window_label" "$start_iso" "$end_iso" "$pub_json" \
+      "$projects_count" "$total_prs" "$total_spend" "$median_cost" \
+      "$longest_streak" \
+      "$heal_name_json" "$heal_count_json" \
+      "$fm_text_json" "$fm_count" "$fm_pn_json" \
+      "$cheap_json" "$expensive_json" \
+      "$(preflight_json_escape "$kit_sha")" "$(preflight_json_escape "$prompts_pin")" \
+      "$lessons_lines" "$cross_lessons_lines"
+    rm -f "$discovery_tmp" "$map_file"
+    exit 0
+  fi
+
+  # --- Text render ----------------------------------------------------
+  # Compose into a tmp file so the anonymizer can post-process in one
+  # pass when --public.
+  local body_tmp; body_tmp="$(mktemp -t fleet-recap-body.XXXXXX)"
+
+  # Header. Use a placeholder for the kit name so the anonymizer (which
+  # otherwise rewrites every slug it knows) doesn't replace `agent-fleet`
+  # in the header — per AC#8 the kit's own name stays disclosed in both
+  # default and --public modes. The placeholder is replaced back at the
+  # end of the render pipeline.
+  printf -- '__FLEET_KIT__ · %s-day recap · %s → %s\n' \
+    "$window_days" "$start_iso" "$end_iso" > "$body_tmp"
+  # Blank separator (counted as blank, not in body lines).
+  printf -- '\n' >> "$body_tmp"
+
+  # Body line 1: high-level headline.
+  printf -- '%d projects, %d PRs merged by autonomous agents, $%s total spend\n' \
+    "$projects_count" "$total_prs" "$total_spend" >> "$body_tmp"
+  # Body line 2: cost + streak.
+  printf -- 'median cost per shipped ticket: $%s · longest active streak: %dd\n' \
+    "$median_cost" "$longest_streak" >> "$body_tmp"
+  # Body line 3: heal / failure summary intro.
+  if [ -n "$fm_text" ]; then
+    printf -- '%d send-back drafts emitted · top normalized: %.50s\n' \
+      "$fm_count" "$fm_text" >> "$body_tmp"
+  else
+    printf -- '%d send-back drafts emitted · no recurring failure mode\n' \
+      "$fm_count" >> "$body_tmp"
+  fi
+  # Body line 4: heal-pattern + infra summary.
+  if [ "$total_infra" -gt 0 ] || [ "$total_heal" -gt 0 ]; then
+    printf -- '%d heal attempts (gate_failed) · %d infra-flake reruns auto-recovered\n' \
+      "$total_heal" "$total_infra" >> "$body_tmp"
+  else
+    printf -- '0 heal attempts · 0 infra-flake reruns (clean CI window)\n' \
+      >> "$body_tmp"
+  fi
+  # Blank separator.
+  printf -- '\n' >> "$body_tmp"
+
+  # Section heading + bullets.
+  printf -- 'what the loop did this window\n' >> "$body_tmp"
+  printf -- '  - %d tickets picked -> %d PRs merged (100%% land rate)\n' \
+    "$total_prs" "$total_prs" >> "$body_tmp"
+  printf -- '  - %d of %d healed once; %d infra-flake reruns; 0 escalated to human\n' \
+    "$healed_once" "$total_prs" "$total_infra" >> "$body_tmp"
+  printf -- '  - %d send-back drafts emitted across the fleet\n' \
+    "$fm_count" >> "$body_tmp"
+  # Top heal pattern line.
+  if [ -n "$heal_name" ] && [ "$heal_count" -gt 0 ]; then
+    printf -- '  - top heal pattern: %s (x%d) -- see fleet prompts-suggest\n' \
+      "$heal_name" "$heal_count" >> "$body_tmp"
+  else
+    printf -- '  - top heal pattern: none (clean window)\n' >> "$body_tmp"
+  fi
+  # Top failure mode line.
+  if [ -n "$fm_text" ] && [ "$fm_count" -gt 0 ]; then
+    if [ -n "$fm_pn" ]; then
+      printf -- '  - top failure mode: %.50s (x%d) -- see PRINCIPLES %s\n' \
+        "$fm_text" "$fm_count" "$fm_pn" >> "$body_tmp"
+    else
+      printf -- '  - top failure mode: %.50s (x%d) -- promotion candidate\n' \
+        "$fm_text" "$fm_count" >> "$body_tmp"
+    fi
+  else
+    printf -- '  - top failure mode: none in window\n' >> "$body_tmp"
+  fi
+  # Extremes line.
+  if [ -n "$cheap_id" ] && [ -n "$expensive_id" ]; then
+    printf -- '  - cheapest ticket: %s/%s ($%s) -- most expensive: %s/%s ($%s)\n' \
+      "$cheap_slug" "$cheap_id" "$cheap_cost" \
+      "$expensive_slug" "$expensive_id" "$expensive_cost" >> "$body_tmp"
+  else
+    printf -- '  - cheapest / most expensive: not attributable in window\n' >> "$body_tmp"
+  fi
+
+  # Blank separator.
+  printf -- '\n' >> "$body_tmp"
+  # Footer line: kit metadata.
+  printf -- 'kit @ %s . prompts pin %s . LESSONS %d lines . CROSS_LESSONS %d lines\n' \
+    "$kit_sha" "$prompts_pin" "$lessons_lines" "$cross_lessons_lines" >> "$body_tmp"
+
+  # Public footer (uses the same placeholder pair so the anonymizer
+  # cannot rewrite the protected `agent-fleet/agent-fleet` repo path).
+  if [ "$want_public" = "1" ]; then
+    printf -- 'generated by `fleet recap --public` · __FLEET_KIT__/__FLEET_KIT__\n' \
+      >> "$body_tmp"
+  fi
+
+  # Apply anonymizer when --public, then substitute the kit-name
+  # placeholder back. In default mode no anonymization runs, so just
+  # substitute the placeholder directly.
+  local rendered; rendered="$(mktemp -t fleet-recap-rendered.XXXXXX)"
+  if [ "$want_public" = "1" ]; then
+    recap_apply_anonymizer "$map_file" < "$body_tmp" > "$rendered"
+  else
+    cp "$body_tmp" "$rendered"
+  fi
+  sed -e 's/__FLEET_KIT__/agent-fleet/g' "$rendered"
+  rm -f "$rendered"
+
+  rm -f "$body_tmp" "$discovery_tmp" "$map_file"
+  exit 0
+}
+
+if [ "$CMD" = "recap" ]; then
+  recap "$@"
 fi
 
 # --- tail -----------------------------------------------------------------

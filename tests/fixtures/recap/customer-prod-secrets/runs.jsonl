@@ -1,0 +1,2 @@
+{"ts_start":"2026-05-26T10:00:00Z","slug":"customer-prod-secrets","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000,"total_cost_usd":0.22,"result_head":"SHIP 0060 — feature shipped PR #300"}
+{"ts_start":"2026-06-03T10:00:00Z","slug":"customer-prod-secrets","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000,"total_cost_usd":0.18,"result_head":"SHIP 0061 — feature shipped PR #301"}

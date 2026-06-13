@@ -66,7 +66,7 @@ ones, `review` grades them.
 | 0045 | fleet prompts-suggest proposes PRINCIPLES.md additions from recurring lesson_draft clusters | P1 | shipped | governance |
 | 0046 | fleet vacation suspends ship/eng work during operator PTO and prints a return briefing | P2 | shipped | governance |
 | 0047 | fleet ticket-cost <id> attributes every dollar spent shipping one ticket | P2 | shipped | observability |
-| 0048 | fleet recap composes a screenshot-ready narrative snapshot of the last N days | P1 | groomed | observability |
+| 0048 | fleet recap composes a screenshot-ready narrative snapshot of the last N days | P1 | in-progress | observability |
 | 0049 | fleet milestone celebrates streak milestones and composes a one-line recovery nudge on streak break | P1 | groomed | observability |
 | 0050 | fleet tour walks a new operator through their first events.jsonl annotated by PRINCIPLES | P2 | groomed | docs |
 | 0051 | fleet skill-gap <slug> diffs a project's PHASE 0 reads against the fleet-wide CROSS_LESSONS coverage | P2 | groomed | governance |
