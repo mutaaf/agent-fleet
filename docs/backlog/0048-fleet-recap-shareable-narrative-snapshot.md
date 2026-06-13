@@ -1,7 +1,7 @@
 ---
 id: 0048
 title: fleet recap composes a screenshot-ready narrative snapshot of the last N days
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-13
@@ -448,3 +448,13 @@ doesn't have to re-discover the architecture.
   `bin/fleet`. No edits to `lib/` or `prompts/` or `AGENTS.md` — pure
   reader. Help line + README "Daily ops" entry added. Auto-merge enabled
   on green CI per FLEET_TRAINEE_REMAINING=0.
+- 2026-06-13 — implementation-dev: PR #100 merged green
+  (shellcheck + validate both pass). One placement deviation from the
+  ticket's engineering notes: the `recap` dispatcher lives after the
+  `prompts-suggest` dispatcher (~line 7250), not next to `weekly()`
+  (~line 3922). Reason: `recap` reuses `prompts_suggest_normalize_headline`
+  (~line 6641) and `prompts_suggest_parse_since` (~line 6607), both of
+  which sit BELOW `weekly()`. Per LESSONS 2026-06-05 (dispatcher
+  forward-reference) the dispatcher block fires at execution time, so
+  every function recap calls must be defined ABOVE the dispatcher. The
+  choice is documented inline in the recap header comment.
