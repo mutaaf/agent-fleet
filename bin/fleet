@@ -70,6 +70,9 @@
 #   fleet ticket-cost <id>    attribute every $ spent shipping one ticket
 #                             (ticket 0047 — pure reader of runs.jsonl + pr_opened events;
 #                              --slug, --since Nd|YYYY-MM-DD default 30d, --json)
+#   fleet tour [<repo>]       walk events.jsonl with PRINCIPLES.md annotations
+#                             (ticket 0050 — pure reader of events.jsonl + lib/tour-catalog.sh;
+#                              --archive walks rotated segments, --type filters, --json emits NDJSON)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -9223,6 +9226,534 @@ USAGE
 
 if [ "$CMD" = "kickstart" ]; then
   kickstart_cmd "$@"
+fi
+
+# --- tour -----------------------------------------------------------------
+# Ticket 0050. `fleet tour [<repo>]` walks events.jsonl chronologically and
+# annotates each event with the matching principle from
+# prompts/PRINCIPLES.md, via the static `lib/tour-catalog.sh` lookup table
+# (one function per event type; gated by scripts/check-tour-catalog.mjs in
+# CI's `validate` job).
+#
+# Pure reader. NO `events.jsonl` writes, NO `fleet_emit_event` calls, NO
+# `lib/` or `prompts/` edits, NO new event types. The runtime hot path is
+# untouched — `lib/tour-catalog.sh` is sourced ONLY from this dispatcher
+# block, never from `lib/ship.sh`/`lib/eng.sh`/`lib/groom.sh`/`lib/review.sh`.
+#
+# All `tour_*` helpers are defined BELOW this header but ABOVE the inline
+# dispatcher block per LESSONS 2026-06-05 (a bin/fleet subcommand cannot
+# call a function defined LATER in the file when reached via the inline
+# `if [ "$CMD" = "<sub>" ]` dispatcher). JSON escape goes through the
+# already-early-defined `preflight_json_escape` (line ~1094) per LESSONS
+# 2026-06-03 — NO `tour_json_escape() { preflight_json_escape "$@"; }`
+# wrapper, since the self-check `json-escape-sign-extension` pattern
+# would flag it as missing the UTF-8 guard (LESSONS 2026-06-13).
+#
+# `tour()` end-state is `exit 0` on every code path per LESSONS
+# 2026-06-01 (dispatcher fall-through guard).
+
+# Resolve the target events.jsonl path.
+#
+# With a repo path argument: read agents.config.sh, derive SLUG, and
+# point at $HOME/.cache/<slug>-agent/events.jsonl.
+#
+# With no argument: walk the kit's own events.jsonl (the agent-fleet
+# kit-as-project channel, per the `lessons_pruned`/`prompts_reverted`
+# pattern). When the kit has no events.jsonl, echo empty so the
+# caller can print the no-events hint.
+#
+# Echoes the resolved path on stdout; empty if no channel could be found.
+tour_discover_target() {
+  local repo_arg="${1:-}"
+  if [ -n "$repo_arg" ]; then
+    local manifest="$repo_arg/agents.config.sh"
+    if [ ! -f "$manifest" ]; then
+      printf -- ''; return 0
+    fi
+    local slug
+    # shellcheck disable=SC1090  # discovered at runtime
+    slug="$( ( source "$manifest" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )"
+    if [ -z "$slug" ]; then
+      printf -- ''; return 0
+    fi
+    printf -- '%s\n' "$HOME/.cache/${slug}-agent/events.jsonl"
+    return 0
+  fi
+  # No arg: try the discovered "kit project" via FLEET_DISCOVERY_ROOT,
+  # then the installed-share root. Same union pattern as recap_discover_slugs
+  # but stops at the first hit.
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  local m slug events
+  for root in "$root_a" "$root_b"; do
+    while IFS= read -r m; do
+      [ -z "$m" ] && continue
+      # shellcheck disable=SC1090
+      slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+      [ -z "$slug" ] && continue
+      events="$HOME/.cache/${slug}-agent/events.jsonl"
+      if [ -f "$events" ]; then
+        printf -- '%s\n' "$events"
+        return 0
+      fi
+    done < <(find "$root" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort)
+  done
+  printf -- ''
+}
+
+# Source `lib/tour-catalog.sh` into the current shell once per process.
+# Per LESSONS 2026-06-05 (export-in-subshell trap) this MUST run from the
+# `tour()` dispatcher's own shell, NOT from inside `$(...)` — sourced
+# functions are scoped to the subshell that did the source, and a
+# `tour_lookup_catalog()` invoked via `$(...)` in `tour_render_text`
+# would otherwise re-source per call (slow) or, worse, would not see
+# the functions at all when called from a downstream subshell that
+# inherited the FLEET_TOUR_CATALOG_LOADED guard but not the function
+# definitions. The contract is: caller of tour_lookup_catalog must
+# already have sourced the catalog.
+#
+# Returns the catalog path the caller sourced (printed to stdout)
+# OR empty on failure.
+tour_source_catalog() {
+  if [ -n "${FLEET_TOUR_CATALOG_LOADED:-}" ]; then
+    return 0
+  fi
+  local self catalog=""
+  self="$( cd "$( dirname "$0" )" && pwd )"
+  for cand in \
+    "${FLEET_KIT_ROOT:-}/lib/tour-catalog.sh" \
+    "$self/../lib/tour-catalog.sh" \
+    "$HOME/.local/share/agent-fleet/lib/tour-catalog.sh"; do
+    if [ -n "$cand" ] && [ -f "$cand" ]; then
+      catalog="$cand"
+      break
+    fi
+  done
+  if [ -z "$catalog" ]; then
+    return 1
+  fi
+  # shellcheck disable=SC1090  # discovered at runtime
+  source "$catalog"
+  FLEET_TOUR_CATALOG_LOADED=1
+  return 0
+}
+
+# Lookup helper. Dispatches to `tour_catalog_<type>` (assumes the catalog
+# has been sourced into the caller's shell — see tour_source_catalog).
+# Echoes a TAB-separated triple:
+#   <principle_id>\t<gloss>\t<why_this_event_exists>
+# Echoes empty when the type has no catalog entry.
+tour_lookup_catalog() {
+  local event_type="$1"
+  local fn="tour_catalog_${event_type}"
+  if declare -F "$fn" >/dev/null 2>&1; then
+    "$fn"
+  else
+    printf -- ''
+  fi
+}
+
+# Walk one events.jsonl file and emit TSV records the renderer consumes.
+# Each record is one of:
+#   E\t<idx>\t<ts>\t<type>\t<raw_line>\t<fold_count>\t<last_ts>
+# `fold_count` is 1 for a non-folded event; >1 for the trailing line of a
+# fold run. `last_ts` is the same as `<ts>` for un-folded events; for a
+# fold it is the timestamp of the LAST event in the fold run.
+#
+# Folding only happens when a consecutive run shares BOTH `type` AND the
+# byte-identical raw line minus its `ts` field. We compare the post-ts
+# substring so two events with different timestamps but identical bodies
+# still fold (per AC#5 "byte-identical bodies").
+#
+# Per LESSONS 2026-06-08 every awk accumulator declares
+# `BEGIN { idx = 0; ... }` so the empty-string-key trap cannot fire.
+# Per LESSONS 2026-06-08 IFS=$'\t' middle-empty-field — the renderer uses
+# a `-` sentinel for the optional last_ts field; this helper never emits
+# an empty middle column.
+tour_walk_events() {
+  local channel="$1" type_filter="${2:-}" start_idx="${3:-1}"
+  [ ! -f "$channel" ] && return 0
+  awk -v start_idx="$start_idx" -v type_filter="$type_filter" '
+    BEGIN {
+      idx = start_idx - 1
+      have_pending = 0
+      pending_type = ""
+      pending_body = ""
+      pending_first_ts = ""
+      pending_last_ts = ""
+      pending_line = ""
+      pending_count = 0
+    }
+    function extract(field, line,    pat, val) {
+      pat = "\"" field "\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+      if (match(line, pat)) {
+        val = substr(line, RSTART, RLENGTH)
+        sub(/.*"/, "", val)  # noop intermediate
+      }
+      # Re-extract cleanly.
+      if (match(line, "\"" field "\"[[:space:]]*:[[:space:]]*\"[^\"]*\"")) {
+        val = substr(line, RSTART, RLENGTH)
+        sub("^\"" field "\"[[:space:]]*:[[:space:]]*\"", "", val)
+        sub(/"$/, "", val)
+        return val
+      }
+      return ""
+    }
+    function flush(    sep) {
+      if (!have_pending) return
+      sep = "\t"
+      idx++
+      printf("E%s%d%s%s%s%s%s%s%s%d%s%s\n",
+        sep, idx,
+        sep, pending_first_ts,
+        sep, pending_type,
+        sep, pending_line,
+        sep, pending_count,
+        sep, pending_last_ts)
+      have_pending = 0
+    }
+    NF {
+      ts = extract("ts", $0)
+      ty = extract("type", $0)
+      if (ts == "" || ty == "") next
+      if (type_filter != "" && ty != type_filter) {
+        flush(); next
+      }
+      # Body = raw line with the ts:"..." pair stripped, so two events
+      # with the same fields but different timestamps fold.
+      body = $0
+      gsub(/"ts"[[:space:]]*:[[:space:]]*"[^"]*"[[:space:]]*,?[[:space:]]*/, "", body)
+      if (have_pending && ty == pending_type && body == pending_body) {
+        pending_count++
+        pending_last_ts = ts
+        # Keep pending_line as the first occurrence (we render its body
+        # in the fold block; AC#5 shows the first event verbatim).
+        next
+      }
+      flush()
+      have_pending = 1
+      pending_type = ty
+      pending_body = body
+      pending_first_ts = ts
+      pending_last_ts = ts
+      pending_line = $0
+      pending_count = 1
+    }
+    END { flush() }
+  ' "$channel"
+}
+
+# Render text block for one event.
+# Args: idx ts type raw_line fold_count last_ts
+# Catalog lookup is one process-internal call; no external forks.
+tour_render_text() {
+  local idx="$1" ts="$2" type="$3" raw="$4" fold_count="$5" last_ts="$6"
+  local triple principle_id gloss why title
+  triple="$(tour_lookup_catalog "$type")"
+  if [ -n "$triple" ]; then
+    # Use printf -- '%s\n' "$triple" piped into read so embedded tabs
+    # parse correctly without IFS leakage.
+    IFS=$'\t' read -r principle_id gloss why <<< "$triple"
+    title="$(tour_catalog_principle_title "$principle_id")"
+  else
+    principle_id=""
+    gloss=""
+    why=""
+    title=""
+  fi
+
+  printf -- '[%s] %s  %s\n' "$idx" "$ts" "$type"
+  printf -- '      %s\n' "$raw"
+  if [ "$fold_count" -gt 1 ]; then
+    printf -- '      x %s occurrences (%s -> %s)\n' \
+      "$fold_count" "$ts" "$last_ts"
+  fi
+  if [ -n "$gloss" ]; then
+    printf -- '      %s\n' "$gloss"
+    printf -- '      Why this event exists: %s (%s). %s\n' \
+      "$principle_id" "$title" "$why"
+  else
+    printf -- '      Why this event exists: not in the catalog yet (probably a prompts revision newer than this kit). file an issue or run `fleet tour --json` to inspect raw.\n'
+  fi
+  printf -- '\n'
+}
+
+# Render one JSON object for one event. Per LESSONS 2026-06-03 every
+# escape goes through preflight_json_escape directly (NO local
+# tour_json_escape wrapper per LESSONS 2026-06-13).
+tour_render_json() {
+  local idx="$1" ts="$2" type="$3" raw="$4" fold_count="$5" _last_ts="$6"
+  local triple principle_id gloss why title
+  triple="$(tour_lookup_catalog "$type")"
+  if [ -n "$triple" ]; then
+    IFS=$'\t' read -r principle_id gloss why <<< "$triple"
+    title="$(tour_catalog_principle_title "$principle_id")"
+  else
+    principle_id="P-0"
+    gloss=""
+    why="not in the catalog yet"
+    title="unknown"
+  fi
+  # Pull the raw line's contents as `fields` — we re-emit the original
+  # event JSON object verbatim under the `fields` key so consumers can
+  # round-trip without re-parsing the schema. JSON's `fields` value is
+  # a parsed sub-object built from the raw line's body. We compose by
+  # escaping the raw line and embedding it as a string under
+  # `fields_raw` AND re-emitting under `fields` as the parsed object.
+  printf -- '{"idx":%d,"ts":"%s","type":"%s","fields":%s,"principle_id":"%s","principle_title":"%s","gloss":"%s","why_exists":"%s","fold_count":%d}\n' \
+    "$idx" \
+    "$(preflight_json_escape "$ts")" \
+    "$(preflight_json_escape "$type")" \
+    "$raw" \
+    "$(preflight_json_escape "$principle_id")" \
+    "$(preflight_json_escape "$title")" \
+    "$(preflight_json_escape "$gloss")" \
+    "$(preflight_json_escape "$why")" \
+    "$fold_count"
+}
+
+# Compose the "what to read next" footer from the set of event types the
+# walk just covered. Reads one type per line on stdin; emits the footer
+# block (text mode) to stdout.
+#
+# The daily three (`fleet morning`, `fleet streak`, `fleet doctor`) are
+# always suggested. The conditional three fire when any of the matching
+# event types appeared in the walk:
+#   lesson_draft_emitted → fleet lessons-promote
+#   ship_paused          → fleet resume
+#   infra_flake_rerun    → fleet incident
+#
+# Per LESSONS 2026-05-28 every printf goes through `printf -- '%s'`.
+tour_compose_footer() {
+  local types_seen="$1"
+  local saw_draft=0 saw_paused=0 saw_infra=0
+  case " $types_seen " in
+    *" lesson_draft_emitted "*) saw_draft=1 ;;
+  esac
+  case " $types_seen " in
+    *" ship_paused "*) saw_paused=1 ;;
+  esac
+  case " $types_seen " in
+    *" infra_flake_rerun "*) saw_infra=1 ;;
+  esac
+
+  printf -- 'what to read next:\n'
+  printf -- '  - fleet morning            — your daily one-paragraph briefing\n'
+  printf -- '  - fleet streak             — does this project have a streak yet?\n'
+  printf -- '  - fleet doctor             — is the kit installation healthy?\n'
+  if [ "$saw_draft" = "1" ]; then
+    printf -- '  - fleet lessons-promote    — curate a send-back draft into cross-fleet memory\n'
+  fi
+  if [ "$saw_paused" = "1" ]; then
+    printf -- '  - fleet resume <slug>      — re-enable a ship_paused project\n'
+  fi
+  if [ "$saw_infra" = "1" ]; then
+    printf -- '  - fleet incident --since 24h — assemble a post-mortem from the infra-flake window\n'
+  fi
+  printf -- '\n'
+  printf -- 'reference docs:\n'
+  printf -- '  - AGENTS.md § Telemetry    — every event type'\''s schema\n'
+  printf -- '  - prompts/PRINCIPLES.md    — the nine principles cited above\n'
+  printf -- '  - docs/LESSONS.md          — the kit'\''s operational memory\n'
+}
+
+# Render one channel (file path) into either text or JSON. The text/JSON
+# output goes to stdout. The number of events emitted is reported back
+# through the GLOBAL `FLEET_TOUR_LAST_COUNT` (set on every call) — we
+# do NOT echo the count to stdout because the caller already captures
+# the render output there.
+#
+# The union of event types seen is tracked through the global
+# FLEET_TOUR_TYPES_SEEN so the footer can compose. Per LESSONS
+# 2026-06-05 (export-in-subshell trap) this helper MUST run from the
+# `tour()` dispatcher's own shell (no $(...) wrapper) so the global
+# assignments persist for the footer composer.
+#
+# Per LESSONS 2026-06-08 (IFS=$'\t' middle-empty-field) every TSV read
+# uses the `-` sentinel pattern at the producer side — tour_walk_events
+# always emits a non-empty last_ts column, so no remap is needed here.
+tour_render_channel() {
+  local channel="$1" mode="$2" type_filter="$3" start_idx="$4"
+  local n_emitted=0
+  local marker idx ts type raw fold_count last_ts
+  while IFS=$'\t' read -r marker idx ts type raw fold_count last_ts; do
+    [ "$marker" != "E" ] && continue
+    n_emitted=$(( n_emitted + 1 ))
+    # Track types seen (for footer composition).
+    case " ${FLEET_TOUR_TYPES_SEEN:-} " in
+      *" $type "*) ;;
+      *)
+        FLEET_TOUR_TYPES_SEEN="${FLEET_TOUR_TYPES_SEEN:-} $type"
+        ;;
+    esac
+    if [ "$mode" = "json" ]; then
+      tour_render_json "$idx" "$ts" "$type" "$raw" "$fold_count" "$last_ts"
+    else
+      tour_render_text "$idx" "$ts" "$type" "$raw" "$fold_count" "$last_ts"
+    fi
+  done < <(tour_walk_events "$channel" "$type_filter" "$start_idx")
+  FLEET_TOUR_LAST_COUNT="$n_emitted"
+}
+
+tour() {
+  shift  # drop the leading "tour"
+  # Source the catalog into THIS shell up-front. Per LESSONS 2026-06-05
+  # the source must NOT happen inside `$(...)` from a producer like
+  # tour_render_text — sourced functions don't survive a subshell exit.
+  if ! tour_source_catalog; then
+    printf -- 'fleet tour: lib/tour-catalog.sh not found\n' >&2
+    exit 1
+  fi
+  local want_archive=0 want_json=0 type_filter="" repo_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --archive)  want_archive=1; shift ;;
+      --json)     want_json=1; shift ;;
+      --type)     type_filter="${2:-}"; shift 2 ;;
+      --type=*)   type_filter="${1#--type=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet tour — walk events.jsonl with PRINCIPLES.md annotations.
+
+Usage:
+  fleet tour                           walk the kit's own events.jsonl
+  fleet tour <repo>                    walk that repo's events.jsonl
+  fleet tour --archive [<repo>]        ALSO walk events.jsonl.archive/*.jsonl
+                                       (rotated segments, chronological)
+  fleet tour --type <name> [<repo>]    filter to one event type (e.g.
+                                       --type lesson_draft_emitted)
+  fleet tour --json [<repo>]           one NDJSON object per annotated event
+                                       (idx, ts, type, fields, principle_id,
+                                       principle_title, gloss, why_exists,
+                                       fold_count)
+
+Output (text mode):
+  per-event block: `[<idx>] <ts>  <type>` + the raw event line + a 2-3
+  sentence plain-English gloss + one line `Why this event exists: P-<N>
+  (<title>). <elaboration>.` Consecutive byte-identical bodies fold into
+  a single block with `x N occurrences (<first_ts> -> <last_ts>)`.
+
+Footer: the daily three (fleet morning / streak / doctor) plus
+conditional follow-ups for any lesson_draft_emitted, ship_paused, or
+infra_flake_rerun events the walk covered. Reference-docs block points
+at AGENTS.md § Telemetry, prompts/PRINCIPLES.md, docs/LESSONS.md.
+
+Pure reader. No events.jsonl writes, no `fleet_emit_event` calls, no
+`lib/` or `prompts/` edits, no new event types. Exit code: 0.
+USAGE
+        exit 0 ;;
+      --) shift ;;
+      -*)
+        printf -- 'fleet tour: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$repo_arg" ]; then
+          repo_arg="$1"
+          shift
+        else
+          printf -- 'fleet tour: unexpected extra argument %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+
+  # Resolve the target events.jsonl path.
+  local channel slug_name=""
+  channel="$(tour_discover_target "$repo_arg")"
+  if [ -z "$channel" ] || [ ! -f "$channel" ]; then
+    printf -- 'tour: no events.jsonl found. run `fleet onboard <repo>` to install, OR `fleet kickstart --demo` to see a synthetic cycle.\n'
+    exit 0
+  fi
+
+  # Derive a human slug for the header.
+  if [ -n "$repo_arg" ] && [ -f "$repo_arg/agents.config.sh" ]; then
+    # shellcheck disable=SC1090
+    slug_name="$( ( source "$repo_arg/agents.config.sh" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )"
+  fi
+  if [ -z "$slug_name" ]; then
+    # Fallback: parse the slug out of $channel = $HOME/.cache/<slug>-agent/events.jsonl.
+    local parent
+    parent="$(dirname "$channel")"
+    slug_name="$(basename "$parent")"
+    slug_name="${slug_name%-agent}"
+  fi
+
+  # Empty channel branch.
+  if [ ! -s "$channel" ]; then
+    if [ "$want_json" = "1" ]; then
+      # JSON mode emits nothing for an empty channel (consumers tolerate
+      # the empty stream). Text mode prints the operator-friendly hint.
+      exit 0
+    fi
+    printf -- 'tour: events.jsonl is empty. wait for the next `:37` ship cycle, or run `fleet kickstart --demo` to generate a synthetic cycle.\n'
+    exit 0
+  fi
+
+  # Count lines for the header (text mode only).
+  local n_lines
+  n_lines="$(awk 'END { print NR + 0 }' "$channel")"
+
+  if [ "$want_json" != "1" ]; then
+    printf -- 'tour: walking events.jsonl for %s (%s lines)\n' \
+      "$slug_name" "$n_lines"
+    printf -- '\n'
+  fi
+
+  # Reset the cross-channel type-seen set so a re-entry in the same shell
+  # doesn't inherit a previous walk's union.
+  FLEET_TOUR_TYPES_SEEN=""
+  export FLEET_TOUR_TYPES_SEEN
+
+  local mode="text"
+  [ "$want_json" = "1" ] && mode="json"
+
+  local global_idx=1
+  if [ "$want_archive" = "1" ]; then
+    local arch_dir="${channel}.archive"
+    if [ -d "$arch_dir" ]; then
+      local arch_files arch_file
+      # Sort archive files lex (the rotation stamp is UTC ISO8601-like,
+      # so lex == chronological).
+      arch_files="$(LC_ALL=C find "$arch_dir" -maxdepth 1 -name '*.jsonl' 2>/dev/null | LC_ALL=C sort)"
+      if [ -n "$arch_files" ]; then
+        local first=1
+        while IFS= read -r arch_file; do
+          [ -z "$arch_file" ] && continue
+          if [ "$mode" = "text" ]; then
+            if [ "$first" = "1" ]; then
+              first=0
+            else
+              printf -- '--- archive boundary ---\n\n'
+            fi
+          fi
+          # tour_render_channel sets FLEET_TOUR_LAST_COUNT — must run
+          # without $(...) so the global persists (LESSONS 2026-06-05).
+          FLEET_TOUR_LAST_COUNT=0
+          tour_render_channel "$arch_file" "$mode" "$type_filter" "$global_idx"
+          global_idx=$(( global_idx + FLEET_TOUR_LAST_COUNT ))
+        done <<< "$arch_files"
+        if [ "$mode" = "text" ]; then
+          printf -- '--- archive boundary ---\n\n'
+        fi
+      fi
+    fi
+  fi
+
+  # Live channel — same no-$(...)-wrapper invariant.
+  FLEET_TOUR_LAST_COUNT=0
+  tour_render_channel "$channel" "$mode" "$type_filter" "$global_idx"
+  global_idx=$(( global_idx + FLEET_TOUR_LAST_COUNT ))
+
+  # Text footer.
+  if [ "$mode" = "text" ]; then
+    tour_compose_footer "${FLEET_TOUR_TYPES_SEEN:-}"
+  fi
+
+  exit 0
+}
+
+if [ "$CMD" = "tour" ]; then
+  tour "$@"
 fi
 
 # --- replay ---------------------------------------------------------------

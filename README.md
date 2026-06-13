@@ -475,6 +475,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet milestone                                         # celebrate streak crossings and frame recoveries (ticket 0049 — pure reader; --since Nd|YYYY-MM-DD default 90d, --slug, --json; MILESTONE_THRESHOLDS + MILESTONE_BREAK_FLOOR knobs)
 ~/code/agent-fleet/bin/fleet ticket-cost 0042                                  # attribute every $ spent shipping one ticket (ticket 0047 — pure reader of runs.jsonl + pr_opened; --slug, --since Nd|YYYY-MM-DD default 30d, --json)
 ~/code/agent-fleet/bin/fleet recap --since 30d --public                         # shareable narrative snapshot of the last N days (ticket 0048 — pure reader; --since Nd|YYYY-MM-DD default 30d, --public anonymizes slugs, --json)
+~/code/agent-fleet/bin/fleet tour ~/code/your-repo                              # walk events.jsonl with PRINCIPLES.md annotations (ticket 0050 — pure reader; --archive walks rotated segments, --type filters, --json emits NDJSON)
 ```
 
 **Dry-run mode (ticket 0010).** Setting `AGENT_DRY_RUN=1` flips

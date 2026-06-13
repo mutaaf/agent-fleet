@@ -1,0 +1,5 @@
+{"ts":"2026-06-13T08:00:00Z","slug":"demo","phase":"ship","type":"run_started","pid":"1"}
+{"ts":"2026-06-13T08:10:00Z","slug":"demo","phase":"ship","type":"ship_paused","reason":"3-sendback-streak","count":"3","prs":"100,101,102"}
+{"ts":"2026-06-13T08:20:00Z","slug":"demo","phase":"ship","type":"lesson_draft_emitted","pr":"105","headline":"awk -v multiline trap"}
+{"ts":"2026-06-13T08:30:00Z","slug":"demo","phase":"ship","type":"infra_flake_rerun","pattern":"gh_graphql_502","run_id":"800","pr":"106"}
+{"ts":"2026-06-13T08:40:00Z","slug":"demo","phase":"ship","type":"run_completed","exit":"0","duration_ms":"500"}

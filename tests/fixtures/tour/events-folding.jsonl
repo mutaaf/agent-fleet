@@ -1,0 +1,6 @@
+{"ts":"2026-06-13T09:37:09Z","slug":"demo","phase":"ship","type":"run_started","pid":"100"}
+{"ts":"2026-06-13T09:40:01Z","slug":"demo","phase":"ship","type":"infra_flake_rerun","pattern":"actions_silent","run_id":"100","pr":"14"}
+{"ts":"2026-06-13T09:42:01Z","slug":"demo","phase":"ship","type":"infra_flake_rerun","pattern":"actions_silent","run_id":"100","pr":"14"}
+{"ts":"2026-06-13T09:44:01Z","slug":"demo","phase":"ship","type":"infra_flake_rerun","pattern":"actions_silent","run_id":"100","pr":"14"}
+{"ts":"2026-06-13T09:46:01Z","slug":"demo","phase":"ship","type":"infra_flake_rerun","pattern":"actions_silent","run_id":"100","pr":"14"}
+{"ts":"2026-06-13T09:50:00Z","slug":"demo","phase":"ship","type":"run_completed","exit":"0","duration_ms":"800"}
