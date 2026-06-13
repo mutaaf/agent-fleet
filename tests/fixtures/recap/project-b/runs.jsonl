@@ -1,0 +1,4 @@
+{"ts_start":"2026-05-25T10:00:00Z","slug":"project-b","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000,"total_cost_usd":0.07,"result_head":"SHIP 0043 — feature shipped PR #200"}
+{"ts_start":"2026-05-28T10:00:00Z","slug":"project-b","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000,"total_cost_usd":0.25,"result_head":"SHIP 0050 — feature shipped PR #201"}
+{"ts_start":"2026-06-01T10:00:00Z","slug":"project-b","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000,"total_cost_usd":0.32,"result_head":"SHIP 0051 — feature shipped PR #202"}
+{"ts_start":"2026-06-04T10:00:00Z","slug":"project-b","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000,"total_cost_usd":0.28,"result_head":"SHIP 0052 — feature shipped PR #203"}

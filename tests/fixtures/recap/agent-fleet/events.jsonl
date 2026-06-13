@@ -1,0 +1,18 @@
+{"ts":"2026-05-20T10:01:00Z","slug":"agent-fleet","phase":"ship","type":"pr_opened","number":"100","branch":"feat/0040-something"}
+{"ts":"2026-05-24T10:01:00Z","slug":"agent-fleet","phase":"ship","type":"pr_opened","number":"101","branch":"feat/0041-something"}
+{"ts":"2026-05-26T10:01:00Z","slug":"agent-fleet","phase":"ship","type":"pr_opened","number":"102","branch":"feat/0042-something"}
+{"ts":"2026-05-28T10:01:00Z","slug":"agent-fleet","phase":"ship","type":"pr_opened","number":"103","branch":"feat/0043-something"}
+{"ts":"2026-05-30T10:01:00Z","slug":"agent-fleet","phase":"ship","type":"pr_opened","number":"104","branch":"feat/0044-something"}
+{"ts":"2026-06-02T10:01:00Z","slug":"agent-fleet","phase":"ship","type":"pr_opened","number":"105","branch":"feat/0045-something"}
+{"ts":"2026-06-05T10:01:00Z","slug":"agent-fleet","phase":"ship","type":"pr_opened","number":"106","branch":"feat/0046-something"}
+{"ts":"2026-06-08T10:01:00Z","slug":"agent-fleet","phase":"ship","type":"pr_opened","number":"107","branch":"feat/0047-something"}
+{"ts":"2026-05-21T11:00:00Z","slug":"agent-fleet","phase":"ship","type":"infra_flake_rerun","pattern":"actions_silent","run_id":"1","pr":"100"}
+{"ts":"2026-05-23T11:00:00Z","slug":"agent-fleet","phase":"ship","type":"infra_flake_rerun","pattern":"actions_silent","run_id":"2","pr":"101"}
+{"ts":"2026-05-27T11:00:00Z","slug":"agent-fleet","phase":"ship","type":"infra_flake_rerun","pattern":"actions_silent","run_id":"3","pr":"102"}
+{"ts":"2026-05-29T11:00:00Z","slug":"agent-fleet","phase":"ship","type":"infra_flake_rerun","pattern":"gh_graphql_502","run_id":"4","pr":"103"}
+{"ts":"2026-05-22T12:00:00Z","slug":"agent-fleet","phase":"review","type":"lesson_draft_emitted","pr":"100","headline":"P-2 test wrote to non-isolated path"}
+{"ts":"2026-05-25T12:00:00Z","slug":"agent-fleet","phase":"review","type":"lesson_draft_emitted","pr":"101","headline":"P-2 test wrote to non-isolated path"}
+{"ts":"2026-05-29T12:00:00Z","slug":"agent-fleet","phase":"review","type":"lesson_draft_emitted","pr":"103","headline":"P-2 test wrote to non-isolated path"}
+{"ts":"2026-06-01T12:00:00Z","slug":"agent-fleet","phase":"review","type":"lesson_draft_emitted","pr":"105","headline":"P-2 test wrote to non-isolated path"}
+{"ts":"2026-05-21T05:00:00Z","slug":"agent-fleet","phase":"ship","type":"gate_failed","check":"shellcheck"}
+{"ts":"2026-05-23T05:00:00Z","slug":"agent-fleet","phase":"ship","type":"gate_failed","check":"shellcheck"}
