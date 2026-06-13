@@ -1,7 +1,7 @@
 ---
 id: 0048
 title: fleet recap composes a screenshot-ready narrative snapshot of the last N days
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-13
@@ -441,4 +441,10 @@ doesn't have to re-discover the architecture.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-13 — implementation-dev: branch
+  `feat/0048-fleet-recap-shareable-narrative-snapshot` opened. Plan: write
+  `tests/recap.sh` (15 ACs, one block each) FIRST per P-2, then implement
+  the `recap_*` helpers + dispatcher above the `weekly` block in
+  `bin/fleet`. No edits to `lib/` or `prompts/` or `AGENTS.md` — pure
+  reader. Help line + README "Daily ops" entry added. Auto-merge enabled
+  on green CI per FLEET_TRAINEE_REMAINING=0.
