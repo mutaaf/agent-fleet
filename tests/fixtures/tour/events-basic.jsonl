@@ -1,0 +1,4 @@
+{"ts":"2026-06-13T09:37:09Z","slug":"demo","phase":"ship","type":"run_started","pid":"12384"}
+{"ts":"2026-06-13T09:37:12Z","slug":"demo","phase":"ship","type":"pr_opened","number":"14","branch":"feat/0003-add-stripe-webhook-retry"}
+{"ts":"2026-06-13T09:41:55Z","slug":"demo","phase":"ship","type":"gate_failed","check":"unit-tests"}
+{"ts":"2026-06-13T10:53:22Z","slug":"demo","phase":"ship","type":"run_completed","exit":"0","duration_ms":"7813"}

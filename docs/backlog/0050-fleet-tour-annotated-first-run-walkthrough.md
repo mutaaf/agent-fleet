@@ -1,7 +1,7 @@
 ---
 id: 0050
 title: fleet tour walks a new operator through their first events.jsonl annotated by PRINCIPLES
-status: groomed
+status: in-progress
 priority: P2
 area: docs
 created: 2026-06-13
@@ -506,4 +506,10 @@ Files / patterns the dev should touch.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-13: `implementation-dev` started on `feat/0050-fleet-tour`. Plan: write
+  failing `tests/tour.sh` (14 AC blocks) first, then add `bin/fleet tour` +
+  helpers ABOVE the dispatcher (LESSONS 2026-06-05), `lib/tour-catalog.sh`
+  (one function per AGENTS.md event type), `scripts/check-tour-catalog.mjs`
+  (validate-gate parity), and the CI wire-up. Pure reader. No
+  `*_json_escape` wrapper (LESSONS 2026-06-13) — call
+  `preflight_json_escape` directly.
