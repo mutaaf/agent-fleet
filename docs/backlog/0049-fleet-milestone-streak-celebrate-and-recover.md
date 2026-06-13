@@ -1,7 +1,7 @@
 ---
 id: 0049
 title: fleet milestone celebrates streak milestones and composes a one-line recovery nudge on streak break
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-13
@@ -495,7 +495,8 @@ Files / patterns the dev should touch.
   `main` (clean tree). Status flipped from `groomed` to `in-progress`; index
   row in `docs/backlog/README.md` mirrored.
 - Plan: tests-first per AGENTS.md P-2. `tests/milestone.sh` with one
-  assertion block per AC box (14 boxes), fixtures under
+  assertion block per AC box (16 boxes — the ticket head says "14" but
+  the file's `- [ ]` count is 16), fixtures under
   `tests/fixtures/milestone/`, `$HOME/.local/bin` stub PATH per LESSONS
   2026-05-26, frozen clock via `FLEET_NOW_OVERRIDE` + paired
   `FLEET_NOW_OVERRIDE_YESTERDAY` per the ticket. Then implement
@@ -504,3 +505,42 @@ Files / patterns the dev should touch.
   `streak_discover`, `streak_walk_days`, `streak_collapse_runs` from
   ticket 0042 — there is no `streak_compute_for_slug` in the file;
   the equivalent compute is the `walk + collapse` pair.
+
+### 2026-06-13 — implementation notes
+- `bin/fleet` got `milestone()` + 11 `milestone_*` helpers placed
+  ABOVE the dispatcher block (LESSONS 2026-06-05 forward-ref guard).
+  Dispatcher block sits immediately after `streak`'s, before `incident`.
+  Help-banner line + README "Daily ops" line both added.
+- Detection model:
+  - `--since N` is the DETECTION WINDOW (how recent a crossing/break
+    must be to surface). Default `1d` (the trailing 24h, matching the
+    ticket's "typical operator runs daily" intent).
+  - The HISTORICAL WALK is a fixed 90d look-back so today_n /
+    historical_longest / prior_n always reflect the real history even
+    when `--since` is short. A 14-day streak ending in a break is
+    still scored as 14d in the recovery line even on `--since 1d`.
+- Single consolidated awk pass per slug (`milestone_compute_slug_meta`)
+  emits TODAY / YEST / RUN / BREAK records in one process — the earlier
+  per-helper awks shelled out to `date -u -j -v +1d` 90× per call
+  (~30s/slug); switching to in-awk Julian Day arithmetic dropped
+  per-slug cost to ~30ms. The test still takes ~90s wall clock but
+  most of that is the seed loop's per-day `date` forks (synthetic
+  fixture generation), not the milestone logic. The local-gate
+  composition (`shellcheck && bash -n && check-backlog && self-check`)
+  finishes in <3s so the test budget doesn't bottleneck CI.
+- Reuses `streak_parse_since` (ticket 0042) for the `--since` parser,
+  `streak_discover` for project discovery, `preflight_json_escape`
+  DIRECTLY (no `milestone_json_escape` wrapper — LESSONS 2026-06-13
+  flagged `*_json_escape` wrappers as a self-check regression).
+- AC#2 interpretation: when `MILESTONE_THRESHOLDS=""` the ticket says
+  "only streak-break events are emitted". I gate BOTH threshold-
+  crossing and new-longest on a non-empty ladder, since the
+  empty-ladder case explicitly suppresses everything but breaks.
+- Acceptance check: `tests/milestone.sh` green across all 16 boxes,
+  including the byte-size-of-events.jsonl-unchanged "pure reader"
+  assertion. Local gate green. `fleet self-check` reports 3 hits
+  (the on-main baseline) — no new self-check regressions.
+
+### 2026-06-13 — shipped
+- PR opened on `feat/0049-fleet-milestone-streak-celebrate-and-recover`;
+  ticket status flipped to `shipped`.
