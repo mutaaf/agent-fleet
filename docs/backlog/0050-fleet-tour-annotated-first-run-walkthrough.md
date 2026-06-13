@@ -1,7 +1,7 @@
 ---
 id: 0050
 title: fleet tour walks a new operator through their first events.jsonl annotated by PRINCIPLES
-status: in-progress
+status: shipped
 priority: P2
 area: docs
 created: 2026-06-13
@@ -513,3 +513,10 @@ Files / patterns the dev should touch.
   (validate-gate parity), and the CI wire-up. Pure reader. No
   `*_json_escape` wrapper (LESSONS 2026-06-13) — call
   `preflight_json_escape` directly.
+- 2026-06-13: PR #104 merged via auto-merge on green CI (shellcheck +
+  validate both pass). All 15 AC boxes covered by `tests/tour.sh` in
+  ~7.7s. `FLEET_SELF_CHECK_GATE=1 bin/fleet self-check` stayed at the
+  3-hit on-main baseline (no `*_json_escape` wrapper added). The
+  `check-tour-catalog` validate step now gates every future PR that
+  touches `AGENTS.md § Telemetry` to also update
+  `lib/tour-catalog.sh`.
