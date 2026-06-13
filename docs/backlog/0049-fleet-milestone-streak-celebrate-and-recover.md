@@ -1,7 +1,7 @@
 ---
 id: 0049
 title: fleet milestone celebrates streak milestones and composes a one-line recovery nudge on streak break
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-13
@@ -489,3 +489,18 @@ Files / patterns the dev should touch.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+### 2026-06-13 — picked up for ship
+- Branch `feat/0049-fleet-milestone-streak-celebrate-and-recover` opened off
+  `main` (clean tree). Status flipped from `groomed` to `in-progress`; index
+  row in `docs/backlog/README.md` mirrored.
+- Plan: tests-first per AGENTS.md P-2. `tests/milestone.sh` with one
+  assertion block per AC box (14 boxes), fixtures under
+  `tests/fixtures/milestone/`, `$HOME/.local/bin` stub PATH per LESSONS
+  2026-05-26, frozen clock via `FLEET_NOW_OVERRIDE` + paired
+  `FLEET_NOW_OVERRIDE_YESTERDAY` per the ticket. Then implement
+  `milestone_*` helpers + dispatcher in `bin/fleet` placed next to
+  `streak()` per "Engineering notes". Reuse the existing
+  `streak_discover`, `streak_walk_days`, `streak_collapse_runs` from
+  ticket 0042 — there is no `streak_compute_for_slug` in the file;
+  the equivalent compute is the `walk + collapse` pair.
