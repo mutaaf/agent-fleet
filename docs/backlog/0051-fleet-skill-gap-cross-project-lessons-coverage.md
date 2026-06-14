@@ -1,7 +1,7 @@
 ---
 id: 0051
 title: fleet skill-gap <slug> diffs a project's PHASE 0 reads against the fleet-wide CROSS_LESSONS coverage
-status: in-progress
+status: shipped
 priority: P2
 area: governance
 created: 2026-06-13
