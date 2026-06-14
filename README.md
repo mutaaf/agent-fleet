@@ -476,6 +476,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet ticket-cost 0042                                  # attribute every $ spent shipping one ticket (ticket 0047 — pure reader of runs.jsonl + pr_opened; --slug, --since Nd|YYYY-MM-DD default 30d, --json)
 ~/code/agent-fleet/bin/fleet recap --since 30d --public                         # shareable narrative snapshot of the last N days (ticket 0048 — pure reader; --since Nd|YYYY-MM-DD default 30d, --public anonymizes slugs, --json)
 ~/code/agent-fleet/bin/fleet tour ~/code/your-repo                              # walk events.jsonl with PRINCIPLES.md annotations (ticket 0050 — pure reader; --archive walks rotated segments, --type filters, --json emits NDJSON)
+~/code/agent-fleet/bin/fleet skill-gap courtiq                                  # diagnose CROSS_LESSONS coverage gaps for one project (ticket 0051 — pure reader of events.jsonl + CROSS_LESSONS feed; --since Nd|YYYY-MM-DD default 30d, --threshold N default 3, --json)
 ```
 
 **Dry-run mode (ticket 0010).** Setting `AGENT_DRY_RUN=1` flips

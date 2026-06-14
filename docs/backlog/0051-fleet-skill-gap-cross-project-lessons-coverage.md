@@ -1,7 +1,7 @@
 ---
 id: 0051
 title: fleet skill-gap <slug> diffs a project's PHASE 0 reads against the fleet-wide CROSS_LESSONS coverage
-status: groomed
+status: in-progress
 priority: P2
 area: governance
 created: 2026-06-13
@@ -541,4 +541,10 @@ Files / patterns the dev should touch.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-13: implementation-dev branched `feat/0051-fleet-skill-gap`; wrote
+  `tests/skill-gap.sh` and per-AC fixtures under
+  `tests/fixtures/skill-gap/`; added `skill_gap_*` helpers and the
+  `skill_gap` dispatcher in `bin/fleet` next to `prompts-suggest` per
+  LESSONS 2026-06-05 (dispatcher forward-reference); reused
+  `prompts_suggest_normalize_headline` verbatim; called
+  `preflight_json_escape` directly per LESSONS 2026-06-13 (no wrapper).

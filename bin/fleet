@@ -67,6 +67,9 @@
 #   fleet prompts-suggest     propose PRINCIPLES.md additions from recurring send-back drafts
 #                             (ticket 0045 — fleet-wide reader of lesson_draft_emitted;
 #                              --since Nd|YYYY-MM-DD default 30d, --threshold N default 3, --json)
+#   fleet skill-gap <slug>    diagnose CROSS_LESSONS coverage gaps for one project
+#                             (ticket 0051 — pure reader of events.jsonl + CROSS_LESSONS;
+#                              --since Nd|YYYY-MM-DD default 30d, --threshold N default 3, --json)
 #   fleet ticket-cost <id>    attribute every $ spent shipping one ticket
 #                             (ticket 0047 — pure reader of runs.jsonl + pr_opened events;
 #                              --slug, --since Nd|YYYY-MM-DD default 30d, --json)
@@ -7253,6 +7256,611 @@ USAGE
 
 if [ "$CMD" = "prompts-suggest" ]; then
   prompts_suggest "$@"
+fi
+
+# --- skill-gap (ticket 0051) ----------------------------------------------
+# `fleet skill-gap <slug>` diffs the named slug's recurring send-back
+# headlines against the fleet-wide CROSS_LESSONS feed and surfaces
+# coverage gaps. Pure reader; no events.jsonl writes, no CROSS_LESSONS.md
+# writes, no agents.config.sh writes, no new event types. Reuses
+# `prompts_suggest_normalize_headline` verbatim (ticket 0045). All
+# helpers are defined above the dispatcher per LESSONS 2026-06-05
+# (forward-reference). JSON escape calls `preflight_json_escape` directly
+# per LESSONS 2026-06-13 (no `*_json_escape` wrapper — self-check would
+# flag it).
+
+skill_gap_discover_slugs() {
+  local _seen="" m slug
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    local proj_dir; proj_dir="$(dirname "$m")"
+    printf -- '%s\t%s\t%s\n' "$slug" "$proj_dir" "$HOME/.cache/${slug}-agent"
+  done | sort -t $'\t' -k1,1
+}
+
+# Precedence: $FLEET_CROSS_LESSONS env → manifest CROSS_LESSONS → default.
+# Echoes "<path>\t<source>" where source is env|manifest|default.
+skill_gap_resolve_cross_lessons_path() {
+  local manifest="$1"
+  if [ -n "${FLEET_CROSS_LESSONS:-}" ]; then
+    printf -- '%s\t%s\n' "$FLEET_CROSS_LESSONS" "env"
+    return 0
+  fi
+  local v=""
+  if [ -f "$manifest" ]; then
+    # shellcheck disable=SC1090
+    v=$( (source "$manifest"; echo "${CROSS_LESSONS:-}") 2>/dev/null )
+  fi
+  if [ -n "$v" ]; then
+    printf -- '%s\t%s\n' "$v" "manifest"
+    return 0
+  fi
+  printf -- '%s\t%s\n' "$HOME/.local/share/agent-fleet/CROSS_LESSONS.md" "default"
+}
+
+# True when the slug's manifest sets CROSS_LESSONS=. Env override doesn't
+# count — the path-unset check inspects the operator's manifest only.
+skill_gap_manifest_has_cross_lessons() {
+  local manifest="$1"
+  [ -f "$manifest" ] || return 1
+  local v
+  # shellcheck disable=SC1090
+  v=$( (source "$manifest"; echo "${CROSS_LESSONS:-}") 2>/dev/null )
+  [ -n "$v" ]
+}
+
+# Walk CROSS_LESSONS.md. One TSV record per dated heading:
+#   slug_section<TAB>date<TAB>title<TAB>body_first_80
+# slug_section is the closest preceding `## <slug>` heading (sentinel `-`
+# when none). body_first_80 is the first non-empty body line truncated
+# to 80 bytes (sentinel `-` when empty).
+skill_gap_parse_cross_lessons() {
+  local path="$1"
+  [ -f "$path" ] || return 0
+  awk '
+    BEGIN { count = 0; cur_slug = "-"; pending_body = 0; pending_idx = -1 }
+    function record_emit(i,    body) {
+      body = bodies[i]
+      if (body == "") body = "-"
+      printf "%s\t%s\t%s\t%s\n", slugs[i], dates[i], titles[i], body
+    }
+    # Dated headings live at level 2 or 3 (lessons-sync demotes source
+    # `## YYYY-MM-DD` to `### YYYY-MM-DD` so dates nest under per-slug
+    # `## <slug>` sections). One regex for both; branch on the date.
+    /^##+ / {
+      hdr = $0
+      sub(/^##+ /, "", hdr)
+      # If hdr matches a date prefix, treat as a dated heading.
+      if (hdr ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}/) {
+        # Close any pending heading by flushing its body record now.
+        if (pending_body == 1) {
+          record_emit(pending_idx)
+          pending_body = 0
+        }
+        # Extract date and title.
+        d = hdr
+        sub(/[[:space:]].*/, "", d)
+        t = hdr
+        sub(/^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+/, "", t)
+        # Strip the leading non-space token (em-dash) + trailing space.
+        sub(/^[^[:space:]]+[[:space:]]+/, "", t)
+        slugs[count]  = cur_slug
+        dates[count]  = d
+        titles[count] = t
+        bodies[count] = ""
+        pending_idx   = count
+        pending_body  = 1
+        count++
+        next
+      }
+      # Non-dated heading is a slug section header (always level 2 in
+      # the lessons-sync output, but we tolerate level 3+ for safety).
+      if (pending_body == 1) {
+        record_emit(pending_idx)
+        pending_body = 0
+      }
+      cur_slug = hdr
+      next
+    }
+    # Inside a dated heading: capture the FIRST non-empty body line.
+    pending_body == 1 {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line == "") next
+      if (bodies[pending_idx] == "") {
+        # Truncate to first 80 bytes.
+        bodies[pending_idx] = substr(line, 1, 80)
+      }
+    }
+    END {
+      if (pending_body == 1) record_emit(pending_idx)
+    }
+  ' "$path"
+}
+
+# For the named slug, walk events.jsonl for in-window
+# lesson_draft_emitted events, normalize via prompts_suggest_normalize_
+# headline, cluster, and emit "normalized<TAB>frequency" for clusters
+# whose count >= threshold.
+skill_gap_collect_recurring_headlines() {
+  local events="$1" slug="$2" cutoff="$3" threshold="$4"
+  [ -f "$events" ] || return 0
+  # Step 1: extract (epoch, raw_headline) per in-window event.
+  local raw_tmp; raw_tmp="$(mktemp -t skill-gap-raw.XXXXXX)"
+  awk -v cutoff="$cutoff" '
+    BEGIN { count = 0 }
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    /"type":"lesson_draft_emitted"/ {
+      ts = ""; headline = ""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts)
+        sub(/".*/, "", ts)
+      }
+      if (match($0, /"headline"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        headline = substr($0, RSTART, RLENGTH)
+        sub(/.*"headline"[[:space:]]*:[[:space:]]*"/, "", headline)
+        sub(/".*/, "", headline)
+      }
+      if (ts == "" || headline == "") next
+      ep = iso2ep(ts)
+      if (ep < cutoff) next
+      printf "%s\t%s\n", ep, headline
+      count++
+    }
+  ' "$events" > "$raw_tmp"
+  # Step 2: normalize each headline via the shared helper.
+  local norm_tmp; norm_tmp="$(mktemp -t skill-gap-norm.XXXXXX)"
+  local ep raw norm
+  while IFS=$'\t' read -r ep raw; do
+    [ -z "$ep" ] && continue
+    norm="$(prompts_suggest_normalize_headline "$raw")"
+    [ -z "$norm" ] && continue
+    printf -- '%s\n' "$norm" >> "$norm_tmp"
+  done < "$raw_tmp"
+  rm -f "$raw_tmp"
+  # Step 3: cluster + threshold-filter via awk; one TSV row per cluster.
+  awk -v th="$threshold" '
+    BEGIN { count = 0 }
+    {
+      key = $0
+      if (!(key in seen)) {
+        seen[key] = 1
+        order[count++] = key
+      }
+      freq[key]++
+    }
+    END {
+      for (i = 0; i < count; i++) {
+        k = order[i]
+        if (freq[k] + 0 >= th + 0) {
+          printf "%s\t%s\n", k, freq[k]
+        }
+      }
+    }
+  ' "$norm_tmp"
+  rm -f "$norm_tmp"
+}
+
+# Lowercase + strip filler + substring in either direction. Returns 0
+# on match. Per LESSONS 2026-06-05 (bash 3.2 LC_ALL caching) all
+# character-level work uses LC_ALL=C awk, not bash's ${s:i:1}.
+skill_gap_fuzzy_match() {
+  local a_raw="$1" b_raw="$2"
+  local a b
+  a="$(printf -- '%s' "$a_raw" | LC_ALL=C awk '{
+    s = tolower($0)
+    sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s)
+    gsub(/[[:space:]]+/, " ", s)
+    sub(/[.,;:!?]+$/, "", s)
+    # Strip a few common leading filler words. v1: "a ", "the ".
+    sub(/^a /, "", s); sub(/^the /, "", s)
+    printf "%s", s
+  }')"
+  b="$(printf -- '%s' "$b_raw" | LC_ALL=C awk '{
+    s = tolower($0)
+    sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s)
+    gsub(/[[:space:]]+/, " ", s)
+    sub(/[.,;:!?]+$/, "", s)
+    sub(/^a /, "", s); sub(/^the /, "", s)
+    printf "%s", s
+  }')"
+  [ -z "$a" ] && return 1
+  [ -z "$b" ] && return 1
+  case "$a" in *"$b"*) return 0 ;; esac
+  case "$b" in *"$a"*) return 0 ;; esac
+  return 1
+}
+
+# Run the four coverage checks for a (cluster, cross_lesson) pair.
+# Echoes "<check_name>\t<suggested_fix>" — check_name is one of
+# CROSS_LESSONS_PATH_UNSET, CROSS_LESSONS_FILE_MISSING,
+# OVERRIDE_SHADOWING, LESSON_PROSE_NOT_GENERALIZED.
+skill_gap_run_coverage_checks() {
+  local slug="$1" manifest="$2" feed_path="$3" feed_source="$4"
+  local cl_date="$5" cl_title="$6"
+  # Check 1: PATH UNSET — manifest has no explicit CROSS_LESSONS.
+  if ! skill_gap_manifest_has_cross_lessons "$manifest"; then
+    printf -- 'CROSS_LESSONS_PATH_UNSET\tadd CROSS_LESSONS="$HOME/.local/share/agent-fleet/CROSS_LESSONS.md" to %s/agents.config.sh and re-install.\n' \
+      "$slug"
+    return 0
+  fi
+  # Check 2: FILE MISSING — manifest path doesn't exist on disk.
+  if [ ! -f "$feed_path" ]; then
+    printf -- 'CROSS_LESSONS_FILE_MISSING\trun `fleet lessons-sync` to populate %s.\n' \
+      "$feed_path"
+    return 0
+  fi
+  # Check 3: OVERRIDE SHADOWING — per-slug override file exists AND
+  # does NOT contain a matching `## YYYY-MM-DD — <title>` heading for
+  # the cross-lesson under inspection.
+  local override_root="${FLEET_CROSS_LESSONS_ROOT:-$HOME/.local/share/agent-fleet}"
+  local override_path="$override_root/projects/$slug/CROSS_LESSONS.md.override"
+  if [ -f "$override_path" ]; then
+    # Look for the cross-lesson date in the override file. If absent,
+    # the override is shadowing the shared feed.
+    if ! grep -qF -- "$cl_date" "$override_path"; then
+      printf -- 'OVERRIDE_SHADOWING\tcat %s to inspect; remove if not needed, or append the matched lesson manually, or re-promote with `fleet lessons-promote --scope %s`.\n' \
+        "$override_path" "$slug"
+      return 0
+    fi
+  fi
+  # Check 4: PROSE NOT GENERALIZED — feed is read, lesson is present,
+  # no override shadowing. The slug keeps hitting the failure mode
+  # despite the lesson being on disk → the cross-version's prose may
+  # be too slug-specific.
+  printf -- 'LESSON_PROSE_NOT_GENERALIZED\trun `fleet lessons-promote %s --scope all --source %s` to re-promote with broader scope, OR `fleet lessons-promote <source-slug> --scope all --source %s --rewrite` to rewrite the cross version.\n' \
+    "$slug" "$cl_date" "$cl_date"
+  # feed_source is consumed only to silence shellcheck; the four
+  # branches above all reference whichever source resolved.
+  : "${feed_source}"
+  return 0
+}
+
+# From parsed CROSS_LESSONS rows on stdin + fleet-wide headlines in $1,
+# emit one date<TAB>title<TAB>slug_section row per heading with zero
+# matching recurring headlines (no-signal candidates).
+skill_gap_compose_no_signal_footer() {
+  local fleet_headlines="$1"
+  local slug_section date title body
+  while IFS=$'\t' read -r slug_section date title body; do
+    [ -z "$date" ] && continue
+    [ -z "$title" ] && continue
+    local matched=0 norm
+    if [ -s "$fleet_headlines" ]; then
+      while IFS= read -r norm; do
+        [ -z "$norm" ] && continue
+        if skill_gap_fuzzy_match "$norm" "$title"; then
+          matched=1
+          break
+        fi
+      done < "$fleet_headlines"
+    fi
+    if [ "$matched" -eq 0 ]; then
+      printf -- '%s\t%s\t%s\n' "$date" "$title" "$slug_section"
+    fi
+    # `body` is captured to keep the field count stable; not rendered.
+    : "${body}"
+  done
+}
+
+# Text render: one block per gap, then no-signal footer.
+skill_gap_render_text() {
+  local slug="$1" window="$2" gaps_file="$3" no_signal_file="$4"
+  local n_gaps="$5" n_no_signal="$6"
+  if [ "$n_gaps" -eq 0 ]; then
+    printf -- 'skill-gap: %s has no coverage gaps in the trailing %s.\n' "$slug" "$window"
+  else
+    printf -- 'skill-gap: %s has %s recurring send-back headline(s) that map to CROSS_LESSONS entries it appears to have missed.\n\n' \
+      "$slug" "$n_gaps"
+    local idx=0 headline freq cl_date cl_title cl_slug check fix
+    while IFS=$'\t' read -r headline freq cl_date cl_title cl_slug check fix; do
+      [ -z "$headline" ] && continue
+      idx=$(( idx + 1 ))
+      printf -- '  [%s] %s — %s\n' "$idx" "$cl_date" "$cl_title"
+      printf -- '      cross_lesson source: %s\n' "$cl_slug"
+      printf -- '      recurring headline: "%s" (x%s in the trailing %s)\n' \
+        "$headline" "$freq" "$window"
+      printf -- '      coverage check: %s\n' "$check"
+      printf -- '      suggested fix: %s\n\n' "$fix"
+    done < "$gaps_file"
+  fi
+  if [ "$n_no_signal" -gt 0 ]; then
+    printf -- 'no-signal entries (no recurring headline across any slug in the trailing %s; candidates for `fleet lessons-prune`):\n' "$window"
+    local d t s
+    while IFS=$'\t' read -r d t s; do
+      [ -z "$d" ] && continue
+      printf -- '  - %s — %s (under ## %s)\n' "$d" "$t" "$s"
+    done < "$no_signal_file"
+  fi
+}
+
+# JSON render: one object per gap + summary. Per LESSONS 2026-06-13
+# call preflight_json_escape directly (no `*_json_escape` wrapper).
+skill_gap_render_json() {
+  local slug="$1" window="$2" gaps_file="$3" no_signal_file="$4"
+  local n_gaps="$5" n_no_signal="$6"
+  local headline freq cl_date cl_title cl_slug check fix
+  local esc_slug esc_headline esc_cl_date esc_cl_title esc_cl_slug esc_check esc_fix esc_window
+  esc_slug="$(preflight_json_escape "$slug")"
+  esc_window="$(preflight_json_escape "$window")"
+  while IFS=$'\t' read -r headline freq cl_date cl_title cl_slug check fix; do
+    [ -z "$headline" ] && continue
+    esc_headline="$(preflight_json_escape "$headline")"
+    esc_cl_date="$(preflight_json_escape "$cl_date")"
+    esc_cl_title="$(preflight_json_escape "$cl_title")"
+    esc_cl_slug="$(preflight_json_escape "$cl_slug")"
+    esc_check="$(preflight_json_escape "$check")"
+    esc_fix="$(preflight_json_escape "$fix")"
+    printf -- '{"slug":"%s","cluster_headline":"%s","frequency":%s,"cross_lesson_date":"%s","cross_lesson_title":"%s","cross_lesson_source_slug":"%s","coverage_check":"%s","suggested_fix":"%s"}\n' \
+      "$esc_slug" "$esc_headline" "$freq" "$esc_cl_date" "$esc_cl_title" \
+      "$esc_cl_slug" "$esc_check" "$esc_fix"
+  done < "$gaps_file"
+  printf -- '{"summary":{"slug":"%s","window":"%s","gaps_found":%s,"no_signal_entries":%s}}\n' \
+    "$esc_slug" "$esc_window" "$n_gaps" "$n_no_signal"
+}
+
+# Dispatcher entry. Per LESSONS 2026-06-01 every path exits explicitly.
+skill_gap() {
+  shift  # drop "skill-gap"
+  local slug="" since="30d" threshold=3 want_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)         want_json=1; shift ;;
+      --since)        since="${2:-}"; shift 2 ;;
+      --since=*)      since="${1#--since=}"; shift ;;
+      --threshold)    threshold="${2:-}"; shift 2 ;;
+      --threshold=*)  threshold="${1#--threshold=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet skill-gap <slug> — diagnose CROSS_LESSONS coverage gaps for one project.
+
+Usage:
+  fleet skill-gap <slug>                       default --since 30d, threshold 3
+  fleet skill-gap <slug> --since 14d           narrow the window (Nd or YYYY-MM-DD)
+  fleet skill-gap <slug> --since 2026-05-01    explicit start date
+  fleet skill-gap <slug> --threshold 5         only clusters with >=5 events
+  fleet skill-gap <slug> --threshold 1         list every cluster (debug)
+  fleet skill-gap <slug> --json                one JSON object per gap, summary last
+
+Each coverage gap surfaces one of four diagnoses:
+  - CROSS_LESSONS_PATH_UNSET         the slug's agents.config.sh has no
+                                     CROSS_LESSONS= value; PHASE 0 never
+                                     reads the feed for this slug.
+  - CROSS_LESSONS_FILE_MISSING       the path is set but the file doesn't
+                                     exist on disk; run `fleet lessons-sync`.
+  - OVERRIDE_SHADOWING               the per-slug override file shadows the
+                                     shared feed and omits the matched lesson.
+  - LESSON_PROSE_NOT_GENERALIZED     the feed carries the lesson but the
+                                     prose is too slug-specific to land.
+
+Pure reader: no events.jsonl writes, no CROSS_LESSONS.md writes, no
+agents.config.sh writes, no fleet_emit_event calls. The operator owns
+the fix.
+USAGE
+        exit 0 ;;
+      --)             shift ;;
+      -*)
+        printf -- 'skill-gap: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$slug" ]; then
+          slug="$1"
+          shift
+        else
+          printf -- 'skill-gap: unexpected extra argument %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$slug" ]; then
+    printf -- 'skill-gap: usage: bin/fleet skill-gap <slug> [--since Nd] [--threshold N] [--json]\n' >&2
+    exit 2
+  fi
+
+  # Validate threshold.
+  case "$threshold" in
+    ''|*[!0-9]*)
+      printf -- 'skill-gap: --threshold must be a positive integer\n' >&2
+      exit 2 ;;
+  esac
+  [ "$threshold" -lt 1 ] && threshold=1
+
+  # Parse --since via the shared prompts_suggest_parse_since helper.
+  local since_seconds
+  since_seconds="$(prompts_suggest_parse_since "$since")" || {
+    printf -- 'skill-gap: invalid --since %s (use Nd or YYYY-MM-DD)\n' "$since" >&2
+    exit 2
+  }
+
+  local now cutoff
+  now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  cutoff=$(( now - since_seconds ))
+
+  # Discover all slugs; locate the requested one.
+  local discover_rows
+  discover_rows="$(skill_gap_discover_slugs)"
+  if [ -z "$discover_rows" ]; then
+    printf -- 'skill-gap: no projects discovered. run `fleet onboard` to adopt one.\n' >&2
+    exit 2
+  fi
+
+  local manifest="" cache_dir="" found=0 all_slugs=""
+  local s_slug s_dir s_cache
+  while IFS=$'\t' read -r s_slug s_dir s_cache; do
+    [ -z "$s_slug" ] && continue
+    if [ -z "$all_slugs" ]; then
+      all_slugs="$s_slug"
+    else
+      all_slugs="$all_slugs, $s_slug"
+    fi
+    if [ "$s_slug" = "$slug" ]; then
+      manifest="$s_dir/agents.config.sh"
+      cache_dir="$s_cache"
+      found=1
+    fi
+  done <<<"$discover_rows"
+
+  if [ "$found" -eq 0 ]; then
+    printf -- 'skill-gap: slug %s not found. discovered slugs: %s.\n' "$slug" "$all_slugs" >&2
+    exit 2
+  fi
+
+  # Resolve CROSS_LESSONS path.
+  local resolve_pair feed_path feed_source
+  resolve_pair="$(skill_gap_resolve_cross_lessons_path "$manifest")"
+  feed_path="${resolve_pair%%	*}"
+  feed_source="${resolve_pair##*	}"
+
+  if [ ! -f "$feed_path" ]; then
+    # Differentiate the "file is missing AND there is no recurring
+    # cluster" case from the "file is missing AND cluster exists"
+    # case. For the v1 surface, if the feed is missing entirely the
+    # operator's first action is `fleet lessons-sync`; we short-
+    # circuit with a hint. BUT: when the file-missing is due to a
+    # manifest-set path (CROSS_LESSONS_FILE_MISSING coverage check),
+    # we still want to surface that as a gap. So: only short-circuit
+    # when the resolution source is the env or default.
+    if [ "$feed_source" != "manifest" ]; then
+      printf -- 'skill-gap: no CROSS_LESSONS feed found at %s. run `fleet lessons-sync` to populate it.\n' \
+        "$feed_path"
+      exit 0
+    fi
+  fi
+
+  # Collect this slug's recurring headlines.
+  local recur_tmp; recur_tmp="$(mktemp -t skill-gap-recur.XXXXXX)"
+  local events_path="$cache_dir/events.jsonl"
+  skill_gap_collect_recurring_headlines "$events_path" "$slug" "$cutoff" "$threshold" \
+    > "$recur_tmp"
+  local n_recur
+  n_recur="$(awk 'END { print NR + 0 }' "$recur_tmp")"
+
+  # Parse CROSS_LESSONS feed (empty when feed missing — file-missing
+  # branch still wants the coverage check fired).
+  local parsed_tmp; parsed_tmp="$(mktemp -t skill-gap-parsed.XXXXXX)"
+  if [ -f "$feed_path" ]; then
+    skill_gap_parse_cross_lessons "$feed_path" > "$parsed_tmp"
+  fi
+
+  # Collect fleet-wide recurring headlines for the no-signal footer.
+  # (Walk every discovered slug.)
+  local fleet_recur_tmp; fleet_recur_tmp="$(mktemp -t skill-gap-fleet-recur.XXXXXX)"
+  while IFS=$'\t' read -r s_slug s_dir s_cache; do
+    [ -z "$s_slug" ] && continue
+    skill_gap_collect_recurring_headlines "$s_cache/events.jsonl" "$s_slug" "$cutoff" "$threshold" \
+      | awk -F'\t' '{ print $1 }' >> "$fleet_recur_tmp"
+  done <<<"$discover_rows"
+
+  # No-signal footer rows (date<TAB>title<TAB>slug_section).
+  local no_signal_tmp; no_signal_tmp="$(mktemp -t skill-gap-nosig.XXXXXX)"
+  if [ -s "$parsed_tmp" ]; then
+    skill_gap_compose_no_signal_footer "$fleet_recur_tmp" < "$parsed_tmp" > "$no_signal_tmp"
+  fi
+  local n_no_signal
+  n_no_signal="$(awk 'END { print NR + 0 }' "$no_signal_tmp")"
+
+  # Empty cluster branch — no recurring headlines for this slug.
+  if [ "$n_recur" -eq 0 ]; then
+    if [ "$want_json" = "1" ]; then
+      skill_gap_render_json "$slug" "$since" /dev/null "$no_signal_tmp" 0 "$n_no_signal"
+    else
+      printf -- 'skill-gap: %s has no recurring send-back headlines (>=%s occurrences) in the trailing %s. The loop is either healthy or the window is too short.\n' \
+        "$slug" "$threshold" "$since"
+      if [ "$n_no_signal" -gt 0 ]; then
+        printf -- '\n'
+        skill_gap_render_text "$slug" "$since" /dev/null "$no_signal_tmp" 0 "$n_no_signal" \
+          | awk 'NR>1 || /^no-signal/'
+      fi
+    fi
+    rm -f "$recur_tmp" "$parsed_tmp" "$fleet_recur_tmp" "$no_signal_tmp"
+    exit 0
+  fi
+
+  # Build the gaps tmp file. One row per matched cluster:
+  #   headline<TAB>freq<TAB>cl_date<TAB>cl_title<TAB>cl_slug<TAB>check<TAB>fix
+  # Synthetic branch: when the manifest has no CROSS_LESSONS or the
+  # feed file is missing, every recurring cluster surfaces the diag
+  # directly (no cross-lesson to match against).
+  local gaps_tmp; gaps_tmp="$(mktemp -t skill-gap-gaps.XXXXXX)"
+  local headline freq cl_slug cl_date cl_title cl_body match_pair check_name fix
+  local rest_row
+  local force_synthetic=0
+  if ! skill_gap_manifest_has_cross_lessons "$manifest"; then
+    force_synthetic=1
+  elif [ ! -f "$feed_path" ]; then
+    force_synthetic=1
+  fi
+  while IFS=$'\t' read -r headline freq; do
+    [ -z "$headline" ] && continue
+    cl_slug="-"
+    cl_date="-"
+    cl_title="-"
+    cl_body="-"
+    if [ "$force_synthetic" = "1" ]; then
+      # Synthetic match — the gap is the missing-feed/unset-path itself.
+      :
+    else
+      # Find the first CROSS_LESSON heading that fuzzy-matches.
+      local matched_row=""
+      while IFS=$'\t' read -r cl_slug cl_date cl_title cl_body; do
+        [ -z "$cl_date" ] && continue
+        if skill_gap_fuzzy_match "$headline" "$cl_title"; then
+          matched_row="$cl_slug	$cl_date	$cl_title	$cl_body"
+          break
+        fi
+      done < "$parsed_tmp"
+      [ -z "$matched_row" ] && continue
+      cl_slug="${matched_row%%	*}"
+      rest_row="${matched_row#*	}"
+      cl_date="${rest_row%%	*}"
+      rest_row="${rest_row#*	}"
+      cl_title="${rest_row%%	*}"
+      cl_body="${rest_row#*	}"
+      : "${cl_body}"
+    fi
+    # Run the coverage checks.
+    match_pair="$(skill_gap_run_coverage_checks "$slug" "$manifest" "$feed_path" \
+      "$feed_source" "$cl_date" "$cl_title")"
+    check_name="${match_pair%%	*}"
+    fix="${match_pair#*	}"
+    printf -- '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$headline" "$freq" "$cl_date" "$cl_title" "$cl_slug" "$check_name" "$fix" \
+      >> "$gaps_tmp"
+  done < "$recur_tmp"
+
+  local n_gaps
+  n_gaps="$(awk 'END { print NR + 0 }' "$gaps_tmp")"
+
+  if [ "$want_json" = "1" ]; then
+    skill_gap_render_json "$slug" "$since" "$gaps_tmp" "$no_signal_tmp" "$n_gaps" "$n_no_signal"
+  else
+    skill_gap_render_text "$slug" "$since" "$gaps_tmp" "$no_signal_tmp" "$n_gaps" "$n_no_signal"
+  fi
+
+  rm -f "$recur_tmp" "$parsed_tmp" "$fleet_recur_tmp" "$no_signal_tmp" "$gaps_tmp"
+  exit 0
+}
+
+if [ "$CMD" = "skill-gap" ]; then
+  skill_gap "$@"
 fi
 
 # --- recap (ticket 0048) ---------------------------------------------------
