@@ -1,7 +1,7 @@
 ---
 id: 0053
 title: fleet portfolio --redact emits a leak-safe one-pager of the whole fleet for a blog post or peer demo
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-15

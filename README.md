@@ -479,6 +479,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet skill-gap courtiq                                  # diagnose CROSS_LESSONS coverage gaps for one project (ticket 0051 — pure reader of events.jsonl + CROSS_LESSONS feed; --since Nd|YYYY-MM-DD default 30d, --threshold N default 3, --json)
 ~/code/agent-fleet/bin/fleet add ~/projects/sidebrew --inherit-from courtiq      # add a project to your fleet by inheriting another slug's policy (ticket 0052 — scaffold + install + onboarding-check; --inherit-from <slug>, --dry-run, --force; reuses onboard_* helpers, writes no events)
 ~/code/agent-fleet/bin/fleet portfolio --redact                                  # leak-safe fleet-wide one-pager for a blog post or peer demo (ticket 0053 — pure reader; --redact pseudonymizes slug names + PR numbers + dollar amounts + repo URLs + paths + lesson headlines; --keep-slug-names / --since / --json; pseudonym map held in memory only, never persisted to disk)
+~/code/agent-fleet/bin/fleet maturity sidebrew                                   # score one project against the 7-step activation funnel (ticket 0054 — pure reader of events.jsonl + agents.config.sh + CROSS_LESSONS + morning-last-run; --all / --since Nd|YYYY-MM-DD default 30d / --json; no writes, no new event types)
 ```
 
 **Dry-run mode (ticket 0010).** Setting `AGENT_DRY_RUN=1` flips
