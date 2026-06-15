@@ -469,3 +469,36 @@ such wrapper as a regression. If a project really needs a
 prefixed name for stylistic consistency, the body must duplicate
 the guarded escape loop verbatim (then carry its own LESSONS
 2026-06-03 reference).
+
+## 2026-06-15 — awk `while (match(s, /pat/)) { s = before repl after }` loops forever when `repl` contains chars that re-match `pat`
+
+While shipping ticket 0053's `portfolio_redact_text`, the first cut
+of the dollar-band rewrite was
+`while (match(s, /\$[0-9]+(\.[0-9]+)?/)) { s = before band after }`,
+where `band` is one of the nine band strings (`<$1`, `~$1`, `~$2`,
+`~$5`, …, `~$100`, `>$100`). Every band token CONTAINS a `$<digits>`
+substring (`~$5` literally contains `$5`), so the next `match(s, ...)`
+call re-found the band's own embedded `$5` and re-banded it forever.
+Two awk subprocesses ate 100% CPU for ~5 minutes before I noticed
+`tests/portfolio.sh` hadn't returned. Same trap fired separately on the
+repo-URL rewrite: the replacement `github.com/<redacted>/<repo>`
+contains the literal `github.com` the regex itself matches, so
+`while (match(s, /github\.com[:\/]…/))` looped indefinitely. The
+slug-name rewrite did NOT trip the trap because `index(rest, name)`
+on the not-yet-consumed `rest` advances past the match site each
+iteration — it's the `s = before X after; while (match(s, ...))`
+shape specifically that bites, because `before` and `after` are
+folded back into `s` (the new `s` may now contain matches inside the
+replacement). Fix: use a CURSOR-based walk — keep an `out` accumulator
+and a `rest` tail, and after each match append `substr(rest, 1,
+RSTART - 1) repl` to `out` and slide `rest = substr(rest, RSTART +
+RLENGTH)`. Final `s = out rest`. The regex now only ever scans the
+not-yet-rewritten tail, so a self-matching `repl` is harmless. Cheap
+defensive habit: any time a `while (match(s, /pat/))` block's
+replacement string COULD contain characters that match `pat`, switch
+to the cursor pattern instead. Quick audit: every band/wrap/decorate
+substitution (anything that adds a prefix/suffix to the matched value)
+is suspect; pure replacements (e.g. `<path>` for a `/...` regex —
+`<path>` has no `/`) are usually safe but using the cursor for
+symmetry costs nothing. Distinct from `gsub` which always
+short-circuits self-match because it walks the string ONCE.
