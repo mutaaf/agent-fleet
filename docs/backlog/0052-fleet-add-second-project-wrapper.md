@@ -1,7 +1,7 @@
 ---
 id: 0052
 title: fleet add <repo> compresses a second-project install by inheriting one existing slug's manifest defaults
-status: in-progress
+status: shipped
 priority: P1
 area: engine
 created: 2026-06-15
@@ -422,3 +422,12 @@ Files / patterns the dev should touch.
   — the actual name in this kit; the ticket's `overview_discover_slugs`
   language was descriptive). Manifest source-read uses subshell with
   TSV `key<TAB>-` sentinels for empty middle fields (LESSONS 2026-06-08).
+- 2026-06-15: PR #109 opened on feat/0052-fleet-add-inherit-manifest; CI
+  initially red on `shellcheck -S warning` (the Linux runner is stricter
+  than macOS homebrew shellcheck — SC2034 on `add_project_specific_fields`
+  and an unused `padded`/`need` local in `add_render_diff`). Single-push
+  heal: marked the contract surface array with `# shellcheck disable=SC2034`
+  (it is referenced only by `tests/add.sh`'s AC#4 grep, not by the
+  dispatcher) and pruned the dead locals. Second push went green;
+  auto-merge fired; merge commit 0141efc landed on main 2026-06-15T06:22Z.
+  Feature PR carries the 14 ACs; this mark-shipped follow-up flips status.

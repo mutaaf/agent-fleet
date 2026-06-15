@@ -70,6 +70,6 @@ ones, `review` grades them.
 | 0049 | fleet milestone celebrates streak milestones and composes a one-line recovery nudge on streak break | P1 | shipped | observability |
 | 0050 | fleet tour walks a new operator through their first events.jsonl annotated by PRINCIPLES | P2 | shipped | docs |
 | 0051 | fleet skill-gap <slug> diffs a project's PHASE 0 reads against the fleet-wide CROSS_LESSONS coverage | P2 | shipped | governance |
-| 0052 | fleet add <repo> compresses a second-project install by inheriting one existing slug's manifest defaults | P1 | in-progress | engine |
+| 0052 | fleet add <repo> compresses a second-project install by inheriting one existing slug's manifest defaults | P1 | shipped | engine |
 | 0053 | fleet portfolio --redact emits a leak-safe one-pager of the whole fleet for a blog post or peer demo | P1 | groomed | observability |
 | 0054 | fleet maturity <slug> scores how far one project has walked the post-install activation funnel | P2 | groomed | observability |
