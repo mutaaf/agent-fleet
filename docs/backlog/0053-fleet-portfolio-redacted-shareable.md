@@ -1,7 +1,7 @@
 ---
 id: 0053
 title: fleet portfolio --redact emits a leak-safe one-pager of the whole fleet for a blog post or peer demo
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-15
@@ -503,3 +503,8 @@ Files / patterns the dev should touch.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+### 2026-06-15 — implementation-dev pickup
+- Branch: `feat/0053-fleet-portfolio-redact`.
+- Status flipped to `in-progress` in the same branch; backlog index row updated to match (per LESSONS 2026-05-22 README index/file drift).
+- Approach: a new `portfolio()` dispatcher placed next to `recap()` (~line 8806) sharing the per-slug walkers from `recap_*` for events/runs/streak math but adding a fleet-wide redaction pre-processor before render. Pure reader: no `lib/`, no `prompts/`, no `events.jsonl` writes, no new event types. ~350 lines of `portfolio_*` helpers + ~350 lines of test + fixtures + one README/help line.
