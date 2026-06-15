@@ -82,6 +82,10 @@
 #   fleet portfolio --redact  emit a leak-safe fleet-wide one-pager for a blog post or peer demo
 #                             (ticket 0053 — pure reader; --redact / --keep-slug-names / --since / --json;
 #                              pseudonym map held in memory only, never persisted to disk)
+#   fleet maturity <slug>     score one project against the 7-step activation funnel
+#                             (ticket 0054 — pure reader of events.jsonl + agents.config.sh +
+#                              CROSS_LESSONS + morning-last-run; --all / --since / --json;
+#                              no writes, no new event types)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -16520,6 +16524,883 @@ USAGE
 
 if [ "$CMD" = "streak" ]; then
   streak "$@"
+  exit $?
+fi
+
+# --- maturity (ticket 0054) ----------------------------------------------
+# `fleet maturity <slug>` scores one project against a fixed 7-step
+# activation funnel and prints a per-step PASS / PENDING / STUCK line
+# plus a "next nudge" footer. Pure reader of events.jsonl + the slug's
+# agents.config.sh + the kit's CROSS_LESSONS feed + the kit's
+# morning-last-run state file. No writes anywhere; no fleet_emit_event
+# calls; no new event types; no lib/ or prompts/ changes.
+#
+# Per LESSONS 2026-06-05 (forward-reference trap) every `maturity_*`
+# helper is defined ABOVE the maturity() dispatcher block, and every
+# call into a LATER-defined helper happens via the streak()/inbox
+# pattern of `( fn fn --args )` so the dispatcher's late definition
+# is irrelevant (those functions are already parsed by the time the
+# user runs `fleet maturity`).
+#
+# Per LESSONS 2026-06-13 (no *_json_escape wrapper around
+# preflight_json_escape) JSON escaping calls preflight_json_escape
+# directly at each site; the streak --json parser is an inline
+# `node -e` shellout (no helper wrapper around it).
+#
+# Per LESSONS 2026-05-28 every print of a user-derived slug name
+# uses `printf -- '%s'`. Per LESSONS 2026-06-01 every count uses
+# `awk … END { print n+0 }`. Per LESSONS 2026-06-08 awk scripts
+# that index by counter declare `BEGIN { count = 0 }`. Per LESSONS
+# 2026-06-11 a `--since YYYY-MM-DD` value is normalized to
+# `YYYY-MM-DDT00:00:00` before any BSD `date -j -f` call.
+
+# Discover projects without sourcing every manifest. The standard
+# pattern is `source <manifest>; echo "$SLUG"`, but for a hot read-
+# path that's ~50ms × N manifests. We grep instead: `SLUG=` is the
+# kit's contract field. Falls back to the directory name when
+# the field is absent. Row shape mirrors skill_gap_discover_slugs:
+# slug<TAB>proj_dir<TAB>cache_dir, one record per slug, de-duped.
+maturity_discover_slugs() {
+  local _seen="" m slug proj_dir
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # Pull SLUG= via awk — way faster than sourcing the manifest.
+    slug="$(awk -F'=' '
+      BEGIN { count = 0 }
+      /^[[:space:]]*SLUG[[:space:]]*=/ {
+        v = $2
+        gsub(/^[[:space:]"]+|["[:space:]]+$/, "", v)
+        print v
+        exit
+      }' "$m")"
+    proj_dir="$(dirname "$m")"
+    # Fallback to the parent directory's basename if SLUG was absent.
+    [ -z "$slug" ] && slug="$(basename "$proj_dir")"
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf -- '%s\t%s\t%s\n' "$slug" "$proj_dir" "$HOME/.cache/${slug}-agent"
+  done | sort -t $'\t' -k1,1
+}
+
+maturity_resolve_install_anchor() {  # $1 = events.jsonl, $2 = now_epoch
+  local events="$1" now_epoch="$2"
+  # 1. First run_started ts (if events exists and has one).
+  if [ -f "$events" ] && [ -s "$events" ]; then
+    local first_ts
+    first_ts="$(awk '
+      BEGIN { count = 0 }
+      /"type"[[:space:]]*:[[:space:]]*"run_started"/ {
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts)
+          sub(/".*/, "", ts)
+          print ts
+          exit
+        }
+      }
+    ' "$events")"
+    if [ -n "$first_ts" ]; then
+      # Convert "YYYY-MM-DDTHH:MM:SSZ" to epoch.
+      local ep
+      ep="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$first_ts" '+%s' 2>/dev/null \
+            || date -u -d "$first_ts" '+%s' 2>/dev/null)"
+      if [ -n "$ep" ]; then
+        printf -- '%s\n' "$ep"
+        return 0
+      fi
+    fi
+  fi
+  # 2. File mtime fallback.
+  if [ -f "$events" ]; then
+    local m
+    m="$(stat -f %m "$events" 2>/dev/null || stat -c %Y "$events" 2>/dev/null)"
+    if [ -n "$m" ]; then
+      printf -- '%s\n' "$m"
+      return 0
+    fi
+  fi
+  # 3. NOW fallback.
+  printf -- '%s\n' "$now_epoch"
+}
+
+# Step 1: events.jsonl has ≥1 run_completed inside the window.
+# Echoes "<status>\t<render_detail>\t<nudge>" where status is one of
+# PASS|PENDING and render_detail is human-friendly.
+#
+# Performance: we pass the cutoff IN as an ISO8601 string and compare
+# inside awk lexicographically. ISO8601 strings sort identically to
+# the epoch they encode, so this is correct AND avoids the per-event
+# `date -j -f` shellout that drove a 90-day streak walk to ~13s. See
+# the perf note inline below.
+maturity_step1_has_run_completed() {  # $1 = events, $2 = cutoff_epoch, $3 = cutoff_iso
+  local events="$1" cutoff="$2" cutoff_iso="$3"
+  if [ ! -f "$events" ]; then
+    printf -- 'PENDING\tno run_completed in window\trun the loop at least once: `bin/fleet kickstart <slug> ship`\n'
+    return 0
+  fi
+  local latest_ts
+  latest_ts="$(awk -v cutoff_iso="$cutoff_iso" '
+    BEGIN { count = 0; best = "" }
+    /"type"[[:space:]]*:[[:space:]]*"run_completed"/ {
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts)
+        sub(/".*/, "", ts)
+        if (ts < cutoff_iso) next
+        if (ts > best) best = ts
+      }
+    }
+    END { if (best != "") print best }
+  ' "$events")"
+  if [ -z "$latest_ts" ]; then
+    printf -- 'PENDING\tno run_completed in window\trun the loop at least once: `bin/fleet kickstart <slug> ship`\n'
+    return 0
+  fi
+  local ep
+  ep="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$latest_ts" '+%s' 2>/dev/null \
+        || date -u -d "$latest_ts" '+%s' 2>/dev/null)"
+  if [ -z "$ep" ]; then
+    # Couldn't parse — render without relative time.
+    printf -- 'PASS\tlast completion: %s\t-\n' "$latest_ts"
+    return 0
+  fi
+  local now rel
+  now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  rel="$(maturity_format_relative_age "$(( now - ep ))")"
+  printf -- 'PASS\tlast completion: %s\t-\n' "$rel"
+}
+
+# Step 2: events.jsonl has ≥1 pr_opened event inside the window.
+maturity_step2_has_pr_opened() {  # $1 = events, $2 = cutoff_iso
+  local events="$1" cutoff_iso="$2"
+  if [ ! -f "$events" ]; then
+    printf -- 'PENDING\tno pr_opened yet\tlet the loop ship one ticket — review and merge the PR\n'
+    return 0
+  fi
+  local n
+  n="$(awk -v cutoff_iso="$cutoff_iso" '
+    BEGIN { count = 0 }
+    /"type"[[:space:]]*:[[:space:]]*"pr_opened"/ {
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts)
+        sub(/".*/, "", ts)
+        if (ts >= cutoff_iso) count++
+      }
+    }
+    END { print count+0 }
+  ' "$events")"
+  [ -z "$n" ] && n=0
+  if [ "$n" -ge 1 ]; then
+    printf -- 'PASS\t%s pr_opened event(s) in window\t-\n' "$n"
+  else
+    printf -- 'PENDING\tno pr_opened yet\tlet the loop ship one ticket — review and merge the PR\n'
+  fi
+}
+
+# Step 3: morning-last-run state file present. PASS = mtime exists;
+# PASS_DRIFTING = present but >7 days old; PENDING = missing.
+maturity_step3_morning_invoked() {  # no args — reads $HOME state
+  local state="$HOME/.local/state/agent-fleet/morning-last-run"
+  if [ ! -f "$state" ]; then
+    printf -- 'PENDING\tnever run\trun `fleet morning` to start your day with the verdict + digest\n'
+    return 0
+  fi
+  local m now age
+  m="$(stat -f %m "$state" 2>/dev/null || stat -c %Y "$state" 2>/dev/null)"
+  if [ -z "$m" ]; then
+    printf -- 'PENDING\tstate file unreadable\trun `fleet morning` to start your day with the verdict + digest\n'
+    return 0
+  fi
+  now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  age=$(( now - m ))
+  local rel
+  rel="$(maturity_format_relative_age "$age")"
+  if [ "$age" -gt $(( 7 * 86400 )) ]; then
+    printf -- 'PASS\tdrifting — last run: %s\t-\n' "$rel"
+  else
+    printf -- 'PASS\tlast run: %s\t-\n' "$rel"
+  fi
+}
+
+# Step 4: ≥1 pr_opened whose number also appears in a pr_footer_posted.
+# PENDING if no pr_opened. STUCK if pr_opened ≥1 but no pr_footer_posted
+# AND oldest unmerged pr_opened is older than 48h. ISO8601-string
+# comparison stays correct because ISO sorts identically to epoch.
+maturity_step4_pr_merged() {  # $1 = events, $2 = cutoff_iso, $3 = now_epoch
+  local events="$1" cutoff_iso="$2" now_epoch="$3"
+  if [ ! -f "$events" ]; then
+    printf -- 'PENDING\tno pr_opened yet\tlet the loop ship one ticket — review and merge the PR\n'
+    return 0
+  fi
+  # Build a TSV "kind<TAB>number<TAB>ts" for in-window pr_opened and
+  # pr_footer_posted. Per LESSONS 2026-06-08 declare `BEGIN { count = 0 }`.
+  local rows
+  rows="$(awk -v cutoff_iso="$cutoff_iso" '
+    BEGIN { count = 0 }
+    /"type"[[:space:]]*:[[:space:]]*"pr_opened"/  { kind = "opened"  }
+    /"type"[[:space:]]*:[[:space:]]*"pr_footer_posted"/ { kind = "footer" }
+    {
+      if (kind != "opened" && kind != "footer") next
+      ts = ""; number = ""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts)
+        sub(/".*/, "", ts)
+      }
+      if (match($0, /"number"[[:space:]]*:[[:space:]]*"?[0-9]+"?/)) {
+        number = substr($0, RSTART, RLENGTH)
+        sub(/.*"number"[[:space:]]*:[[:space:]]*"?/, "", number)
+        sub(/".*/, "", number)
+      }
+      if (ts == "" || number == "" || ts < cutoff_iso) { kind = ""; next }
+      printf("%s\t%s\t%s\n", kind, number, ts)
+      kind = ""
+    }
+  ' "$events")"
+
+  # Count opened (footer count is implicit in the matched pairing below).
+  local opened_count matched_count
+  opened_count="$(printf -- '%s\n' "$rows" | awk -F'\t' 'BEGIN { count = 0 } $1=="opened" { n++ } END { print n+0 }')"
+
+  if [ "$opened_count" -eq 0 ]; then
+    printf -- 'PENDING\tno pr_opened yet\tlet the loop ship one ticket — review and merge the PR\n'
+    return 0
+  fi
+
+  # Pair via awk.
+  matched_count="$(printf -- '%s\n' "$rows" | awk -F'\t' '
+    BEGIN { count = 0; n = 0 }
+    $1 == "opened" { opened[$2] = 1 }
+    $1 == "footer" { footer[$2] = 1 }
+    END {
+      for (k in opened) {
+        if (k in footer) n++
+      }
+      print n+0
+    }')"
+
+  if [ "$matched_count" -ge 1 ]; then
+    printf -- 'PASS\t%s merged PR(s) in window\t-\n' "$matched_count"
+    return 0
+  fi
+
+  # No matches — find the oldest unmatched pr_opened ISO timestamp.
+  local oldest_unmatched_ts
+  oldest_unmatched_ts="$(printf -- '%s\n' "$rows" | awk -F'\t' '
+    BEGIN { count = 0; best = "" }
+    $1 == "footer" { footer[$2] = 1 }
+    $1 == "opened" { opened_ts[$2] = $3 }
+    END {
+      for (n in opened_ts) {
+        if (n in footer) continue
+        if (best == "" || opened_ts[n] < best) best = opened_ts[n]
+      }
+      if (best != "") print best
+    }')"
+
+  if [ -n "$oldest_unmatched_ts" ]; then
+    local oldest_ep
+    oldest_ep="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$oldest_unmatched_ts" '+%s' 2>/dev/null \
+                 || date -u -d "$oldest_unmatched_ts" '+%s' 2>/dev/null)"
+    if [ -n "$oldest_ep" ]; then
+      local age_s=$(( now_epoch - oldest_ep ))
+      if [ "$age_s" -gt $(( 48 * 3600 )) ]; then
+        printf -- 'STUCK\t%s pr_opened, 0 merged\trun `fleet doctor <slug>` to check for a stuck send-back OR review the PR — the loop will not auto-merge without you signing off if trainee mode is on\n' \
+          "$opened_count"
+        return 0
+      fi
+    fi
+  fi
+  printf -- 'PENDING\t%s pr_opened, 0 merged (within 48h)\twait for the loop to post the merge footer, or review the PR\n' \
+    "$opened_count"
+}
+
+# Step 5: ≥1 lesson_promoted event in the trailing window.
+maturity_step5_lesson_promoted() {  # $1 = events, $2 = cutoff_iso
+  local events="$1" cutoff_iso="$2"
+  if [ ! -f "$events" ]; then
+    printf -- 'PENDING\tno lesson promoted yet\twhen a send-back drops a `lesson_draft_emitted`, run `fleet lessons-promote <slug>` to lock it in\n'
+    return 0
+  fi
+  local n
+  n="$(awk -v cutoff_iso="$cutoff_iso" '
+    BEGIN { count = 0 }
+    /"type"[[:space:]]*:[[:space:]]*"lesson_promoted"/ {
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts)
+        sub(/".*/, "", ts)
+        if (ts >= cutoff_iso) count++
+      }
+    }
+    END { print count+0 }
+  ' "$events")"
+  [ -z "$n" ] && n=0
+  if [ "$n" -ge 1 ]; then
+    printf -- 'PASS\t%s lesson_promoted event(s) in window\t-\n' "$n"
+  else
+    printf -- 'PENDING\tno lesson promoted yet\twhen a send-back drops a `lesson_draft_emitted`, run `fleet lessons-promote <slug>` to lock it in\n'
+  fi
+}
+
+# Step 6: `fleet streak <slug> --json` returns a streak length ≥7.
+#
+# Implementation note: we DO NOT call `fleet streak` here. The streak
+# function shells out to BSD `date -j -v +1d` once per day in the
+# window, which costs ~13s for the default 90-day window and is too
+# slow inside an `--all` loop that walks every project. Instead we
+# replicate the streak's GREEN-DAY predicate directly via one awk
+# pass over events.jsonl: count distinct UTC YYYY-MM-DD days in the
+# trailing 14d that have a phase=ship run_completed exit=0 AND no
+# ship_paused / budget_block / unresolved gate_failed events the
+# same day. We then walk backward from today; the count of
+# consecutive green days ending today is the "current" streak. Per
+# LESSONS 2026-06-13 we do NOT wrap this parser in a `*_json_escape`
+# helper — it's inline. Per LESSONS 2026-06-08 the awk declares
+# `BEGIN { count = 0 }`.
+maturity_step6_streak_started() {  # $1 = slug, $2 = events, $3 = now_epoch
+  local slug="$1" events="$2" now_epoch="$3"
+  if [ ! -f "$events" ] || [ ! -s "$events" ]; then
+    printf -- "PENDING\tno streak yet\tyou're 0/7 — keep merging green agent PRs and the streak builds itself\n"
+    return 0
+  fi
+
+  local today_day cutoff_day cutoff_iso
+  today_day="$(date -u -r "$now_epoch" '+%Y-%m-%d' 2>/dev/null \
+                || date -u -d "@$now_epoch" '+%Y-%m-%d' 2>/dev/null)"
+  cutoff_day="$(date -u -r "$(( now_epoch - 13 * 86400 ))" '+%Y-%m-%d' 2>/dev/null \
+                || date -u -d "@$(( now_epoch - 13 * 86400 ))" '+%Y-%m-%d' 2>/dev/null)"
+  cutoff_iso="${cutoff_day}T00:00:00Z"
+
+  # One awk pass: for each day in the window, classify green/red/neutral
+  # using the same predicate as `fleet streak`. Then walk the days
+  # backward from today, counting consecutive green days. Output is
+  # the integer "current" streak length.
+  local current
+  current="$(awk -v today_day="$today_day" -v cutoff_iso="$cutoff_iso" '
+    function days_in_month(y, m) {
+      if (m == 1 || m == 3 || m == 5 || m == 7 || m == 8 || m == 10 || m == 12) return 31
+      if (m == 4 || m == 6 || m == 9 || m == 11) return 30
+      if ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) return 29
+      return 28
+    }
+    function prev_day(d,  y, m, da) {
+      y = substr(d, 1, 4) + 0
+      m = substr(d, 6, 2) + 0
+      da = substr(d, 9, 2) + 0
+      da--
+      if (da < 1) {
+        m--
+        if (m < 1) { m = 12; y-- }
+        da = days_in_month(y, m)
+      }
+      return sprintf("%04d-%02d-%02d", y, m, da)
+    }
+    BEGIN { count = 0 }
+    {
+      ts=""; type=""; phase=""; exit_code=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (ts == "" || ts < cutoff_iso) next
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"phase"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        phase=substr($0, RSTART, RLENGTH)
+        sub(/.*"phase"[[:space:]]*:[[:space:]]*"/, "", phase); sub(/".*/, "", phase)
+      }
+      if (match($0, /"exit"[[:space:]]*:[[:space:]]*"?[^",}]*"?/)) {
+        exit_code=substr($0, RSTART, RLENGTH)
+        sub(/.*"exit"[[:space:]]*:[[:space:]]*"?/, "", exit_code)
+        sub(/"$/, "", exit_code)
+      }
+      day = substr(ts, 1, 10)
+      if (day > today_day) next
+      if (type == "ship_paused")     paused[day]    = 1
+      else if (type == "budget_block") budget[day]  = 1
+      else if (type == "gate_failed" && phase == "ship") gate_unresolved[day] = 1
+      else if (type == "run_completed" && phase == "ship") {
+        if (exit_code == "0" || exit_code == 0) {
+          ship_ok[day]++
+          gate_unresolved[day] = 0
+        }
+      }
+    }
+    END {
+      cur_day = today_day
+      streak = 0
+      for (i = 0; i < 14; i++) {
+        if ((cur_day in paused) || (cur_day in budget) || (cur_day in gate_unresolved && gate_unresolved[cur_day] == 1)) {
+          break
+        }
+        if (cur_day in ship_ok && ship_ok[cur_day] > 0) {
+          streak++
+        }
+        # else: neutral day, preserves streak (absent days are neutral
+        # per the streak walker rule, LESSONS 2026-06-08).
+        cur_day = prev_day(cur_day)
+      }
+      print streak + 0
+    }
+  ' "$events")"
+  [ -z "$current" ] && current=0
+  case "$current" in ''|*[!0-9]*) current=0 ;; esac
+  if [ "$current" -ge 7 ]; then
+    printf -- 'PASS\t%s-day green streak\t-\n' "$current"
+  else
+    printf -- "PENDING\tno streak yet\tyou're %s/7 — keep merging green agent PRs and the streak builds itself\n" "$current"
+  fi
+}
+
+# Step 7: slug's agents.config.sh has CROSS_LESSONS= set AND the
+# resolved file has ≥1 heading whose title matches a lesson_promoted
+# event's `headline` (fuzzy lowercase substring). Reuses
+# skill_gap_fuzzy_match VERBATIM per LESSONS 2026-06-05 (LC_ALL=C awk
+# inside it; bash 3.2 locale-cache trap).
+maturity_step7_cross_lesson_cited() {  # $1 = manifest, $2 = events, $3 = cutoff_iso
+  local manifest="$1" events="$2" cutoff_iso="$3"
+  # (a) manifest must have CROSS_LESSONS=.
+  local cl_path=""
+  # Grep the value instead of sourcing the manifest. The kit convention
+  # is `CROSS_LESSONS="…"`; awk is ~50x faster than spawning a subshell
+  # per call (matters in --all over many slugs). The LESSONS 2026-06-05
+  # export-in-subshell trap is moot here because we never source.
+  if [ -f "$manifest" ]; then
+    cl_path="$(awk -F'=' '
+      BEGIN { count = 0 }
+      /^[[:space:]]*CROSS_LESSONS[[:space:]]*=/ {
+        v = $0
+        sub(/^[[:space:]]*CROSS_LESSONS[[:space:]]*=[[:space:]]*/, "", v)
+        gsub(/^["[:space:]]+|["[:space:]]+$/, "", v)
+        print v
+        exit
+      }' "$manifest")"
+  fi
+  if [ -z "$cl_path" ]; then
+    printf -- 'PENDING\tCROSS_LESSONS unset in agents.config.sh\tset CROSS_LESSONS in agents.config.sh and `fleet lessons-sync` to pull in fleet-wide lessons\n'
+    return 0
+  fi
+  if [ ! -f "$cl_path" ]; then
+    printf -- 'PENDING\tCROSS_LESSONS file missing on disk\trun `fleet lessons-sync` to populate the feed\n'
+    return 0
+  fi
+  # (b) extract dated titles from the feed.
+  local feed_titles
+  feed_titles="$(awk '
+    BEGIN { count = 0 }
+    /^##+ [0-9]{4}-[0-9]{2}-[0-9]{2}/ {
+      h = $0
+      sub(/^##+ [0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+/, "", h)
+      sub(/^[^[:space:]]+[[:space:]]+/, "", h)
+      print h
+    }' "$cl_path")"
+  if [ -z "$feed_titles" ]; then
+    printf -- 'PENDING\tno dated headings in CROSS_LESSONS feed\trun `fleet lessons-sync` to pull in fleet-wide lessons\n'
+    return 0
+  fi
+  # (c) collect lesson_promoted headlines for this slug in the window.
+  local promoted_titles=""
+  if [ -f "$events" ]; then
+    promoted_titles="$(awk -v cutoff_iso="$cutoff_iso" '
+      BEGIN { count = 0 }
+      /"type"[[:space:]]*:[[:space:]]*"lesson_promoted"/ {
+        ts = ""; headline = ""
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts)
+          sub(/".*/, "", ts)
+        }
+        if (match($0, /"headline"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          headline = substr($0, RSTART, RLENGTH)
+          sub(/.*"headline"[[:space:]]*:[[:space:]]*"/, "", headline)
+          sub(/".*/, "", headline)
+        }
+        if (ts == "" || headline == "" || ts < cutoff_iso) next
+        print headline
+      }
+    ' "$events")"
+  fi
+  if [ -z "$promoted_titles" ]; then
+    printf -- 'PENDING\tno lesson_promoted with a headline in window\tthis step activates passively once another slug promotes a relevant lesson\n'
+    return 0
+  fi
+  # (d) fuzzy match each promoted_title against each feed_title via
+  # skill_gap_fuzzy_match. First match wins.
+  local pt ft
+  while IFS= read -r pt; do
+    [ -z "$pt" ] && continue
+    while IFS= read -r ft; do
+      [ -z "$ft" ] && continue
+      if skill_gap_fuzzy_match "$pt" "$ft"; then
+        printf -- 'PASS\theadline "%s" matches CROSS_LESSONS entry\t-\n' "$pt"
+        return 0
+      fi
+    done <<<"$feed_titles"
+  done <<<"$promoted_titles"
+  printf -- 'PENDING\tno promoted headline matches CROSS_LESSONS yet\tthis step activates passively once another slug promotes a relevant lesson\n'
+}
+
+# Compose the "next nudge" footer per AC #10. Reads a TSV file of
+# "step_num<TAB>status<TAB>nudge" records. Returns:
+#   - lowest-numbered STUCK > lowest-numbered PENDING > none.
+maturity_compose_next_nudge() {  # $1 = steps_tsv
+  local tsv="$1"
+  # Steps TSV columns: 1=num, 2=id, 3=status, 4=detail, 5=nudge.
+  # Lowest STUCK.
+  local stuck
+  stuck="$(awk -F'\t' '
+    BEGIN { count = 0; best = "" }
+    $3 == "STUCK" { if (best == "" || $1+0 < best+0) { best = $1; nudge = $5 } }
+    END { if (best != "") printf("%s\t%s", best, nudge) }
+  ' "$tsv")"
+  if [ -n "$stuck" ]; then
+    local num="${stuck%%	*}" txt="${stuck#*	}"
+    printf -- 'next nudge: address step %s first — %s\n' "$num" "$txt"
+    return 0
+  fi
+  local pending
+  pending="$(awk -F'\t' '
+    BEGIN { count = 0; best = "" }
+    $3 == "PENDING" { if (best == "" || $1+0 < best+0) { best = $1; nudge = $5 } }
+    END { if (best != "") printf("%s\t%s", best, nudge) }
+  ' "$tsv")"
+  if [ -n "$pending" ]; then
+    local num="${pending%%	*}" txt="${pending#*	}"
+    printf -- 'next nudge: step %s — %s\n' "$num" "$txt"
+    return 0
+  fi
+  printf -- 'next nudge: none — fully activated. run `fleet portfolio --redact` to share the shape.\n'
+}
+
+# Format a relative-age integer (seconds) as "<N> minutes/hours/days
+# ago". Helper for human-friendly rendering. Negative ages clamp to 0.
+maturity_format_relative_age() {  # $1 = age in seconds
+  local s="${1-0}"
+  [ -z "$s" ] && s=0
+  [ "$s" -lt 0 ] && s=0
+  if [ "$s" -lt 60 ]; then
+    printf -- 'just now'
+  elif [ "$s" -lt 3600 ]; then
+    printf -- '%d minutes ago' "$(( s / 60 ))"
+  elif [ "$s" -lt 86400 ]; then
+    printf -- '%d hours ago' "$(( s / 3600 ))"
+  else
+    printf -- '%d days ago' "$(( s / 86400 ))"
+  fi
+}
+
+# Parse a --since value (Nd or YYYY-MM-DD). Echo seconds since
+# the given "now" epoch. Per LESSONS 2026-06-11, the YYYY-MM-DD
+# branch normalizes to YYYY-MM-DDT00:00:00 before calling
+# `date -j -f %Y-%m-%dT%H:%M:%S`.
+maturity_parse_since() {  # $1 = raw, $2 = now_epoch
+  local raw="$1" now_epoch="$2" n
+  case "$raw" in
+    [0-9]*d)
+      n="${raw%d}"
+      case "$n" in ''|*[!0-9]*) return 1 ;; esac
+      printf -- '%s\n' "$(( n * 86400 ))"
+      return 0
+      ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+      local ep
+      ep="$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "${raw}T00:00:00" '+%s' 2>/dev/null \
+            || date -u -d "${raw}T00:00:00" '+%s' 2>/dev/null)" || return 1
+      [ -z "$ep" ] && return 1
+      local diff=$(( now_epoch - ep ))
+      [ "$diff" -lt 0 ] && diff=0
+      printf -- '%s\n' "$diff"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Render the per-slug 7-step block in text mode. Reads a "steps_tsv"
+# (one row per step: num<TAB>id<TAB>status<TAB>detail<TAB>nudge), the
+# slug header info, and the composed footer. Per LESSONS 2026-05-28
+# every slug-name print goes through `printf -- '%s'`.
+maturity_render_text() {  # $1 = slug, $2 = installed_days, $3 = score, $4 = steps_tsv, $5 = next_nudge_line
+  local slug="$1" installed_days="$2" score="$3" steps_tsv="$4" next_nudge="$5"
+  printf -- 'maturity: '
+  printf -- '%s' "$slug"
+  printf -- ' — installed %s days ago, score %s/7\n' "$installed_days" "$score"
+  awk -F'\t' '
+    BEGIN { count = 0 }
+    {
+      num = $1; id = $2; status = $3; detail = $4; nudge = $5
+      step_titles[1] = "events.jsonl has >=1 run_completed"
+      step_titles[2] = "a real PR was opened by the loop"
+      step_titles[3] = "you ran `fleet morning` at least once"
+      step_titles[4] = "PR merged"
+      step_titles[5] = "a lesson was promoted"
+      step_titles[6] = "a 7-day green streak"
+      step_titles[7] = "a CROSS_LESSON was cited"
+      printf("  [%s] step %s: %s\n", status, num, step_titles[num+0])
+      if (detail != "" && detail != "-") {
+        printf("         (%s)\n", detail)
+      }
+      if (status != "PASS" && nudge != "" && nudge != "-") {
+        printf("         %s\n", nudge)
+      }
+    }
+  ' "$steps_tsv"
+  printf -- '\n'
+  printf -- '%s\n' "$next_nudge"
+}
+
+# Render JSON mode. Per LESSONS 2026-06-03 JSON escape via
+# preflight_json_escape called DIRECTLY (no wrapper, per LESSONS
+# 2026-06-13). One object with slug, installed_days_ago, score,
+# steps[], next_nudge.
+maturity_render_json() {  # $1=slug, $2=installed_days, $3=score, $4=steps_tsv, $5=next_nudge
+  local slug="$1" installed_days="$2" score="$3" steps_tsv="$4" next_nudge="$5"
+  local slug_e nudge_e
+  slug_e="$(preflight_json_escape "$slug")"
+  nudge_e="$(preflight_json_escape "$next_nudge")"
+  printf -- '{"slug":"%s","installed_days_ago":%s,"score":%s,"steps":[' \
+    "$slug_e" "$installed_days" "$score"
+  local first=1 num id status detail nudge id_e nudge_step_e
+  while IFS=$'\t' read -r num id status detail nudge; do
+    [ -z "$num" ] && continue
+    [ "$first" = "1" ] && first=0 || printf -- ','
+    id_e="$(preflight_json_escape "$id")"
+    nudge_step_e="$(preflight_json_escape "$nudge")"
+    printf -- '{"id":"%s","status":"%s","nudge":"%s"}' \
+      "$id_e" "$status" "$nudge_step_e"
+  done < "$steps_tsv"
+  printf -- '],"next_nudge":"%s"}\n' "$nudge_e"
+}
+
+# Compute the 7-step score for one slug. Writes a TSV file with one
+# row per step. Returns 0 always. Helper used by both the single-slug
+# and --all paths.
+maturity_score_slug() {  # $1=slug, $2=manifest, $3=events, $4=cutoff_epoch, $5=cutoff_iso, $6=now_epoch, $7=out_tsv
+  local slug="$1" manifest="$2" events="$3" cutoff="$4" cutoff_iso="$5" now_epoch="$6" out="$7"
+  : > "$out"
+
+  local line status detail nudge
+  # Step 1.
+  line="$(maturity_step1_has_run_completed "$events" "$cutoff" "$cutoff_iso")"
+  status="${line%%	*}"; nudge="${line##*	}"; detail="${line#*	}"; detail="${detail%	*}"
+  printf -- '1\tHAS_RUN_COMPLETED\t%s\t%s\t%s\n' "$status" "$detail" "$nudge" >> "$out"
+
+  # Step 2.
+  line="$(maturity_step2_has_pr_opened "$events" "$cutoff_iso")"
+  status="${line%%	*}"; nudge="${line##*	}"; detail="${line#*	}"; detail="${detail%	*}"
+  printf -- '2\tHAS_PR_OPENED\t%s\t%s\t%s\n' "$status" "$detail" "$nudge" >> "$out"
+
+  # Step 3.
+  line="$(maturity_step3_morning_invoked)"
+  status="${line%%	*}"; nudge="${line##*	}"; detail="${line#*	}"; detail="${detail%	*}"
+  printf -- '3\tMORNING_INVOKED\t%s\t%s\t%s\n' "$status" "$detail" "$nudge" >> "$out"
+
+  # Step 4.
+  line="$(maturity_step4_pr_merged "$events" "$cutoff_iso" "$now_epoch")"
+  status="${line%%	*}"; nudge="${line##*	}"; detail="${line#*	}"; detail="${detail%	*}"
+  printf -- '4\tPR_MERGED\t%s\t%s\t%s\n' "$status" "$detail" "$nudge" >> "$out"
+
+  # Step 5.
+  line="$(maturity_step5_lesson_promoted "$events" "$cutoff_iso")"
+  status="${line%%	*}"; nudge="${line##*	}"; detail="${line#*	}"; detail="${detail%	*}"
+  printf -- '5\tLESSON_PROMOTED\t%s\t%s\t%s\n' "$status" "$detail" "$nudge" >> "$out"
+
+  # Step 6.
+  line="$(maturity_step6_streak_started "$slug" "$events" "$now_epoch")"
+  status="${line%%	*}"; nudge="${line##*	}"; detail="${line#*	}"; detail="${detail%	*}"
+  printf -- '6\tSTREAK_STARTED\t%s\t%s\t%s\n' "$status" "$detail" "$nudge" >> "$out"
+
+  # Step 7.
+  line="$(maturity_step7_cross_lesson_cited "$manifest" "$events" "$cutoff_iso")"
+  status="${line%%	*}"; nudge="${line##*	}"; detail="${line#*	}"; detail="${detail%	*}"
+  printf -- '7\tCROSS_LESSON_CITED\t%s\t%s\t%s\n' "$status" "$detail" "$nudge" >> "$out"
+}
+
+# Sum the PASS rows.
+maturity_count_pass() {  # $1 = steps_tsv
+  awk -F'\t' 'BEGIN { count = 0 } $3 == "PASS" { count++ } END { print count+0 }' "$1"
+}
+
+maturity() {
+  shift  # drop "maturity"
+  local want_json=0 want_all=0 since_raw="30d"
+  local slug=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)       want_json=1; shift ;;
+      --all)        want_all=1; shift ;;
+      --since)      since_raw="${2:-}"; shift 2 ;;
+      --since=*)    since_raw="${1#--since=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet maturity <slug> — score one project against the 7-step activation funnel.
+
+Usage:
+  fleet maturity <slug>                       default --since 30d
+  fleet maturity <slug> --since 14d           narrow the window (Nd or YYYY-MM-DD)
+  fleet maturity <slug> --since 2026-05-01    explicit start date
+  fleet maturity <slug> --json                one structured JSON object
+  fleet maturity --all                        one summary line per discovered slug
+                                              (sorted ascending by score)
+  fleet maturity --help                       this message
+
+Seven steps (fixed in v1):
+  1 HAS_RUN_COMPLETED   events.jsonl has >=1 run_completed in window
+  2 HAS_PR_OPENED       events.jsonl has >=1 pr_opened in window
+  3 MORNING_INVOKED     `fleet morning` ran at least once
+  4 PR_MERGED           pr_opened correlated with pr_footer_posted
+  5 LESSON_PROMOTED     events.jsonl has >=1 lesson_promoted in window
+  6 STREAK_STARTED      `fleet streak --json` returns current >= 7
+  7 CROSS_LESSON_CITED  CROSS_LESSONS heading matches a lesson_promoted headline
+
+Pure reader: no events.jsonl writes, no fleet_emit_event calls, no
+agents.config.sh / CROSS_LESSONS / morning-last-run writes.
+USAGE
+        exit 0 ;;
+      --)           shift ;;
+      -*)
+        printf -- 'maturity: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$slug" ]; then
+          slug="$1"
+          shift
+        else
+          printf -- 'maturity: unexpected extra argument %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+
+  # --all OR a slug is required.
+  if [ "$want_all" = "0" ] && [ -z "$slug" ]; then
+    printf -- 'maturity: usage: bin/fleet maturity <slug> [--all] [--since Nd] [--json]\n' >&2
+    exit 2
+  fi
+
+  local now_epoch since_seconds cutoff cutoff_iso
+  now_epoch="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  since_seconds="$(maturity_parse_since "$since_raw" "$now_epoch")" || {
+    printf -- 'maturity: invalid --since %s (use Nd or YYYY-MM-DD)\n' "$since_raw" >&2
+    exit 2
+  }
+  cutoff=$(( now_epoch - since_seconds ))
+  # Render cutoff as ISO8601 once so inner awks can lexicographic-
+  # compare instead of shelling out to `date` per matching line.
+  cutoff_iso="$(date -u -r "$cutoff" +%FT%TZ 2>/dev/null \
+                || date -u -d "@$cutoff" +%FT%TZ 2>/dev/null)"
+  [ -z "$cutoff_iso" ] && cutoff_iso="0000-00-00T00:00:00Z"
+
+  # Discover.
+  local rows
+  rows="$(maturity_discover_slugs)"
+  if [ -z "$rows" ]; then
+    printf -- 'maturity: no projects discovered. run `fleet onboard` to adopt one.\n' >&2
+    exit 2
+  fi
+
+  local s_slug s_dir s_cache all_slugs="" manifest="" cache_dir="" found=0
+  if [ "$want_all" = "0" ]; then
+    while IFS=$'\t' read -r s_slug s_dir s_cache; do
+      [ -z "$s_slug" ] && continue
+      if [ -z "$all_slugs" ]; then
+        all_slugs="$s_slug"
+      else
+        all_slugs="$all_slugs, $s_slug"
+      fi
+      if [ "$s_slug" = "$slug" ]; then
+        manifest="$s_dir/agents.config.sh"
+        cache_dir="$s_cache"
+        found=1
+      fi
+    done <<<"$rows"
+
+    if [ "$found" -eq 0 ]; then
+      printf -- 'maturity: slug %s not found. discovered slugs: %s.\n' "$slug" "$all_slugs" >&2
+      exit 2
+    fi
+
+    local events="$cache_dir/events.jsonl"
+    local anchor installed_days
+    anchor="$(maturity_resolve_install_anchor "$events" "$now_epoch")"
+    installed_days=$(( ( now_epoch - anchor ) / 86400 ))
+    [ "$installed_days" -lt 0 ] && installed_days=0
+
+    local steps_tsv; steps_tsv="$(mktemp -t maturity-steps.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -f '$steps_tsv'" RETURN
+
+    maturity_score_slug "$slug" "$manifest" "$events" "$cutoff" "$cutoff_iso" "$now_epoch" "$steps_tsv"
+    local score; score="$(maturity_count_pass "$steps_tsv")"
+    local next_nudge_line; next_nudge_line="$(maturity_compose_next_nudge "$steps_tsv")"
+
+    if [ "$want_json" = "1" ]; then
+      maturity_render_json "$slug" "$installed_days" "$score" "$steps_tsv" "$next_nudge_line"
+    else
+      maturity_render_text "$slug" "$installed_days" "$score" "$steps_tsv" "$next_nudge_line"
+    fi
+    exit 0
+  fi
+
+  # --all: one summary line per slug, sorted ascending by score.
+  local summary_tsv; summary_tsv="$(mktemp -t maturity-summary.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$summary_tsv'" RETURN
+  while IFS=$'\t' read -r s_slug s_dir s_cache; do
+    [ -z "$s_slug" ] && continue
+    local m="$s_dir/agents.config.sh"
+    local e="$s_cache/events.jsonl"
+    local tsv; tsv="$(mktemp -t maturity-steps-all.XXXXXX)"
+    maturity_score_slug "$s_slug" "$m" "$e" "$cutoff" "$cutoff_iso" "$now_epoch" "$tsv"
+    local sc; sc="$(maturity_count_pass "$tsv")"
+    # Lowest-numbered non-PASS step status.
+    local low_line
+    low_line="$(awk -F'\t' '
+      BEGIN { count = 0; best = "" }
+      $3 != "PASS" { if (best == "" || $1+0 < best+0) { best = $1; status = $3 } }
+      END { if (best != "") printf("step %s %s", best, tolower(status)) }
+    ' "$tsv")"
+    [ -z "$low_line" ] && low_line="fully activated"
+    printf -- '%s\t%s\t%s\n' "$sc" "$s_slug" "$low_line" >> "$summary_tsv"
+    rm -f "$tsv"
+  done <<<"$rows"
+  # Sort ascending by score; print one line per slug.
+  if [ "$want_json" = "1" ]; then
+    printf -- '['
+    local first=1
+    while IFS=$'\t' read -r sc s_slug low; do
+      [ -z "$s_slug" ] && continue
+      [ "$first" = "1" ] && first=0 || printf -- ','
+      local sl_e lo_e
+      sl_e="$(preflight_json_escape "$s_slug")"
+      lo_e="$(preflight_json_escape "$low")"
+      printf -- '{"slug":"%s","score":%s,"summary":"%s"}' "$sl_e" "$sc" "$lo_e"
+    done < <(sort -t $'\t' -k1,1n "$summary_tsv")
+    printf -- ']\n'
+  else
+    sort -t $'\t' -k1,1n "$summary_tsv" \
+      | while IFS=$'\t' read -r sc s_slug low; do
+          [ -z "$s_slug" ] && continue
+          printf -- '%s' "$s_slug"
+          printf -- ' %s/7 (%s)\n' "$sc" "$low"
+        done
+  fi
+  exit 0
+}
+
+if [ "$CMD" = "maturity" ]; then
+  maturity "$@"
   exit $?
 fi
 

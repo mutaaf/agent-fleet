@@ -1,7 +1,7 @@
 ---
 id: 0054
 title: fleet maturity <slug> scores how far one project has walked the post-install activation funnel
-status: groomed
+status: in-progress
 priority: P2
 area: observability
 created: 2026-06-15
@@ -473,4 +473,44 @@ Files / patterns the dev should touch.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-15 — picked up by implementation-dev. Drift fix: 0053
+  status reconciled (in-progress → shipped, README row matched) in
+  the same branch. Built `tests/maturity.sh` first (one assertion
+  block per AC box) then implemented the helpers per Engineering
+  notes: `maturity_discover_slugs`, `maturity_resolve_install_anchor`,
+  seven `maturity_step{1..7}_*` predicates, `maturity_compose_next_nudge`,
+  `maturity_format_relative_age`, `maturity_parse_since`,
+  `maturity_score_slug`, `maturity_render_text`,
+  `maturity_render_json`, `maturity_count_pass`. Dispatcher sits
+  AFTER streak's dispatcher block (line ~17400) per the forward-
+  reference convention. Help banner + README "Daily ops" each gain
+  one line per the same single-edit pattern.
+- 2026-06-15 — step 6 deviates from the AC's "parse `fleet streak
+  --json`" guidance: the streak walker shells out to BSD `date -j
+  -v +1d` once per day in the window, costing ~13s for the default
+  90-day walk — incompatible with the per-slug call rate in `--all`.
+  Replicated the GREEN-DAY predicate inline via one awk pass with
+  awk-internal Julian-style date arithmetic (`prev_day` helper);
+  same semantics, ~50ms per slug. Per LESSONS 2026-06-13 we still
+  call `preflight_json_escape` directly with no wrapper, and the
+  inline awk is not a `*_json_escape`-shaped helper.
+- 2026-06-15 — step 7 reuses `skill_gap_fuzzy_match` verbatim
+  (LC_ALL=C awk per LESSONS 2026-06-05), zero duplication. The
+  manifest's CROSS_LESSONS value is grepped via awk (not sourced)
+  for the same per-slug rate reason. The discovery helper
+  (`maturity_discover_slugs`) similarly greps SLUG=  from each
+  manifest instead of sourcing.
+- 2026-06-15 — pure reader confirmed via AC#15 (events.jsonl byte
+  size unchanged across one text + one JSON + one --all invocation
+  against the `fully` fixture). AC#16 confirmed via git diff
+  against main (lib/common.sh + prompts/ untouched).
+- 2026-06-15 — local gate: shellcheck (-S warning) green; bash -n
+  green; check-backlog green; FLEET_SELF_CHECK_GATE=1 self-check
+  reports 3 hits, all pre-existing on main (none in the new
+  maturity code). Test runtime ~28-30s — over the AC's <10s
+  stretch goal because the bin/fleet binary takes ~600ms per
+  invocation to parse the 20k-line file, and the suite makes
+  ~25 single-slug calls plus two `--all` walks. Mitigated by
+  fixture resets between AC blocks (`reset_fixtures` helper) so
+  --all is bounded; not further reducible without consolidating
+  the seven step-helpers into one awk pass (out of scope here).
