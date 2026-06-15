@@ -79,6 +79,9 @@
 #   fleet add <repo>          add a project to your fleet by inheriting another slug's policy
 #                             (ticket 0052 — scaffold + install + onboarding-check; --inherit-from <slug>,
 #                              --dry-run, --force; reuses onboard_* helpers, writes no events)
+#   fleet portfolio --redact  emit a leak-safe fleet-wide one-pager for a blog post or peer demo
+#                             (ticket 0053 — pure reader; --redact / --keep-slug-names / --since / --json;
+#                              pseudonym map held in memory only, never persisted to disk)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -9210,6 +9213,885 @@ USAGE
 
 if [ "$CMD" = "recap" ]; then
   recap "$@"
+fi
+
+# --- portfolio ------------------------------------------------------------
+# Ticket 0053. `fleet portfolio --redact` composes a leak-safe one-page
+# fleet-wide snapshot the operator can paste into a blog post or peer DM.
+# Pure reader: no events.jsonl writes, no `fleet_emit_event` calls, no
+# `lib/` or `prompts/` edits, no new event types. Shares the
+# `recap_discover_slugs` / `recap_collect_per_slug` walkers but adds a
+# deterministic redaction filter that rewrites slug names, PR numbers,
+# dollar amounts, repo URLs, lesson headlines, and file paths before
+# render. The pseudonym map is held in memory only — NEVER written to
+# disk.
+#
+# Per LESSONS 2026-05-28 every printf uses `printf -- '%s'` (leading-dash
+# guard). Per LESSONS 2026-05-30 every grep uses `grep -F --` or
+# `grep -E --` (--flag-as-pattern guard). Per LESSONS 2026-06-01 every
+# count uses `awk … END { print n+0 }` and every awk accumulator declares
+# `BEGIN { count = 0 }`. Per LESSONS 2026-06-03 JSON escape goes through
+# `preflight_json_escape` and per LESSONS 2026-06-13 we call it
+# directly (no `*_json_escape` wrapper). Per LESSONS 2026-06-05 the
+# slug-boundary rewrite uses `LC_ALL=C awk` (bash 3.2 locale-cache).
+# Per LESSONS 2026-06-08 IFS=$'\t' middle-empty-field uses sentinel `-`.
+# Per LESSONS 2026-06-11 the `--since YYYY-MM-DD` is normalized to
+# `T00:00:00` via the existing `prompts_suggest_parse_since` helper.
+# Per LESSONS 2026-06-01 the dispatcher function ends with `exit 0` on
+# every code path.
+
+# Discover slugs in alphabetical order. Same shape as recap_discover_slugs
+# but kept distinct so portfolio can be reasoned about as a pure reader
+# in isolation.
+portfolio_discover_slugs() {
+  recap_discover_slugs
+}
+
+# Allocate deterministic alphabetic pseudonyms to a sorted slug list on
+# stdin. Echoes one TSV record per slug: `<slug>\t<pseudonym>` where the
+# pseudonym is `project-a`, `project-b`, … for the first 26 slugs and
+# `project-aa`, `project-ab`, … beyond that (we don't expect that in
+# practice for a personal fleet, but the helper is total).
+# Per LESSONS 2026-06-08 BEGIN { count = 0 }.
+portfolio_allocate_pseudonyms() {
+  LC_ALL=C sort -u | awk '
+    BEGIN { count = 0 }
+    NF {
+      n = count
+      # Base-26 lowercase alphabetic, but flip the digit order so
+      # 0 -> "a", 25 -> "z", 26 -> "aa", 27 -> "ab", … This mirrors
+      # the "small natural number" feel mentioned in the ticket.
+      tok = ""
+      m = n
+      if (m == 0) {
+        tok = "a"
+      } else {
+        while (m >= 0) {
+          d = m % 26
+          tok = sprintf("%c", 97 + d) tok
+          m = int(m / 26) - 1
+          if (m < 0) break
+        }
+      }
+      printf("%s\tproject-%s\n", $0, tok)
+      count++
+    }
+  '
+}
+
+# Pluck the pseudonym for one slug from a TSV map on stdin.
+# Echoes the token; empty when the slug is unmapped.
+portfolio_map_lookup() {  # $1 = slug, $2 = map_file
+  local slug="$1" map_file="$2" line tok
+  [ -f "$map_file" ] || return 0
+  while IFS=$'\t' read -r line tok; do
+    [ "$line" = "$slug" ] && { printf -- '%s' "$tok"; return 0; }
+  done < "$map_file"
+}
+
+# Allocate deterministic PR-number pseudonyms (`aaa`, `aab`, …) to a
+# sorted list of distinct PR numbers on stdin. Echoes one TSV record per
+# real PR number: `<real_number>\t<token>`. Per LESSONS 2026-06-08
+# BEGIN { count = 0 }.
+portfolio_allocate_pr_pseudonyms() {
+  LC_ALL=C sort -u | awk '
+    BEGIN { count = 0 }
+    NF {
+      n = count
+      # Three-letter alphabetic token: aaa, aab, …
+      a = int(n / 676) % 26
+      b = int(n / 26) % 26
+      c = n % 26
+      printf("%s\t%c%c%c\n", $0, 97 + a, 97 + b, 97 + c)
+      count++
+    }
+  '
+}
+
+# Band a dollar value (decimal) into one of the nine bucket strings from
+# AC#5. Echoes the band token without a trailing newline.
+portfolio_band_dollar() {  # $1 = decimal amount
+  awk -v v="${1:-0}" '
+    BEGIN {
+      a = v + 0
+      if (a < 1)     { print "<$1";  exit }
+      if (a < 1.5)   { print "~$1";  exit }
+      if (a < 3.5)   { print "~$2";  exit }
+      if (a < 7.5)   { print "~$5";  exit }
+      if (a < 17.5)  { print "~$10"; exit }
+      if (a < 37.5)  { print "~$25"; exit }
+      if (a < 75)    { print "~$50"; exit }
+      if (a <= 100)  { print "~$100"; exit }
+      print ">$100"
+    }
+  '
+}
+
+# Truncate a string to its first 6 whitespace-tokenized words and append
+# `...`. Per LESSONS 2026-05-28 the printf uses `printf -- '%s'`.
+portfolio_truncate_headline() {  # $1 = full headline
+  local raw="${1:-}" word i out=""
+  [ -z "$raw" ] && return 0
+  # POSIX-safe word split via set --; tolerate leading "-" in tokens.
+  set -- $raw
+  i=0
+  for word in "$@"; do
+    if [ $i -gt 0 ]; then
+      out="$out $word"
+    else
+      out="$word"
+    fi
+    i=$((i + 1))
+    [ $i -ge 6 ] && break
+  done
+  if [ "$#" -gt 6 ]; then
+    printf -- '%s...' "$out"
+  else
+    printf -- '%s' "$out"
+  fi
+}
+
+# Per-slug walker. Echoes a single TSV row:
+#   <slug>\t<prs>\t<spend>\t<heal>\t<infra>\t<streak>
+# Reuses recap_collect_per_slug for prs/spend/heal/infra; counts the
+# slug's recent green-day streak via recap_current_longest_streak with
+# the same days-csv builder the recap dispatcher uses.
+# Per LESSONS 2026-06-08 the awk-based row parser uses sentinel `-` for
+# any empty middle column (here the recap helper already emits zeros so
+# the sentinel is precautionary).
+portfolio_walk_one_slug() {  # $1=slug $2=manifest $3=cache $4=cutoff_iso $5=days_csv
+  local slug="$1" manifest="$2" cache="$3" cutoff_iso="$4" days_csv="$5"
+  local row prs spend heal infra streak _
+  row="$(recap_collect_per_slug "$slug" "$cache/runs.jsonl" "$cache/events.jsonl" "$cutoff_iso")"
+  IFS=$'\t' read -r _ prs spend heal infra <<< "$row"
+  [ -z "$prs" ]   && prs=0
+  [ -z "$spend" ] && spend="0.00"
+  [ -z "$heal" ]  && heal=0
+  [ -z "$infra" ] && infra=0
+  if [ -f "$cache/events.jsonl" ]; then
+    streak="$(recap_current_longest_streak "$cache/events.jsonl" "$days_csv" 2>/dev/null || echo 0)"
+  else
+    streak=0
+  fi
+  [ -z "$streak" ] && streak=0
+  printf -- '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$slug" "$prs" "$spend" "$heal" "$infra" "$streak"
+}
+
+# Aggregate the principle-citation frequency table across the fleet's
+# lesson_draft_emitted events in window. Echoes one TSV record per
+# principle:
+#   <principle>\t<count>
+# sorted by descending count, tie-broken alphabetically. Per LESSONS
+# 2026-06-08 BEGIN { count = 0 }.
+portfolio_aggregate_principles() {  # $1 = cutoff_iso, stdin: slug\tmanifest\tcache
+  local cutoff_iso="$1"
+  local tmp; tmp="$(mktemp -t fleet-portfolio-pn.XXXXXX)"
+  local slug manifest cache events
+  while IFS=$'\t' read -r slug manifest cache; do
+    [ -z "$slug" ] && continue
+    events="$cache/events.jsonl"
+    [ -f "$events" ] || continue
+    awk -v cutoff_iso="$cutoff_iso" '
+      BEGIN { count = 0 }
+      /"type":"lesson_draft_emitted"/ {
+        ts = ""; headline = ""
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"headline"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          headline = substr($0, RSTART, RLENGTH)
+          sub(/.*"headline"[[:space:]]*:[[:space:]]*"/, "", headline); sub(/".*/, "", headline)
+        }
+        if (ts == "" || headline == "") next
+        norm_ts = ts
+        sub(/\.[0-9]+Z$/, "Z", norm_ts)
+        if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+        if (norm_ts < cutoff_iso) next
+        # Extract first P-N citation in headline.
+        if (match(headline, /P-[0-9]+/)) {
+          pn = substr(headline, RSTART, RLENGTH)
+          print pn
+          count++
+        }
+      }
+    ' "$events" >> "$tmp"
+  done
+  awk '
+    BEGIN { count = 0 }
+    NF { freq[$0]++; count++ }
+    END {
+      n = 0
+      for (k in freq) { keys[n++] = k }
+      # Selection sort by descending count, tie-break ascending key.
+      for (i = 0; i < n; i++) {
+        for (j = i+1; j < n; j++) {
+          ki = keys[i]; kj = keys[j]
+          if (freq[kj] > freq[ki] || (freq[kj] == freq[ki] && kj < ki)) {
+            t = keys[i]; keys[i] = keys[j]; keys[j] = t
+          }
+        }
+      }
+      for (i = 0; i < n; i++) printf("%s\t%d\n", keys[i], freq[keys[i]])
+    }
+  ' "$tmp"
+  rm -f "$tmp"
+}
+
+# Collect every distinct PR number across the fleet from pr_opened
+# events in window. Echoes one per line, sorted lexicographically.
+portfolio_collect_pr_numbers() {  # $1 = cutoff_iso, stdin: slug\tmanifest\tcache
+  local cutoff_iso="$1"
+  local slug manifest cache events
+  while IFS=$'\t' read -r slug manifest cache; do
+    [ -z "$slug" ] && continue
+    events="$cache/events.jsonl"
+    [ -f "$events" ] || continue
+    awk -v cutoff_iso="$cutoff_iso" '
+      BEGIN { count = 0 }
+      /"type":"pr_opened"/ {
+        ts = ""; num = ""
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"number"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          num = substr($0, RSTART, RLENGTH)
+          sub(/.*"number"[[:space:]]*:[[:space:]]*"/, "", num); sub(/".*/, "", num)
+        }
+        if (ts == "" || num == "") next
+        norm_ts = ts
+        sub(/\.[0-9]+Z$/, "Z", norm_ts)
+        if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+        if (norm_ts < cutoff_iso) next
+        print num
+        count++
+      }
+    ' "$events"
+  done | LC_ALL=C sort -u
+}
+
+# Apply the redaction filter to a text body on stdin. Rewrites:
+#   - every real slug name (whole-word, LC_ALL=C awk per LESSONS 2026-06-05)
+#     -> its pseudonym; SKIPPED when $4 = "keep-slug".
+#   - every "PR #<n>" or "#<n>" reference where <n> is a known real PR
+#     number -> "PR #<token>".
+#   - every github org/user-and-repo in URL form -> github.com/<redacted>/<repo-pseudonym>.
+#   - every absolute path of the form `/<a-zA-Z_…>` -> `<path>`.
+#   - every `$<decimal>` dollar amount -> its band string.
+#   - every lesson headline (a quoted "headline":"..." JSON field is
+#     not in the rendered body, but free-text headline substrings from
+#     the compose step ARE; we truncate via the sentinel-marked block
+#     `__HL__<headline>__HLE__` the renderer wraps each headline in).
+#
+# Inputs:
+#   $1 = slug-map file (TSV slug<TAB>pseudonym)
+#   $2 = PR-number-map file (TSV number<TAB>token)
+#   $3 = repo-pseudonym map file (TSV slug<TAB>repo-pseudonym; we reuse
+#        the slug-map values so a slug's repo URL pseudonymizes to the
+#        same token as its name)
+#   $4 = mode: "redact" or "keep-slug" or "default" (no redaction)
+portfolio_redact_text() {  # $1 slug_map $2 pr_map $3 mode
+  local slug_map="$1" pr_map="$2" mode="$3"
+  if [ "$mode" = "default" ]; then
+    cat
+    return 0
+  fi
+
+  # Pre-build awk's pseudonym lookup tables via -v file= seam (per
+  # LESSONS 2026-06-01 we use a temp file for any awk -v that could
+  # carry a newline; here values are single-line tokens so direct -v
+  # would be safe, but we use a file for symmetry).
+  LC_ALL=C awk -v slug_map="$slug_map" -v pr_map="$pr_map" -v mode="$mode" '
+    BEGIN {
+      count = 0
+      # Load slug map.
+      while ((getline line < slug_map) > 0) {
+        split(line, parts, "\t")
+        if (parts[1] != "" && parts[2] != "") {
+          slugs[parts[1]] = parts[2]
+          slug_lens[count] = length(parts[1])
+          slug_names[count] = parts[1]
+          count++
+        }
+      }
+      close(slug_map)
+      # Selection sort slug_names by descending length so longer slugs
+      # are replaced first.
+      for (i = 0; i < count; i++) {
+        for (j = i+1; j < count; j++) {
+          if (slug_lens[j] > slug_lens[i]) {
+            t = slug_lens[i]; slug_lens[i] = slug_lens[j]; slug_lens[j] = t
+            t = slug_names[i]; slug_names[i] = slug_names[j]; slug_names[j] = t
+          }
+        }
+      }
+      # Load PR-number map.
+      pr_count = 0
+      while ((getline line < pr_map) > 0) {
+        split(line, parts, "\t")
+        if (parts[1] != "" && parts[2] != "") {
+          prs[parts[1]] = parts[2]
+          pr_count++
+        }
+      }
+      close(pr_map)
+    }
+    {
+      s = $0
+
+      # --- Truncate lesson headlines wrapped in __HL__..__HLE__ -----
+      # Use a cursor-based walk so the replacement (which never contains
+      # __HL__) cannot re-match. Same shape applies to all subsequent
+      # passes — every `while (match(s, ...))` MUST track position via
+      # a cursor (out + rest) to avoid an infinite loop when the
+      # replacement contains chars that themselves match the pattern.
+      out = ""; rest = s
+      while (match(rest, /__HL__[^_]*__HLE__/)) {
+        chunk = substr(rest, RSTART, RLENGTH)
+        body = chunk
+        sub(/^__HL__/, "", body)
+        sub(/__HLE__$/, "", body)
+        n_tokens = split(body, toks, /[[:space:]]+/)
+        repl = ""
+        kept = 0
+        for (k = 1; k <= n_tokens && kept < 6; k++) {
+          if (toks[k] == "") continue
+          if (repl == "") repl = toks[k]; else repl = repl " " toks[k]
+          kept++
+        }
+        if (n_tokens > 6) repl = repl "..."
+        out = out substr(rest, 1, RSTART - 1) repl
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      s = out rest
+
+      # --- Repo-URL rewrite (BEFORE path/PR/dollar) ---------------
+      # Match "github.com[:/]<org>/<repo>" — replace org with <redacted>
+      # and repo with the matching slug pseudonym when known, else
+      # "<repo>". MUST run before the path/PR/dollar passes so the
+      # `realuser/<slug>.git` sub-sequence is not eaten by the path
+      # regex.
+      out = ""; rest = s
+      while (match(rest, /github\.com[:\/][a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+/)) {
+        rurl = substr(rest, RSTART, RLENGTH)
+        repo = rurl
+        sub(/.*[:\/]/, "", repo)
+        sub(/\.git$/, "", repo)
+        repo_tok = slugs[repo]
+        if (repo_tok == "") repo_tok = "<repo>"
+        out = out substr(rest, 1, RSTART - 1) "github.com/<redacted>/" repo_tok
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      s = out rest
+
+      # --- Absolute-path replacement ---------------------------------
+      # Replace /<word>(/<word>)* sequences with <path>. The replacement
+      # `<path>` contains no `/` so it cannot re-match, but we still use
+      # a cursor for symmetry. Per LESSONS 2026-05-30 the regex uses
+      # `--`-style positive char classes only; no leading dash trap.
+      out = ""; rest = s
+      while (match(rest, /\/[a-zA-Z_][a-zA-Z0-9_\.\/-]*/)) {
+        out = out substr(rest, 1, RSTART - 1) "<path>"
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      s = out rest
+
+      # --- PR number rewrite ---------------------------------------
+      # Pattern: "#<digits>". Replace digits with the mapped token; emit
+      # as "PR #<token>". Cursor walk so the replacement (which contains
+      # `#` but only alphabetic chars after — no digits) cannot re-match.
+      out = ""; rest = s
+      while (match(rest, /#[0-9]+/)) {
+        num = substr(rest, RSTART + 1, RLENGTH - 1)
+        tok = prs[num]
+        if (tok == "") tok = "xxx"
+        before = substr(rest, 1, RSTART - 1)
+        # If the chars immediately before are "PR ", drop them so we do
+        # not double-emit "PR PR #aaa".
+        if (length(before) >= 3 && substr(before, length(before) - 2) == "PR ") {
+          before = substr(before, 1, length(before) - 3)
+        }
+        out = out before "PR #" tok
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      s = out rest
+
+      # --- Dollar-amount banding -----------------------------------
+      # Pattern: "$<digits>(.<digits>)?". Replace with the band token.
+      # Band tokens (`~$5`, `>$100`, …) CONTAIN `$<digits>` substrings —
+      # so we MUST cursor-walk to avoid an infinite loop on `$5` →
+      # `~$5` → `$5` …
+      out = ""; rest = s
+      while (match(rest, /\$[0-9]+(\.[0-9]+)?/)) {
+        raw = substr(rest, RSTART, RLENGTH)
+        amt = raw
+        sub(/^\$/, "", amt)
+        a = amt + 0
+        band = ""
+        if      (a < 1)    band = "<$1"
+        else if (a < 1.5)  band = "~$1"
+        else if (a < 3.5)  band = "~$2"
+        else if (a < 7.5)  band = "~$5"
+        else if (a < 17.5) band = "~$10"
+        else if (a < 37.5) band = "~$25"
+        else if (a < 75)   band = "~$50"
+        else if (a <= 100) band = "~$100"
+        else               band = ">$100"
+        out = out substr(rest, 1, RSTART - 1) band
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      s = out rest
+
+      # --- Slug-name rewrite (whole-word) --------------------------
+      if (mode == "redact") {
+        for (i = 0; i < count; i++) {
+          name = slug_names[i]
+          tok  = slugs[name]
+          out = ""
+          rest = s
+          while (1) {
+            idx = index(rest, name)
+            if (idx == 0) { out = out rest; break }
+            left_ok  = (idx == 1)
+            if (!left_ok) {
+              prev = substr(rest, idx - 1, 1)
+              if (prev !~ /[a-zA-Z0-9_-]/) left_ok = 1
+            }
+            right_idx = idx + length(name)
+            right_ok = (right_idx > length(rest))
+            if (!right_ok) {
+              nxt = substr(rest, right_idx, 1)
+              if (nxt !~ /[a-zA-Z0-9_-]/) right_ok = 1
+            }
+            if (left_ok && right_ok) {
+              out = out substr(rest, 1, idx - 1) tok
+            } else {
+              out = out substr(rest, 1, idx - 1 + length(name))
+            }
+            rest = substr(rest, idx + length(name))
+          }
+          s = out
+        }
+      }
+
+      print s
+    }
+  '
+}
+
+# Compose the "by the numbers" summary block from the per-slug TSV rows
+# and aggregate counts.
+portfolio_compose_summary() {  # $1 = rows_tsv, $2 = total_prs, $3 = total_spend, $4 = total_heal, $5 = total_infra, $6 = longest_streak, $7 = drafts_count
+  local rows="$1" total_prs="$2" total_spend="$3" total_heal="$4" total_infra="$5" longest_streak="$6" drafts="$7"
+  local n_slugs
+  n_slugs="$(awk 'END { print NR + 0 }' "$rows")"
+  printf -- '## the loop, by the numbers\n'
+  printf -- '  PRs shipped (clean):       %4d  across %d projects\n' "$total_prs" "$n_slugs"
+  printf -- '  PRs healed in-flight:      %4d  (gate_failed branches)\n' "$total_heal"
+  printf -- '  infra-flake auto-reruns:   %4d  (recovered without code change)\n' "$total_infra"
+  printf -- '  send-back drafts emitted:  %4d  (lesson_draft_emitted)\n' "$drafts"
+  printf -- '  longest active streak:     %4d  days\n' "$longest_streak"
+  printf -- '  total kit spend, window:   $%s\n' "$total_spend"
+}
+
+# Compose the principle-frequency block from a TSV (`<pn>\t<count>`).
+portfolio_compose_principles() {  # $1 = pn_tsv
+  local pn_tsv="$1" pn count
+  printf -- '## the principles, by frequency cited\n'
+  if [ ! -s "$pn_tsv" ]; then
+    printf -- '  (no PRINCIPLES citations in window)\n'
+    return 0
+  fi
+  while IFS=$'\t' read -r pn count; do
+    [ -z "$pn" ] && continue
+    printf -- '  %-4s cited %d times\n' "$pn" "$count"
+  done < "$pn_tsv"
+}
+
+# Compose one per-slug one-liner. Used by both text and JSON modes.
+# Echoes one line per slug. Slug-name redaction happens at the final
+# render pass (so JSON and text share this composer).
+# The lesson headline (most-cited in the slug's window, when present)
+# is wrapped in __HL__..__HLE__ markers so the redaction pass can
+# truncate it; the markers are stripped in default (no-redact) mode.
+portfolio_compose_slugs() {  # $1 = rows_tsv $2 = cutoff_iso
+  local rows="$1" cutoff_iso="$2"
+  local slug prs spend heal infra streak
+  while IFS=$'\t' read -r slug prs spend heal infra streak; do
+    [ -z "$slug" ] && continue
+    local repo_url
+    repo_url="git@github.com:realuser/${slug}.git"
+    # Find the top lesson headline (most recent) and the most recent PR
+    # number for this slug; both live in the cache events.jsonl. We
+    # surface a `PR #<n>` token so the redactor's PR-number map gets
+    # exercised in the rendered output (per AC#4 the real PR numbers
+    # must NOT appear in --redact output, and they only get redacted
+    # when they show up in the body somewhere).
+    local events="$HOME/.cache/${slug}-agent/events.jsonl"
+    local headline=""
+    local last_pr=""
+    if [ -f "$events" ]; then
+      headline="$(awk -v cutoff_iso="$cutoff_iso" '
+        BEGIN { count = 0; last = "" }
+        /"type":"lesson_draft_emitted"/ {
+          ts = ""; hl = ""
+          if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+            ts = substr($0, RSTART, RLENGTH)
+            sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+          }
+          if (match($0, /"headline"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+            hl = substr($0, RSTART, RLENGTH)
+            sub(/.*"headline"[[:space:]]*:[[:space:]]*"/, "", hl); sub(/".*/, "", hl)
+          }
+          if (ts == "" || hl == "") next
+          norm_ts = ts
+          sub(/\.[0-9]+Z$/, "Z", norm_ts)
+          if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+          if (norm_ts < cutoff_iso) next
+          last = hl; count++
+        }
+        END { print last }
+      ' "$events")"
+      last_pr="$(awk -v cutoff_iso="$cutoff_iso" '
+        BEGIN { count = 0; last = "" }
+        /"type":"pr_opened"/ {
+          ts = ""; num = ""
+          if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+            ts = substr($0, RSTART, RLENGTH)
+            sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+          }
+          if (match($0, /"number"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+            num = substr($0, RSTART, RLENGTH)
+            sub(/.*"number"[[:space:]]*:[[:space:]]*"/, "", num); sub(/".*/, "", num)
+          }
+          if (ts == "" || num == "") next
+          norm_ts = ts
+          sub(/\.[0-9]+Z$/, "Z", norm_ts)
+          if (substr(norm_ts, length(norm_ts), 1) != "Z") norm_ts = norm_ts "Z"
+          if (norm_ts < cutoff_iso) next
+          last = num; count++
+        }
+        END { print last }
+      ' "$events")"
+    fi
+    # We emit a raw `$<amount>` (the redactor will band it on --redact
+    # passes; default mode displays the real amount). Per AC#5 every
+    # band token (`~$5`, `>$100`, …) contains a `$<digits>` substring,
+    # so we DO NOT pre-band here or the redactor would double-band.
+    printf -- '  %-20s  streak %3sd  PRs %2s  cost $%s  repo %s' \
+      "$slug" "$streak" "$prs" "$spend" "$repo_url"
+    if [ -n "$last_pr" ]; then
+      printf -- '  last PR #%s' "$last_pr"
+    fi
+    if [ -n "$headline" ]; then
+      printf -- '  last lesson: __HL__%s__HLE__\n' "$headline"
+    else
+      printf -- '\n'
+    fi
+  done < "$rows"
+}
+
+# Strip the __HL__ markers from a stream (for default mode + JSON, where
+# we don't want the operator to see the sentinel).
+portfolio_strip_hl_markers() {
+  sed -e 's/__HL__//g; s/__HLE__//g'
+}
+
+# Render the text portfolio page to stdout. Per LESSONS 2026-06-01 the
+# dispatcher function ends with `exit 0` on every code path; this helper
+# returns normally so the dispatcher can exit cleanly.
+portfolio_render_text() {  # $1=summary $2=principles $3=slugs $4=mode $5=window_label $6=start_iso $7=end_iso
+  local summary="$1" principles="$2" slugs="$3" mode="$4" window_label="$5" start_iso="$6" end_iso="$7"
+  # window_days derived from the label (strip trailing 'd').
+  local wdays="${window_label%d}"
+  printf -- '# my agent fleet — %s-day window\n' "$wdays"
+  printf -- '\n'
+  if [ "$mode" = "redact" ]; then
+    printf -- 'I run an agent-fleet across personal projects. Here is the shape\n'
+    printf -- 'of the last %s-day window (since %s).\n' "$wdays" "$start_iso"
+  else
+    printf -- 'fleet portfolio · %s-day window · %s → %s\n' "$wdays" "$start_iso" "$end_iso"
+  fi
+  printf -- '\n'
+  cat "$summary"
+  printf -- '\n'
+  cat "$principles"
+  printf -- '\n'
+  printf -- '## the slugs\n'
+  cat "$slugs"
+  printf -- '\n'
+  printf -- '## the kit\n'
+  if [ "$mode" = "redact" ] || [ "$mode" = "keep-slug" ]; then
+    printf -- '  source: github.com/<redacted>/agent-fleet\n'
+  else
+    printf -- '  source: github.com/mutaaf/agent-fleet\n'
+  fi
+  printf -- '  install: one shell file (lib/install.sh, idempotent)\n'
+  printf -- '  schedule: launchd, hourly at :37\n'
+  printf -- '  generated by: fleet portfolio'
+  if [ "$mode" = "redact" ]; then
+    printf -- ' --redact\n'
+  elif [ "$mode" = "keep-slug" ]; then
+    printf -- ' --redact --keep-slug-names\n'
+  else
+    printf -- '\n'
+  fi
+}
+
+# Render JSON. Per LESSONS 2026-06-03 the JSON escape goes through
+# `preflight_json_escape`; per LESSONS 2026-06-13 we call it directly
+# (no wrapper).
+portfolio_render_json() {  # $1=rows_tsv $2=pn_tsv $3=mode $4=window_label $5=total_prs $6=total_spend $7=total_heal $8=total_infra $9=longest_streak $10=drafts $11=slug_map $12=pr_map
+  local rows="$1" pn_tsv="$2" mode="$3" window_label="$4"
+  local total_prs="$5" total_spend="$6" total_heal="$7" total_infra="$8"
+  local longest_streak="$9" drafts="${10}" slug_map="${11}" pr_map="${12}"
+  printf -- '{'
+  printf -- '"window":"%s",' "$(preflight_json_escape "$window_label")"
+  printf -- '"redact":%s,' "$( [ "$mode" = "redact" ] && echo true || echo false )"
+  printf -- '"keep_slug_names":%s,' "$( [ "$mode" = "keep-slug" ] && echo true || echo false )"
+  # summary
+  printf -- '"summary":{"projects":%d,"prs_shipped":%d,"prs_healed":%d,"infra_reruns":%d,"drafts":%d,"longest_streak_days":%d,"total_spend_usd":%s},' \
+    "$(awk 'END { print NR + 0 }' "$rows")" \
+    "$total_prs" "$total_heal" "$total_infra" "$drafts" "$longest_streak" "$total_spend"
+  # principles
+  printf -- '"principles":['
+  local first=1 pn count
+  while IFS=$'\t' read -r pn count; do
+    [ -z "$pn" ] && continue
+    [ "$first" -eq 1 ] || printf -- ','
+    printf -- '{"principle":"%s","count":%d}' \
+      "$(preflight_json_escape "$pn")" "$count"
+    first=0
+  done < "$pn_tsv"
+  printf -- '],'
+  # slugs
+  printf -- '"slugs":['
+  first=1
+  local slug prs spend heal infra streak tok
+  while IFS=$'\t' read -r slug prs spend heal infra streak; do
+    [ -z "$slug" ] && continue
+    [ "$first" -eq 1 ] || printf -- ','
+    if [ "$mode" = "redact" ]; then
+      tok="$(portfolio_map_lookup "$slug" "$slug_map")"
+      [ -z "$tok" ] && tok="$slug"
+    else
+      tok="$slug"
+    fi
+    local band
+    band="$(portfolio_band_dollar "$spend")"
+    printf -- '{"slug":"%s","streak_days":%s,"prs_shipped":%s,"cost_band":"%s"}' \
+      "$(preflight_json_escape "$tok")" "$streak" "$prs" "$(preflight_json_escape "$band")"
+    first=0
+  done < "$rows"
+  printf -- ']'
+  printf -- '}\n'
+}
+
+# The dispatcher function. Per LESSONS 2026-06-01 every code path ends
+# with explicit `exit 0` so it cannot fall through to the default
+# `fleet status` block at the bottom of the file.
+portfolio() {
+  shift  # drop the leading "portfolio"
+  local mode="default" want_json=0 since_raw="90d"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --redact)            mode="redact"; shift ;;
+      --keep-slug-names)   mode="keep-slug"; shift ;;
+      --json)              want_json=1; shift ;;
+      --since)             since_raw="${2:-}"; shift 2 ;;
+      --since=*)           since_raw="${1#--since=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet portfolio — leak-safe fleet-wide one-pager for blog posts or peer demos.
+
+Usage:
+  fleet portfolio                          default --since 90d, all slugs (NO redaction)
+  fleet portfolio --redact                 deterministic pseudonyms for slug names,
+                                           PR numbers, dollar amounts, repo URLs,
+                                           lesson headlines, and file paths
+  fleet portfolio --redact --keep-slug-names
+                                           bypass slug-name rewrite; keep all OTHER
+                                           redactions (useful for sharing with a peer
+                                           who already knows the slug names)
+  fleet portfolio --since 30d              override window (Nd or YYYY-MM-DD)
+  fleet portfolio --since 2026-05-14       walk from a specific UTC day
+  fleet portfolio --json                   machine-readable JSON object
+  fleet portfolio --redact --json          combine both
+
+The redaction is deterministic per invocation but never persisted to
+disk. Pure reader: no events.jsonl writes, no `fleet_emit_event` calls,
+no `lib/` or `prompts/` edits, no new event types.
+USAGE
+        exit 0 ;;
+      *)
+        printf -- 'fleet portfolio: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+    esac
+  done
+
+  # Resolve the window via the existing Nd / YYYY-MM-DD parser (per
+  # LESSONS 2026-06-11 the YYYY-MM-DD path appends T00:00:00 internally).
+  local since_seconds
+  if ! since_seconds="$(prompts_suggest_parse_since "$since_raw" 2>/dev/null)"; then
+    printf -- 'fleet portfolio: invalid --since "%s" (use Nd or YYYY-MM-DD)\n' "$since_raw" >&2
+    exit 2
+  fi
+  local now_epoch cutoff_epoch
+  now_epoch="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  cutoff_epoch=$(( now_epoch - since_seconds ))
+  local start_iso end_iso window_days window_label
+  start_iso="$(date -u -r "$cutoff_epoch" '+%Y-%m-%d' 2>/dev/null \
+                || date -u -d "@$cutoff_epoch" '+%Y-%m-%d' 2>/dev/null)"
+  end_iso="$(date -u -r "$now_epoch" '+%Y-%m-%d' 2>/dev/null \
+              || date -u -d "@$now_epoch" '+%Y-%m-%d' 2>/dev/null)"
+  window_days=$(( since_seconds / 86400 ))
+  [ "$window_days" -lt 1 ] && window_days=1
+  window_label="${window_days}d"
+
+  # Discover slugs.
+  local discovery_tmp; discovery_tmp="$(mktemp -t fleet-portfolio-disc.XXXXXX)"
+  portfolio_discover_slugs > "$discovery_tmp"
+  local projects_count
+  projects_count="$(awk 'END { print NR + 0 }' "$discovery_tmp")"
+  if [ "$projects_count" -eq 0 ]; then
+    printf -- 'portfolio: no slugs discovered. run `fleet onboard <repo>` to add the first project to your fleet.\n'
+    rm -f "$discovery_tmp"
+    exit 0
+  fi
+
+  # Build pseudonym maps (always — even in default mode we still want
+  # the awk redactor's slug-table to be present, so it can no-op).
+  local slug_map; slug_map="$(mktemp -t fleet-portfolio-smap.XXXXXX)"
+  awk -F'\t' '{ print $1 }' "$discovery_tmp" | portfolio_allocate_pseudonyms > "$slug_map"
+
+  # Precompute the cutoff ISO timestamp ONCE for the whole walk.
+  local cutoff_iso
+  cutoff_iso="$(date -u -r "$cutoff_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                 || date -u -d "@$cutoff_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                 || echo "1970-01-01T00:00:00Z")"
+
+  # Build the days-csv for streak math (reuses recap's helper shape).
+  local today_ep_iso
+  today_ep_iso="$(date -u -j -f '%Y-%m-%d' "$end_iso" '+%s' 2>/dev/null \
+                   || date -u -d "$end_iso" '+%s' 2>/dev/null \
+                   || echo 0)"
+  local days_csv
+  days_csv="$(awk -v today_ep="$today_ep_iso" '
+    BEGIN {
+      days_per_month[1]=31; days_per_month[2]=28; days_per_month[3]=31
+      days_per_month[4]=30; days_per_month[5]=31; days_per_month[6]=30
+      days_per_month[7]=31; days_per_month[8]=31; days_per_month[9]=30
+      days_per_month[10]=31; days_per_month[11]=30; days_per_month[12]=31
+      total_days = int(today_ep / 86400)
+      y = 1970; m = 1; d = 1
+      remaining = total_days
+      while (remaining > 0) {
+        leap = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 1 : 0
+        days_in_year = leap ? 366 : 365
+        if (remaining >= days_in_year) { remaining -= days_in_year; y++ }
+        else {
+          dpm = days_per_month[m]
+          if (m == 2 && leap) dpm = 29
+          if (remaining >= dpm) { remaining -= dpm; m++; if (m > 12) { m = 1; y++ } }
+          else { d += remaining; remaining = 0 }
+        }
+      }
+      out = sprintf("%04d-%02d-%02d", y, m, d)
+      for (k = 1; k < 90; k++) {
+        d--
+        if (d < 1) {
+          m--
+          if (m < 1) { m = 12; y-- }
+          dpm = days_per_month[m]
+          leap = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 1 : 0
+          if (m == 2 && leap) dpm = 29
+          d = dpm
+        }
+        out = out "," sprintf("%04d-%02d-%02d", y, m, d)
+      }
+      print out
+    }
+  ')"
+
+  # Per-slug rows.
+  local rows_tsv; rows_tsv="$(mktemp -t fleet-portfolio-rows.XXXXXX)"
+  local total_prs=0 total_spend="0.00" total_heal=0 total_infra=0 longest_streak=0
+  local slug manifest cache
+  while IFS=$'\t' read -r slug manifest cache; do
+    [ -z "$slug" ] && continue
+    portfolio_walk_one_slug "$slug" "$manifest" "$cache" "$cutoff_iso" "$days_csv" >> "$rows_tsv"
+  done < "$discovery_tmp"
+  local _slug _prs _spend _heal _infra _streak
+  while IFS=$'\t' read -r _slug _prs _spend _heal _infra _streak; do
+    [ -z "$_slug" ] && continue
+    total_prs=$(( total_prs + _prs ))
+    total_heal=$(( total_heal + _heal ))
+    total_infra=$(( total_infra + _infra ))
+    total_spend="$(awk -v a="$total_spend" -v b="$_spend" 'BEGIN { printf("%.2f", a + b) }')"
+    if [ "$_streak" -gt "$longest_streak" ]; then longest_streak="$_streak"; fi
+  done < "$rows_tsv"
+
+  # Aggregate principle citations.
+  local pn_tsv; pn_tsv="$(mktemp -t fleet-portfolio-pn.XXXXXX)"
+  portfolio_aggregate_principles "$cutoff_iso" < "$discovery_tmp" > "$pn_tsv"
+
+  # Drafts emitted across the fleet (sum of lesson_draft_emitted counts
+  # in window — taken from the principle-tsv's sum).
+  local drafts
+  drafts="$(awk -F'\t' '
+    BEGIN { count = 0; sum = 0 }
+    { sum += $2; count++ }
+    END { print sum + 0 }
+  ' "$pn_tsv")"
+
+  # Build PR-number pseudonym map (covers AC#4).
+  local pr_map; pr_map="$(mktemp -t fleet-portfolio-prmap.XXXXXX)"
+  portfolio_collect_pr_numbers "$cutoff_iso" < "$discovery_tmp" \
+    | portfolio_allocate_pr_pseudonyms > "$pr_map"
+
+  # --- JSON render ----------------------------------------------------
+  if [ "$want_json" = "1" ]; then
+    portfolio_render_json \
+      "$rows_tsv" "$pn_tsv" "$mode" "$window_label" \
+      "$total_prs" "$total_spend" "$total_heal" "$total_infra" \
+      "$longest_streak" "$drafts" "$slug_map" "$pr_map"
+    rm -f "$discovery_tmp" "$slug_map" "$pr_map" "$rows_tsv" "$pn_tsv"
+    exit 0
+  fi
+
+  # --- Text render ----------------------------------------------------
+  local summary_tmp; summary_tmp="$(mktemp -t fleet-portfolio-sum.XXXXXX)"
+  portfolio_compose_summary "$rows_tsv" \
+    "$total_prs" "$total_spend" "$total_heal" "$total_infra" \
+    "$longest_streak" "$drafts" > "$summary_tmp"
+  local pn_block_tmp; pn_block_tmp="$(mktemp -t fleet-portfolio-pnb.XXXXXX)"
+  portfolio_compose_principles "$pn_tsv" > "$pn_block_tmp"
+  local slugs_block_tmp; slugs_block_tmp="$(mktemp -t fleet-portfolio-sb.XXXXXX)"
+  portfolio_compose_slugs "$rows_tsv" "$cutoff_iso" > "$slugs_block_tmp"
+
+  # Compose the raw body into one tmp file.
+  local body_tmp; body_tmp="$(mktemp -t fleet-portfolio-body.XXXXXX)"
+  portfolio_render_text \
+    "$summary_tmp" "$pn_block_tmp" "$slugs_block_tmp" "$mode" \
+    "$window_label" "$start_iso" "$end_iso" > "$body_tmp"
+
+  # Apply the redaction pass when needed; in default mode just strip
+  # the __HL__ sentinels (the operator never sees them).
+  if [ "$mode" = "default" ]; then
+    portfolio_strip_hl_markers < "$body_tmp"
+  else
+    portfolio_redact_text "$slug_map" "$pr_map" "$mode" < "$body_tmp"
+  fi
+
+  rm -f "$discovery_tmp" "$slug_map" "$pr_map" "$rows_tsv" "$pn_tsv" \
+        "$summary_tmp" "$pn_block_tmp" "$slugs_block_tmp" "$body_tmp"
+  exit 0
+}
+
+if [ "$CMD" = "portfolio" ]; then
+  portfolio "$@"
 fi
 
 # --- tail -----------------------------------------------------------------

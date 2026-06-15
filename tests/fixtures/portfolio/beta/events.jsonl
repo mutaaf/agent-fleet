@@ -1,0 +1,4 @@
+{"ts":"2026-05-05T10:01:00Z","slug":"beta","phase":"ship","type":"pr_opened","number":"77","branch":"feat/0050-beta-thing"}
+{"ts":"2026-05-12T10:01:00Z","slug":"beta","phase":"ship","type":"pr_opened","number":"82","branch":"feat/0051-beta-cleanup"}
+{"ts":"2026-05-07T11:00:00Z","slug":"beta","phase":"ship","type":"infra_flake_rerun","pattern":"gh_graphql_502","run_id":"5","pr":"77"}
+{"ts":"2026-05-08T12:00:00Z","slug":"beta","phase":"review","type":"lesson_draft_emitted","pr":"77","headline":"P-5 short headline only"}

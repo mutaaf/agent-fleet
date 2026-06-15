@@ -1,0 +1,4 @@
+{"ts_start":"2026-04-20T10:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000,"total_cost_usd":0.42,"result_head":"SHIP 0040 — alpha shipped PR #14"}
+{"ts_start":"2026-04-25T10:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":160000,"total_cost_usd":4.50,"result_head":"SHIP 0041 — alpha fix shipped PR #143 — file at /Users/alpha/repo/foo.sh referenced"}
+{"ts_start":"2026-05-01T10:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":190000,"total_cost_usd":11.20,"result_head":"SHIP 0042 — alpha feature shipped PR #1024"}
+{"ts_start":"2026-05-15T10:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":190000,"total_cost_usd":2.00,"result_head":"SHIP 0043 — alpha extra shipped PR #205"}
