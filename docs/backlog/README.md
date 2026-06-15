@@ -72,4 +72,4 @@ ones, `review` grades them.
 | 0051 | fleet skill-gap <slug> diffs a project's PHASE 0 reads against the fleet-wide CROSS_LESSONS coverage | P2 | shipped | governance |
 | 0052 | fleet add <repo> compresses a second-project install by inheriting one existing slug's manifest defaults | P1 | shipped | engine |
 | 0053 | fleet portfolio --redact emits a leak-safe one-pager of the whole fleet for a blog post or peer demo | P1 | shipped | observability |
-| 0054 | fleet maturity <slug> scores how far one project has walked the post-install activation funnel | P2 | in-progress | observability |
+| 0054 | fleet maturity <slug> scores how far one project has walked the post-install activation funnel | P2 | shipped | observability |

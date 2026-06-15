@@ -1,7 +1,7 @@
 ---
 id: 0054
 title: fleet maturity <slug> scores how far one project has walked the post-install activation funnel
-status: in-progress
+status: shipped
 priority: P2
 area: observability
 created: 2026-06-15
