@@ -1,0 +1,16 @@
+{"ts":"2026-04-20T10:01:00Z","slug":"alpha","phase":"ship","type":"pr_opened","number":"14","branch":"feat/0040-alpha-thing"}
+{"ts":"2026-04-25T10:01:00Z","slug":"alpha","phase":"ship","type":"pr_opened","number":"143","branch":"feat/0041-alpha-fix"}
+{"ts":"2026-05-01T10:01:00Z","slug":"alpha","phase":"ship","type":"pr_opened","number":"1024","branch":"feat/0042-alpha-feature"}
+{"ts":"2026-05-15T10:01:00Z","slug":"alpha","phase":"ship","type":"pr_opened","number":"205","branch":"feat/0043-alpha-extra"}
+{"ts":"2026-04-22T11:00:00Z","slug":"alpha","phase":"ship","type":"infra_flake_rerun","pattern":"actions_silent","run_id":"1","pr":"14"}
+{"ts":"2026-04-26T11:00:00Z","slug":"alpha","phase":"ship","type":"infra_flake_rerun","pattern":"actions_silent","run_id":"2","pr":"143"}
+{"ts":"2026-04-23T12:00:00Z","slug":"alpha","phase":"review","type":"lesson_draft_emitted","pr":"14","headline":"P-2 alpha test wrote to a non-isolated path and failed in CI"}
+{"ts":"2026-04-27T12:00:00Z","slug":"alpha","phase":"review","type":"lesson_draft_emitted","pr":"143","headline":"P-3 heal in-flight before opening a new ticket failed"}
+{"ts":"2026-04-21T09:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000}
+{"ts":"2026-04-22T09:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000}
+{"ts":"2026-04-23T09:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000}
+{"ts":"2026-04-24T09:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000}
+{"ts":"2026-04-25T09:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000}
+{"ts":"2026-04-26T09:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000}
+{"ts":"2026-04-27T09:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000}
+{"ts":"2026-04-28T09:00:00Z","slug":"alpha","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000}
