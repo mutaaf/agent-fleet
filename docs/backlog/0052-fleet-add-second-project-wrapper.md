@@ -1,7 +1,7 @@
 ---
 id: 0052
 title: fleet add <repo> compresses a second-project install by inheriting one existing slug's manifest defaults
-status: groomed
+status: in-progress
 priority: P1
 area: engine
 created: 2026-06-15
@@ -410,4 +410,15 @@ Files / patterns the dev should touch.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-15: implementation-dev opened `feat/0052-fleet-add-inherit-manifest`.
+  Plan: write `tests/add.sh` failing on each AC box first, then add six
+  `add_*` helpers + the dispatcher in `bin/fleet` immediately above the
+  existing `onboard()` block (forward-reference per LESSONS 2026-06-05),
+  reuse `onboard_render_manifest`/`onboard_render_agents_md`/
+  `onboard_render_backlog_readme`/`onboard_write_one` verbatim, append one
+  help-banner line in `bin/fleet` + one Daily-ops line in `README.md`.
+  No changes to `lib/common.sh`, `lib/install.sh`, or `prompts/`. No new
+  event types. Slug discovery reuses `overview_discover` (defined ~L12061
+  — the actual name in this kit; the ticket's `overview_discover_slugs`
+  language was descriptive). Manifest source-read uses subshell with
+  TSV `key<TAB>-` sentinels for empty middle fields (LESSONS 2026-06-08).

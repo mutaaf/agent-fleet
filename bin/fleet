@@ -76,6 +76,9 @@
 #   fleet tour [<repo>]       walk events.jsonl with PRINCIPLES.md annotations
 #                             (ticket 0050 — pure reader of events.jsonl + lib/tour-catalog.sh;
 #                              --archive walks rotated segments, --type filters, --json emits NDJSON)
+#   fleet add <repo>          add a project to your fleet by inheriting another slug's policy
+#                             (ticket 0052 — scaffold + install + onboarding-check; --inherit-from <slug>,
+#                              --dry-run, --force; reuses onboard_* helpers, writes no events)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -1075,6 +1078,451 @@ USAGE
 
 if [ "$CMD" = "onboard" ]; then
   onboard "$@"
+fi
+
+# --- add ------------------------------------------------------------------
+# Ticket 0052. `fleet add <project-path>` adds the N-th project to an
+# existing fleet by inheriting a NAMED source slug's non-project-specific
+# manifest values (BUDGET_DAILY_USD, CROSS_LESSONS, QUIET_HOURS,
+# LOCAL_GATE_CMD, PROMPTS_PIN_SHA, SHIP_PAUSE_THRESHOLD, TRAINEE_REMAINING)
+# and pre-filling the project-specific values from the candidate repo
+# (SLUG from basename, REPO_URL from origin, GATING_CHECKS from the most
+# recent successful CI run). Differs from `fleet onboard` (0011) on the
+# default-resolver only: `onboard` derives defaults from the kit template,
+# `add` derives them from a named existing slug.
+#
+# Helpers MUST be defined ABOVE the dispatcher block per LESSONS
+# 2026-06-05 (forward-reference trap). The dispatcher itself sits next
+# to `onboard()`'s. Every code path ends `exit 0/1/2` per LESSONS
+# 2026-06-01.
+#
+# Pure reader of the source slug's agents.config.sh (subshell-sourced
+# per LESSONS 2026-06-05 export-in-subshell trap); pure writer of the
+# destination project. ZERO events into either slug's events.jsonl.
+# Reuses onboard_render_manifest / onboard_render_agents_md /
+# onboard_render_backlog_readme / onboard_write_one verbatim — only the
+# default-resolver diverges.
+
+# Static inheritance table — exactly the names this command will copy.
+# Test rig greps for these on a single line. Per AC#4 the project-
+# specific list is its own array — it documents the resolve-from-the-
+# project (NOT-from-source-manifest) contract and is asserted by
+# tests/add.sh; the dispatcher's project-specific resolution is open-
+# coded (basename / git remote / gh run list), so the array itself is
+# referenced only by the test rig, not by the bin/fleet body.
+add_inherit_fields="BUDGET_DAILY_USD CROSS_LESSONS QUIET_HOURS LOCAL_GATE_CMD PROMPTS_PIN_SHA SHIP_PAUSE_THRESHOLD TRAINEE_REMAINING"
+# shellcheck disable=SC2034  # test-rig contract surface; see comment above
+add_project_specific_fields="SLUG REPO_URL GATING_CHECKS"
+
+# Inline copy of preflight_visible_width (defined ~L1367, later in this
+# file). LESSONS 2026-06-05 (dispatcher forward-reference): the add
+# dispatcher fires at execution time before bash has parsed
+# preflight_visible_width's body, so calling that helper from add_render_diff
+# yields `command not found`. Same shape as replay_batch_json_escape's
+# inline copy of provenance_json_escape. Body identical to the canonical
+# definition so the LESSONS 2026-06-05 LC_ALL caching guard stays in force.
+add_visible_width() {
+  local s="${1-}" total cont
+  total="$(printf -- '%s' "$s" | LC_ALL=C wc -c | tr -d ' ')"
+  cont="$(printf -- '%s' "$s" | LC_ALL=C awk '
+    BEGIN {
+      for (k=0; k<256; k++) ord[sprintf("%c", k)] = k
+      n = 0
+    }
+    {
+      for (i=1; i<=length($0); i++) {
+        v = ord[substr($0, i, 1)]
+        if (v >= 128 && v < 192) n++
+      }
+    }
+    END { print n+0 }
+  ')"
+  printf '%d' "$(( total - cont ))"
+}
+
+# Discover candidate source slugs from the same two roots `discover()` and
+# `overview_discover` use: $FLEET_DISCOVERY_ROOT (default ~/Desktop/projects)
+# and ~/.local/share/agent-fleet/projects. Echoes one slug per line, sorted
+# alpha, de-duped. Used by add_resolve_source_slug for the auto-detect and
+# multi-slug-refusal paths (AC#2/AC#3). Standalone so `add` doesn't depend
+# on overview_discover (defined ~10k lines later — forward-reference trap).
+add_discover_source_slugs() {
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    local slug
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -n "$slug" ] && echo "$slug"
+  done | sort -u
+}
+
+# Resolve the source slug. Writes the chosen slug to the path in $2
+# (a caller-supplied tmp file) and an operator-facing banner / refusal
+# message to stdout / stderr respectively. Returns 0 on success, 2 on
+# refusal. Side-channel for the slug name avoids the LESSONS-style trap
+# where command substitution would slurp the banner along with the slug.
+#
+# Args:
+#   $1 = inherit-from value ("" = unset, else operator-supplied slug)
+#   $2 = path to tmp file the resolved slug name is written to
+add_resolve_source_slug() {
+  local want="${1:-}" slug_out="$2"
+  local slugs_tsv slug_count
+  slugs_tsv="$(add_discover_source_slugs | tr '\n' ',' | sed 's/,$//')"
+  slug_count=$(printf -- '%s\n' "$slugs_tsv" | awk -F',' 'NF == 0 { print 0; next } { print NF }')
+  if [ -n "$want" ]; then
+    # Exact match against the comma-joined slug list.
+    case ",$slugs_tsv," in
+      *",$want,"*)
+        printf -- '%s' "$want" > "$slug_out"
+        return 0 ;;
+      *)
+        printf -- 'fleet add: inherit-from slug `%s` not found. discovered slugs: %s\n' \
+                  "$want" "$slugs_tsv" >&2
+        return 2 ;;
+    esac
+  fi
+  case "$slug_count" in
+    0)
+      printf -- 'fleet add: no installed slugs discovered — run `fleet onboard <repo>` for your FIRST project instead.\n' >&2
+      return 2 ;;
+    1)
+      local only="$slugs_tsv"
+      printf -- 'fleet add: inheriting from %s (only discovered slug)\n' "$only"
+      printf -- '%s' "$only" > "$slug_out"
+      return 0 ;;
+    *)
+      printf -- 'fleet add: multiple slugs eligible to inherit from: %s. pass --inherit-from <slug> or run `fleet rank` to pick the healthiest one.\n' \
+                "$slugs_tsv" >&2
+      return 2 ;;
+  esac
+}
+
+# Read the source slug's agents.config.sh and echo `key<TAB>value` rows
+# for every inheritable field that is set + non-empty. The source-slug
+# manifest is located via the same two-root discovery (working tree
+# wins). Per LESSONS 2026-06-05 the source happens inside a `( … )`
+# subshell so no exports leak into the kit's own shell.
+#
+# Empty / unset values are SKIPPED (not echoed) so the diff renderer
+# only walks set rows — the LESSONS 2026-06-08 sentinel rule is N/A
+# here because we never emit the empty-string middle column.
+#
+# Args:
+#   $1 = source slug
+add_read_source_manifest() {
+  local slug="$1"
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  local manifest=""
+  local m
+  for m in "$root_a/$slug/agents.config.sh" "$root_b/$slug/agents.config.sh"; do
+    if [ -f "$m" ]; then
+      manifest="$m"
+      break
+    fi
+  done
+  if [ -z "$manifest" ]; then
+    printf -- 'fleet add: cannot locate agents.config.sh for source slug `%s`.\n' "$slug" >&2
+    return 1
+  fi
+  # LESSONS 2026-06-05: source inside a subshell ( ... ) so the export
+  # never leaks. Echo TSV rows of inheritable fields that are non-empty.
+  (
+    # shellcheck disable=SC1090
+    source "$manifest" 2>/dev/null
+    for k in $add_inherit_fields; do
+      local v="${!k:-}"
+      if [ -n "$v" ]; then
+        printf -- '%s\t%s\n' "$k" "$v"
+      fi
+    done
+  )
+}
+
+# Discover the destination repo's gating checks from the most recent
+# successful CI run on the default branch. Per AC#6 this falls back to
+# the literal placeholder `shellcheck, validate` + a stderr warning
+# when the gh call fails (no successful runs, no network, no auth).
+# Echoes the comma-separated list on stdout. Per LESSONS 2026-05-28
+# every printf of a check name goes through `printf -- '%s'`.
+#
+# Args:
+#   $1 = destination project dir (absolute path)
+#   $2 = slug (for the warning message)
+add_discover_gating_checks() {
+  local proj_dir="$1" slug="$2"
+  local default_branch="main"
+  local raw
+  if command -v gh >/dev/null 2>&1; then
+    raw="$(
+      cd "$proj_dir" 2>/dev/null && \
+      gh run list \
+        --branch "$default_branch" \
+        --status success \
+        --limit 1 \
+        --json jobs \
+        --jq '.[].jobs[].name' \
+        2>/dev/null
+    )"
+  fi
+  if [ -z "${raw:-}" ]; then
+    printf -- 'add: could not auto-detect gating checks for %s; using placeholders — edit %s/AGENTS.md after.\n' \
+              "$slug" "$proj_dir" >&2
+    printf -- '%s' 'shellcheck, validate'
+    return 0
+  fi
+  # Join newline-separated names with `, ` for the table cell.
+  printf -- '%s' "$raw" | awk 'NF { lines[++n] = $0 }
+    END {
+      for (i = 1; i <= n; i++) {
+        if (i > 1) printf ", "
+        printf "%s", lines[i]
+      }
+    }'
+}
+
+# Render the two-table diff. Reads the inherited TSV rows (passed as
+# the path to a tmp file in $1) and the project-specific values
+# ($2=slug, $3=repo_url, $4=gating_checks_csv). Width via
+# preflight_visible_width per LESSONS 2026-06-05. Every printf of a
+# field name or value goes through `printf -- '%s'` per LESSONS
+# 2026-05-28.
+add_render_diff() {
+  local inh_tsv="$1" slug="$2" repo_url="$3" gating_csv="$4" proj_dir="$5"
+  local name_w=24
+  printf -- 'fleet add: %s\n' "$proj_dir"
+  if [ -n "${FLEET_ADD_SOURCE_SLUG:-}" ]; then
+    printf -- '  inherit-from: %s\n' "$FLEET_ADD_SOURCE_SLUG"
+  fi
+  printf -- '\n'
+  printf -- '  inherited values (will land in %s/agents.config.sh):\n' "$slug"
+  local key val cur pad
+  while IFS=$'\t' read -r key val; do
+    [ -z "$key" ] && continue
+    cur=$(add_visible_width "$key")
+    pad=$(( name_w - cur ))
+    if [ "$pad" -lt 0 ]; then pad=0; fi
+    printf -- '    %s' "$key"
+    if [ "$pad" -gt 0 ]; then printf -- '%*s' "$pad" ""; fi
+    printf -- ' %s\n' "$val"
+  done < "$inh_tsv"
+  printf -- '\n'
+  printf -- '  project-specific (you must confirm or edit after):\n'
+  for row in "SLUG=$slug" "REPO_URL=$repo_url" "GATING_CHECKS=$gating_csv"; do
+    key="${row%%=*}"
+    val="${row#*=}"
+    cur=$(add_visible_width "$key")
+    pad=$(( name_w - cur ))
+    if [ "$pad" -lt 0 ]; then pad=0; fi
+    printf -- '    %s' "$key"
+    if [ "$pad" -gt 0 ]; then printf -- '%*s' "$pad" ""; fi
+    printf -- ' %s\n' "$val"
+  done
+  printf -- '\n'
+  printf -- '  next: lib/install.sh + fleet onboarding-check %s\n' "$proj_dir"
+}
+
+# Prompt for confirmation. Returns 0 on `y`, 1 otherwise.
+# Per LESSONS 2026-06-01 every code path ends with explicit exit;
+# returns (not exits) so the caller can pipeline the verdict.
+add_confirm_or_abort() {
+  printf -- '\nproceed? [y/N] '
+  local answer=""
+  read -r answer || true
+  case "${answer:-}" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Invoke install.sh then onboarding-check. Forwards onboarding-check's
+# exit code. Honours FLEET_INSTALL_CMD + FLEET_ONBOARDING_CHECK_CMD test
+# seams (same convention as `onboard`).
+add_run_install_and_verify() {
+  local proj_dir="$1" kit_root="$2"
+  local install_cmd="${FLEET_INSTALL_CMD:-}"
+  if [ -n "$install_cmd" ]; then
+    if ! "$install_cmd" "$proj_dir"; then
+      printf -- 'fleet add: install.sh failed — see install.log\n' >&2
+      return 1
+    fi
+  else
+    if ! bash "$kit_root/lib/install.sh" "$proj_dir"; then
+      printf -- 'fleet add: install.sh failed — see install.log\n' >&2
+      return 1
+    fi
+  fi
+  local check_cmd="${FLEET_ONBOARDING_CHECK_CMD:-}"
+  if [ -n "$check_cmd" ]; then
+    "$check_cmd" "$proj_dir"
+    return $?
+  fi
+  "$kit_root/bin/fleet" onboarding-check "$proj_dir"
+  return $?
+}
+
+add() {
+  shift  # drop the leading "add"
+  local dry_run=0 force=0 inherit_from="" proj_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --force) force=1; shift ;;
+      --inherit-from)
+        shift
+        inherit_from="${1:-}"
+        if [ -z "$inherit_from" ]; then
+          printf -- 'fleet add: --inherit-from needs a slug argument\n' >&2
+          exit 2
+        fi
+        shift ;;
+      -h|--help)
+        cat <<USAGE
+fleet add — add a project to your fleet by inheriting another slug's policy.
+
+Usage:
+  fleet add [--inherit-from <slug>] [--dry-run] [--force] <project-path>
+
+Resolves the source slug from --inherit-from <slug> or, when omitted, the
+single discovered slug (refuses with a hint when 2+ slugs exist). Inherits
+these manifest fields:
+  BUDGET_DAILY_USD, CROSS_LESSONS, QUIET_HOURS, LOCAL_GATE_CMD,
+  PROMPTS_PIN_SHA, SHIP_PAUSE_THRESHOLD, TRAINEE_REMAINING
+
+Project-specific fields (derived per call):
+  SLUG (basename), REPO_URL (origin), GATING_CHECKS (most recent successful CI run)
+
+Flags:
+  --inherit-from <slug>  pick the source slug explicitly (required when 2+ slugs exist)
+  --dry-run              print the diff and exit; no prompt, no writes, no install
+  --force                skip the y/N prompt; also overwrite an existing agents.config.sh
+  -h, --help             this banner
+
+After the operator confirms, fleet add writes the same six contract files
+fleet onboard writes, invokes lib/install.sh, then fleet onboarding-check.
+USAGE
+        exit 0 ;;
+      --) shift; proj_arg="${1:-}"; shift || true; break ;;
+      -*) printf -- "fleet add: unknown flag '%s'\n" "$1" >&2; exit 2 ;;
+      *)
+        if [ -z "$proj_arg" ]; then proj_arg="$1"; shift
+        else printf -- "fleet add: unexpected extra argument '%s'\n" "$1" >&2; exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$proj_arg" ]; then
+    printf -- 'fleet add: missing <project-path>. usage: fleet add [--inherit-from <slug>] [--dry-run] [--force] <project-path>\n' >&2
+    exit 2
+  fi
+  if [ ! -d "$proj_arg" ]; then
+    printf -- 'fleet add: %s is not a directory\n' "$proj_arg" >&2
+    exit 2
+  fi
+
+  local proj_dir; proj_dir="$( cd "$proj_arg" && pwd )"
+  local slug; slug="$(basename "$proj_dir")"
+  local repo_url
+  repo_url="$( cd "$proj_dir" && git remote get-url origin 2>/dev/null || true )"
+  if [ -z "$repo_url" ]; then
+    printf -- 'fleet add: %s has no git origin remote — run `git remote add origin` first\n' "$proj_dir" >&2
+    exit 2
+  fi
+
+  # Refuse pre-existing agents.config.sh unless --force.
+  if [ -f "$proj_dir/agents.config.sh" ] && [ "$force" != "1" ]; then
+    printf -- 'fleet add: %s/agents.config.sh already exists — pass --force to overwrite, or run `fleet onboard --force` if you want the full greenfield scaffold instead.\n' "$proj_dir" >&2
+    exit 1
+  fi
+
+  # Resolve source slug. The helper writes its banner (auto-detect) /
+  # refusal (multi-slug, unknown) directly to stdout/stderr; the resolved
+  # slug name lands in a side-channel tmp file so command substitution
+  # cannot slurp the banner along with it.
+  local slug_tmp; slug_tmp="$(mktemp -t fleet-add-slug.XXXXXX)"
+  set +e
+  add_resolve_source_slug "$inherit_from" "$slug_tmp"
+  local rs_exit=$?
+  set -e
+  if [ "$rs_exit" != "0" ]; then
+    rm -f "$slug_tmp"
+    exit 2
+  fi
+  local source_slug; source_slug="$(cat "$slug_tmp")"
+  rm -f "$slug_tmp"
+  export FLEET_ADD_SOURCE_SLUG="$source_slug"
+
+  # Read source manifest into a TSV tmp file.
+  local inh_tsv; inh_tsv="$(mktemp -t fleet-add-inh.XXXXXX)"
+  if ! add_read_source_manifest "$source_slug" > "$inh_tsv"; then
+    rm -f "$inh_tsv"
+    exit 1
+  fi
+
+  # Resolve project-specific GATING_CHECKS.
+  local gating_csv
+  gating_csv="$(add_discover_gating_checks "$proj_dir" "$slug")"
+
+  # Render the diff.
+  add_render_diff "$inh_tsv" "$slug" "$repo_url" "$gating_csv" "$proj_dir"
+
+  # --dry-run exits 0 here.
+  if [ "$dry_run" = "1" ]; then
+    rm -f "$inh_tsv"
+    exit 0
+  fi
+
+  # Confirm unless --force.
+  if [ "$force" != "1" ]; then
+    if ! add_confirm_or_abort; then
+      printf -- 'fleet add: aborted; nothing written.\n'
+      rm -f "$inh_tsv"
+      exit 0
+    fi
+  fi
+
+  # Scaffold. Reuse onboard_write_one verbatim — same six files.
+  local kit_root; kit_root="$(onboard_kit_root)"
+  while IFS='|' read -r dest_rel kind source_rel; do
+    [ -z "$dest_rel" ] && continue
+    onboard_write_one "$dest_rel" "$kind" "$source_rel" \
+                      "$proj_dir" "$slug" "$kit_root" \
+                      "$force" 0
+  done < <(onboard_file_list)
+
+  # Post-process the manifest: overlay the inherited values onto the
+  # template the renderer produced. onboard_render_manifest writes a
+  # static template; we append inherited values after.
+  if [ -f "$proj_dir/agents.config.sh" ]; then
+    printf -- '\n# --- inherited from %s (ticket 0052) ---\n' "$source_slug" \
+      >> "$proj_dir/agents.config.sh"
+    while IFS=$'\t' read -r key val; do
+      [ -z "$key" ] && continue
+      # Quote the value for shell-safety.
+      printf -- '%s="%s"\n' "$key" "$val" >> "$proj_dir/agents.config.sh"
+    done < "$inh_tsv"
+  fi
+
+  rm -f "$inh_tsv"
+
+  # Install + onboarding-check.
+  set +e
+  add_run_install_and_verify "$proj_dir" "$kit_root"
+  local av_exit=$?
+  set -e
+  if [ "$av_exit" != "0" ]; then
+    exit "$av_exit"
+  fi
+  exit 0
+}
+
+if [ "$CMD" = "add" ]; then
+  add "$@"
 fi
 
 # --- preflight ------------------------------------------------------------
