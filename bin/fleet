@@ -1105,8 +1105,13 @@ fi
 
 # Static inheritance table — exactly the names this command will copy.
 # Test rig greps for these on a single line. Per AC#4 the project-
-# specific list is its own array.
+# specific list is its own array — it documents the resolve-from-the-
+# project (NOT-from-source-manifest) contract and is asserted by
+# tests/add.sh; the dispatcher's project-specific resolution is open-
+# coded (basename / git remote / gh run list), so the array itself is
+# referenced only by the test rig, not by the bin/fleet body.
 add_inherit_fields="BUDGET_DAILY_USD CROSS_LESSONS QUIET_HOURS LOCAL_GATE_CMD PROMPTS_PIN_SHA SHIP_PAUSE_THRESHOLD TRAINEE_REMAINING"
+# shellcheck disable=SC2034  # test-rig contract surface; see comment above
 add_project_specific_fields="SLUG REPO_URL GATING_CHECKS"
 
 # Inline copy of preflight_visible_width (defined ~L1367, later in this
@@ -1296,7 +1301,7 @@ add_render_diff() {
   fi
   printf -- '\n'
   printf -- '  inherited values (will land in %s/agents.config.sh):\n' "$slug"
-  local key val padded pad need
+  local key val cur pad
   while IFS=$'\t' read -r key val; do
     [ -z "$key" ] && continue
     cur=$(add_visible_width "$key")
