@@ -502,3 +502,35 @@ is suspect; pure replacements (e.g. `<path>` for a `/...` regex —
 `<path>` has no `/`) are usually safe but using the cursor for
 symmetry costs nothing. Distinct from `gsub` which always
 short-circuits self-match because it walks the string ONCE.
+
+## 2026-06-15 — `fleet streak --slug X --since 90d` shells out to `date -j -v +1d` once per day; a per-slug reader that calls it inside a `--all` loop pays O(window × N_slugs) subprocess cost
+
+While shipping ticket 0054's `fleet maturity`, step 6's first cut
+honored the AC literally: shell out to `fleet streak <slug> --json
+--since 14d` and parse the `current` field via inline `node -e`.
+That LOOKS like a cheap one-off — until you put it inside
+`fleet maturity --all` which walks every discovered slug. For each
+slug, streak's per-day awk walker shells out to BSD `date -u -j
+-v +1d -f %Y-%m-%d` once per day in the window to advance the
+cursor. With 20 fixture slugs and the default 90-day window that
+is 1,800 subprocess spawns per `--all` invocation, costing ~54s
+on my macOS bash 3.2. Even `--since 14d` is ~5.6s for 20 slugs —
+still untenable inside a test budget. The pattern repeats for
+ANY reader that shells out to `fleet streak`, `fleet doctor`,
+`fleet inbox` etc inside a per-slug loop (look for the shape
+`while ... read s_slug ... do; some_reader "$s_slug"; done`).
+Fix: replicate the GREEN-DAY predicate inline via one `awk` pass
+with awk-internal date arithmetic (Julian-day formula or a small
+`prev_day()` function that subtracts a day from a `YYYY-MM-DD`
+string in pure awk math). Same predicate, ~50ms per slug instead
+of ~600ms. Per LESSONS 2026-06-13 the inline parser is NOT
+wrapped in a `*_json_escape`-shaped helper — it's an inline awk.
+The wider cheap defensive habit: any new reader that's called
+from `--all` paths MUST do its day-walks in pure awk; shelling
+out to `date -j -v +1d` per day is fine for one-shot
+operator-invoked commands (the streak walker itself stays as-is
+because its operator-facing budget is per-invocation), but
+becomes O(window × N_slugs) the moment a caller wraps it in a
+fleet-wide loop. Quick audit: grep for `date -u -j -v` inside
+awk `cmd | getline` blocks AND for `while … read … do; "$FLEET"
+streak "$slug" --json` shapes in any new `--all` helper.
