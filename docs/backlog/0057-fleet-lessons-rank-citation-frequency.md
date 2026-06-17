@@ -1,7 +1,7 @@
 ---
 id: 0057
 title: fleet lessons-rank surfaces the most-cited LESSONS entries to feed promote / prune decisions
-status: groomed
+status: in-progress
 priority: P2
 area: governance
 created: 2026-06-17
@@ -629,3 +629,11 @@ Files / patterns the dev should touch.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+### 2026-06-17 — in-progress
+
+Branch `feat/0057-fleet-lessons-rank-citation-frequency` opened off
+main. Status flipped from `groomed` to `in-progress`. README index row
+0057 updated to match. About to write `tests/lessons-rank.sh` with the
+13 acceptance-criteria scenarios, then add the seven `lessons_rank_*`
+helpers + dispatcher + help banner line + README "Daily ops" line.
