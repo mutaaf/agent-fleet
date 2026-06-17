@@ -1,7 +1,7 @@
 ---
 id: 0055
 title: fleet pulse prints a one-line daily heartbeat suitable for a shell prompt or terminal banner
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-17
@@ -464,3 +464,11 @@ Files / patterns the dev should touch.
   so the cheapest hot-path inbox-debt check is to recompute the three
   cheap sections directly — `gh`-dependent stuck-PR section is
   intentionally skipped on the prompt-line hot path).
+- 2026-06-17 — implementation-dev: PR #117 merged on green CI (shellcheck
+  + validate). 14/14 ACs in tests/pulse.sh passed locally; no regression
+  in tests/maturity.sh (16/16) or tests/streak.sh (13/13). Auto-merge
+  squashed the implementation commit at 06:29:16Z (commit 17210cb)
+  before the status-flip commit landed, so this follow-up PR carries
+  the `shipped` index update. The kit-as-project `events.jsonl` got a
+  `pr_opened number=117 branch=feat/0055-fleet-pulse` event per
+  AGENTS.md § Telemetry.
