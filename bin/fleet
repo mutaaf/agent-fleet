@@ -90,6 +90,9 @@
 #                             (ticket 0055 — pure reader; --prompt-line / --slug / --json /
 #                              --no-cache; 90s TTL cache at ~/.cache/agent-fleet/pulse-prompt-line;
 #                              streak predicate inlined per LESSONS 2026-06-15)
+#   fleet share <slug> <pr>   compose a one-line testimonial for a single merged PR
+#                             (ticket 0056 — pure reader of events.jsonl + runs.jsonl + `gh pr view`;
+#                              --redact / --copy / --json; reuses portfolio_redact_text + portfolio_allocate_pseudonyms from 0053 verbatim)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -6033,6 +6036,7 @@ if [ "$CMD" = "pr-footer" ]; then
   pr_footer "$@"
 fi
 
+
 # --- inbox (ticket 0026) -------------------------------------------------
 # `fleet inbox` answers the daily question "what does my fleet need from
 # me today?" by reading the existing telemetry channel (events.jsonl,
@@ -10100,6 +10104,627 @@ USAGE
 
 if [ "$CMD" = "portfolio" ]; then
   portfolio "$@"
+fi
+# --- share (ticket 0056) -------------------------------------------------
+# `fleet share <slug> <pr>` composes a one-line shareable testimonial about
+# a single merged PR, ready to paste into a tweet / Slack DM / blog post.
+#
+# Pure reader over the slug's events.jsonl + runs.jsonl + `gh pr view` for
+# the merge metadata. No writes to telemetry channels, no new event types,
+# no `lib/` or `prompts/` edits. Reuses `portfolio_redact_text` (0053) and
+# `portfolio_allocate_pseudonyms` (0053) verbatim — no `*_json_escape`
+# wrapper around `preflight_json_escape` per LESSONS 2026-06-13.
+#
+# Per LESSONS 2026-06-05 every `share_*` helper MUST be defined ABOVE the
+# `share()` dispatcher and the `if [ "$CMD" = "share" ]` block — the
+# subcommand dispatcher runs at execution time, not parse time, so any
+# forward reference would die with `command not found` only at the moment
+# the helper is called.
+#
+# Per LESSONS 2026-06-15 `share` does NOT call `fleet streak` per slug; the
+# whole walk is one awk pass over the slug's events.jsonl and one awk pass
+# over its runs.jsonl, no day-walks, no recursive fleet invocations.
+
+# Discover the per-slug manifest by name. Echoes the absolute path to the
+# discovered slug's agents.config.sh, or empty if the slug is unknown.
+# Reuses `recap_discover_slugs`'s union over `FLEET_DISCOVERY_ROOT` +
+# `$HOME/.local/share/agent-fleet/projects`.
+share_resolve_slug_manifest() {  # $1 = slug
+  local want="$1" line slug manifest _cache
+  while IFS=$'\t' read -r slug manifest _cache; do
+    [ -z "$slug" ] && continue
+    if [ "$slug" = "$want" ]; then
+      printf -- '%s\n' "$manifest"
+      return 0
+    fi
+  done < <(recap_discover_slugs)
+  return 0
+}
+
+# Echo all discovered slug names (one per line, alphabetic).
+share_list_slugs() {
+  local slug _manifest _cache
+  while IFS=$'\t' read -r slug _manifest _cache; do
+    [ -z "$slug" ] && continue
+    printf -- '%s\n' "$slug"
+  done < <(recap_discover_slugs)
+}
+
+# Validate inputs per AC#1 + AC#2. Echoes the manifest path on stdout
+# (used by share() to locate the cache dir). On any refusal, prints the
+# documented message to stderr and `exit 2`.
+share_assert_slug_and_pr() {  # $1 = slug, $2 = pr
+  local slug="${1:-}" pr="${2:-}"
+  if [ -z "$slug" ] || [ -z "$pr" ]; then
+    printf -- 'share: usage: bin/fleet share <slug> <pr-number> [--redact] [--copy] [--json]\n' >&2
+    exit 2
+  fi
+  case "$pr" in
+    ''|*[!0-9]*)
+      printf -- 'share: usage: bin/fleet share <slug> <pr-number> [--redact] [--copy] [--json]\n' >&2
+      exit 2 ;;
+  esac
+  local manifest
+  manifest="$(share_resolve_slug_manifest "$slug")"
+  if [ -z "$manifest" ]; then
+    local slugs_csv
+    slugs_csv="$(share_list_slugs | LC_ALL=C sort | awk '
+      BEGIN { count = 0 }
+      NF {
+        if (count > 0) printf("%s", ", ")
+        printf("%s", $0)
+        count++
+      }
+    ')"
+    printf -- 'share: slug %s not found. discovered slugs: %s\n' "$slug" "$slugs_csv" >&2
+    exit 2
+  fi
+  # Verify the PR appears in the slug's events.jsonl as a pr_opened event.
+  local cache
+  # shellcheck disable=SC1090
+  cache="$( ( source "$manifest" 2>/dev/null; printf -- '%s' "${CACHE_DIR:-$HOME/.cache/${SLUG:-}-agent}" ) )"
+  local events="$cache/events.jsonl"
+  local seen=0
+  if [ -f "$events" ]; then
+    seen="$(awk -v want="$pr" '
+      BEGIN { count = 0; hit = 0 }
+      /"type"[[:space:]]*:[[:space:]]*"pr_opened"/ {
+        num = ""
+        if (match($0, /"number"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          num = substr($0, RSTART, RLENGTH)
+          sub(/.*"number"[[:space:]]*:[[:space:]]*"/, "", num)
+          sub(/".*/, "", num)
+        }
+        if (num == want) hit = 1
+        count++
+      }
+      END { print (hit + 0) }
+    ' "$events")"
+  fi
+  if [ "$seen" != "1" ]; then
+    printf -- 'share: %s has no merged PR #%s. run `fleet overview %s` to list known PRs.\n' \
+      "$slug" "$pr" "$slug" >&2
+    exit 2
+  fi
+  printf -- '%s\n' "$manifest"
+}
+
+# Fetch the PR metadata via `gh pr view <n> --json
+# mergedAt,additions,deletions,baseRefName,headRefName,url`. Caches under
+# `$HOME/.cache/agent-fleet/share-gh-pr-<slug>-<n>.json` with a 24h TTL
+# (per LESSONS 2026-06-11 the age math uses `date +%s` minus `stat -f %m`,
+# never `date -j -f`). Echoes the JSON body on stdout. Exits 2 with the
+# documented message on missing gh / non-zero exit.
+share_fetch_pr_metadata() {  # $1 = slug, $2 = pr
+  local slug="$1" pr="$2"
+  local cache_dir="$HOME/.cache/agent-fleet"
+  mkdir -p "$cache_dir" 2>/dev/null || true
+  local cache_file="$cache_dir/share-gh-pr-${slug}-${pr}.json"
+  local now_epoch="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  if [ -f "$cache_file" ]; then
+    local mtime
+    mtime="$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null || echo 0)"
+    local age=$(( now_epoch - mtime ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt 86400 ]; then
+      cat "$cache_file"
+      return 0
+    fi
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    printf -- 'share: gh CLI required to fetch PR metadata. install via `brew install gh` and run `gh auth login`.\n' >&2
+    exit 2
+  fi
+  local body
+  if ! body="$(gh pr view "$pr" --json mergedAt,additions,deletions,baseRefName,headRefName,url 2>/dev/null)"; then
+    printf -- 'share: gh CLI required to fetch PR metadata. install via `brew install gh` and run `gh auth login`.\n' >&2
+    exit 2
+  fi
+  if [ -z "$body" ]; then
+    printf -- 'share: gh CLI required to fetch PR metadata. install via `brew install gh` and run `gh auth login`.\n' >&2
+    exit 2
+  fi
+  printf -- '%s' "$body" > "$cache_file"
+  printf -- '%s' "$body"
+}
+
+# One awk pass over the slug's events.jsonl, correlating events for the
+# given PR number. Echoes a single TSV record:
+#   <run_started_ts>\t<pr_footer_posted_ts>\t<send_back_count>\t<heal_count>
+# Empty middle fields are emitted as the sentinel `-` per LESSONS
+# 2026-06-08. Per LESSONS 2026-06-08 BEGIN { count = 0 } is declared.
+share_walk_events() {  # $1 = events.jsonl, $2 = pr_number
+  local events="$1" pr="$2"
+  if [ ! -f "$events" ]; then
+    printf -- '-\t-\t0\t0\n'
+    return 0
+  fi
+  awk -v want_pr="$pr" '
+    function jv(line, key,    re, val) {
+      re = "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+      if (match(line, re)) {
+        val = substr(line, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*"/, "", val); sub(/".*/, "", val)
+        return val
+      }
+      return ""
+    }
+    BEGIN { count = 0; first_run_ts = ""; footer_ts = ""; send_backs = 0; heal_cycles = 0 }
+    {
+      type = jv($0, "type")
+      ts   = jv($0, "ts")
+      num  = jv($0, "number")
+      prk  = jv($0, "pr")
+      # Correlation key: a row matches when either "number" or "pr" equals
+      # the requested PR. run_started events in this kit do not always
+      # carry a PR (early ship runs assign a PR later), but the prompts
+      # MAY tag them — if neither key is present we still attribute the
+      # earliest run_started for the slug to the PR (best-effort).
+      hit = 0
+      if (num == want_pr || prk == want_pr) hit = 1
+      if (!hit) next
+      if (type == "run_started") {
+        if (first_run_ts == "" || ts < first_run_ts) first_run_ts = ts
+      } else if (type == "pr_footer_posted") {
+        if (footer_ts == "" || ts > footer_ts) footer_ts = ts
+      } else if (type == "lesson_draft_emitted") {
+        send_backs++
+      } else if (type == "heal_attempt" || type == "heal_started" || type == "heal_succeeded") {
+        heal_cycles++
+      }
+      count++
+    }
+    END {
+      out_run    = (first_run_ts == "") ? "-" : first_run_ts
+      out_footer = (footer_ts    == "") ? "-" : footer_ts
+      printf("%s\t%s\t%d\t%d\n", out_run, out_footer, send_backs + 0, heal_cycles + 0)
+    }
+  ' "$events"
+}
+
+# Sum cost_usd from runs.jsonl rows whose pr_number matches the input PR.
+# Falls back to the kit's canonical shape (total_cost_usd + result_head
+# containing "PR #<n>") when the explicit pr_number/cost_usd keys are
+# absent — same logic shape `ticket_cost_attribute_runs_for_slug` uses.
+# Echoes a single decimal with two fractional digits, e.g. `0.42`.
+share_sum_cost_for_pr() {  # $1 = runs.jsonl, $2 = pr_number
+  local runs="$1" pr="$2"
+  if [ ! -f "$runs" ]; then
+    echo "0.00"
+    return 0
+  fi
+  awk -v want_pr="$pr" '
+    BEGIN { count = 0; total = 0 }
+    {
+      pr_num = ""; cost = 0; head = ""
+      if (match($0, /"pr_number"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        pr_num = substr($0, RSTART, RLENGTH)
+        sub(/.*"pr_number"[[:space:]]*:[[:space:]]*"/, "", pr_num)
+        sub(/".*/, "", pr_num)
+      }
+      if (match($0, /"cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        c = substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", c)
+        cost = c + 0
+      } else if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        c = substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", c)
+        cost = c + 0
+      }
+      if (pr_num == "") {
+        if (match($0, /"result_head"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          head = substr($0, RSTART, RLENGTH)
+          sub(/.*"result_head"[[:space:]]*:[[:space:]]*"/, "", head)
+          sub(/".*/, "", head)
+          if (match(head, /PR #[0-9]+/)) {
+            m = substr(head, RSTART, RLENGTH); sub(/PR #/, "", m); pr_num = m
+          }
+        }
+      }
+      if (pr_num == want_pr) { total += cost; count++ }
+    }
+    END { printf("%.2f", total + 0) }
+  ' "$runs"
+}
+
+# Extract YYYY-MM-DD strings from `lesson_promoted.headline` and
+# `lesson_draft_emitted.headline` events whose `pr` field matches the
+# input PR number. Echoes the sorted-unique list, comma-separated, or
+# empty when no lessons cited. Per LESSONS 2026-06-08 BEGIN { count = 0 }.
+share_resolve_lessons_cited() {  # $1 = events.jsonl, $2 = pr_number
+  local events="$1" pr="$2"
+  if [ ! -f "$events" ]; then
+    printf -- ''
+    return 0
+  fi
+  awk -v want_pr="$pr" '
+    function jv(line, key,    re, val) {
+      re = "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+      if (match(line, re)) {
+        val = substr(line, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*"/, "", val); sub(/".*/, "", val)
+        return val
+      }
+      return ""
+    }
+    BEGIN { count = 0 }
+    /"type"[[:space:]]*:[[:space:]]*"lesson_promoted"|"type"[[:space:]]*:[[:space:]]*"lesson_draft_emitted"/ {
+      pr_field = jv($0, "pr")
+      if (pr_field != want_pr) next
+      headline = jv($0, "headline")
+      if (headline == "") next
+      if (match(headline, /[0-9]{4}-[0-9]{2}-[0-9]{2}/)) {
+        date = substr(headline, RSTART, RLENGTH)
+        print date
+        count++
+      }
+    }
+  ' "$events" | LC_ALL=C sort -u | awk '
+    BEGIN { count = 0 }
+    NF {
+      if (count > 0) printf("%s", ", ")
+      printf("%s", $0)
+      count++
+    }
+  '
+}
+
+# Compose the final one-line testimonial string. Per LESSONS 2026-05-28
+# every `printf` of a user-controlled string goes through `printf -- '%s'`.
+# Echoes the line WITHOUT a trailing newline (the dispatcher adds one).
+#
+# Args:
+#   $1 slug          $2 pr           $3 lines_changed   $4 runtime_minutes
+#   $5 cost_str ($N.NN or band)      $6 phrase          $7 lessons_csv (or "")
+#   $8 pr_url
+share_compose_line() {
+  local slug="$1" pr="$2" lines_changed="$3" runtime="$4"
+  local cost_str="$5" phrase="$6" lessons="$7" pr_url="$8"
+  local line=""
+  line="$(printf -- '%s' "${line}🟢 ")"
+  printf -- '%s' "🟢 "
+  printf -- '%s' "$slug"
+  printf -- ' PR #%s shipped autonomously by agent-fleet — ' "$pr"
+  printf -- '%s' "$lines_changed"
+  printf -- ' lines changed, '
+  printf -- '%s' "$runtime"
+  printf -- ' min runtime, '
+  printf -- '%s' "$cost_str"
+  printf -- ', '
+  printf -- '%s' "$phrase"
+  printf -- '.'
+  if [ -n "$lessons" ]; then
+    printf -- ' LESSONS cited: '
+    printf -- '%s' "$lessons"
+    printf -- '.'
+  fi
+  printf -- ' '
+  printf -- '%s' "$pr_url"
+  printf -- '\n'
+}
+
+# Apply the 0053 redaction helper to the composed line on stdin. Builds
+# the slug-map + pr-map (single-entry, since share is per-PR) and calls
+# `portfolio_redact_text` directly. The pseudonym allocator is
+# `portfolio_allocate_pseudonyms` (verbatim — no wrapper, no
+# `*_json_escape`-style indirection that LESSONS 2026-06-13 forbids).
+# Per LESSONS 2026-06-05 the allocator's sort runs under `LC_ALL=C`.
+#
+# Args: $1 = slug, $2 = pr
+# Reads the composed line from stdin; writes the redacted line to stdout.
+share_apply_redaction() {
+  local slug="$1" pr="$2"
+  local slug_map; slug_map="$(mktemp -t fleet-share-smap.XXXXXX)"
+  local pr_map;   pr_map="$(mktemp -t fleet-share-prmap.XXXXXX)"
+  # Allocate the slug pseudonym deterministically over the FULL set of
+  # discovered slugs (so `project-a` is stable across invocations within
+  # the same session, mirroring portfolio).
+  share_list_slugs | portfolio_allocate_pseudonyms > "$slug_map"
+  printf -- '%s\n' "$pr" | portfolio_allocate_pr_pseudonyms > "$pr_map"
+  portfolio_redact_text "$slug_map" "$pr_map" "redact"
+  rm -f "$slug_map" "$pr_map"
+}
+
+# Render the JSON object per AC#9. Per LESSONS 2026-06-03 every string
+# value goes through `preflight_json_escape`; per LESSONS 2026-06-13 we
+# call it directly (no `*_json_escape` wrapper).
+#
+# Args:
+#   $1  slug                $2  pr                  $3  lines_changed
+#   $4  runtime_minutes     $5  cost_field          $6  send_backs
+#   $7  heal_cycles         $8  lessons_csv (or "") $9  pr_url
+#   $10 rendered_line       $11 want_redact (0|1)
+share_render_json() {
+  local slug="$1" pr="$2" lines_changed="$3" runtime="$4"
+  local cost_field="$5" send_backs="$6" heal_cycles="$7"
+  local lessons="$8" pr_url="$9" rendered="${10}" want_redact="${11}"
+  local cost_token cost_raw_for_band
+  if [ "$want_redact" = "1" ]; then
+    # cost_field is "$N.NN"; band it via the 0053 helper so the JSON
+    # carries the same string the redacted text body shows (<$1, ~$5, …).
+    cost_raw_for_band="$(printf -- '%s' "$cost_field" | sed -e 's/^\$//')"
+    local band
+    band="$(portfolio_band_dollar "$cost_raw_for_band")"
+    cost_token="\"$(preflight_json_escape "$band")\""
+  else
+    # Default mode: cost_field is "~$N.NN"; strip "~$" so the JSON emits a
+    # raw numeric (not a quoted string).
+    cost_token="$(printf -- '%s' "$cost_field" | sed -e 's/^~\$//' -e 's/^\$//')"
+  fi
+  local pr_token
+  if [ "$want_redact" = "1" ]; then
+    pr_token="\"$(preflight_json_escape "$pr")\""
+  else
+    pr_token="$pr"
+  fi
+  printf -- '{'
+  printf -- '"slug":"%s",' "$(preflight_json_escape "$slug")"
+  printf -- '"pr":%s,' "$pr_token"
+  printf -- '"lines_changed":%d,' "$lines_changed"
+  printf -- '"runtime_minutes":%d,' "$runtime"
+  printf -- '"cost_usd":%s,' "$cost_token"
+  printf -- '"send_backs":%d,' "$send_backs"
+  printf -- '"heal_cycles":%d,' "$heal_cycles"
+  printf -- '"lessons_cited":['
+  local first=1 d
+  if [ -n "$lessons" ]; then
+    # lessons is a comma-space CSV; split and emit each as JSON string.
+    local oldifs="$IFS"
+    IFS=','
+    # shellcheck disable=SC2086
+    set -- $lessons
+    IFS="$oldifs"
+    for d in "$@"; do
+      d="${d# }"
+      [ -z "$d" ] && continue
+      [ "$first" -eq 1 ] || printf -- ','
+      printf -- '"%s"' "$(preflight_json_escape "$d")"
+      first=0
+    done
+  fi
+  printf -- '],'
+  printf -- '"pr_url":"%s",' "$(preflight_json_escape "$pr_url")"
+  printf -- '"rendered":"%s"' "$(preflight_json_escape "$rendered")"
+  printf -- '}\n'
+}
+
+# Dispatcher. Per LESSONS 2026-06-01 every code path ends with explicit
+# `exit 0` or `exit 2` so the function cannot fall through to the default
+# `fleet status` block.
+share() {
+  shift  # drop the leading "share"
+  local want_redact=0 want_copy=0 want_json=0
+  local slug="" pr=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --redact) want_redact=1; shift ;;
+      --copy)   want_copy=1; shift ;;
+      --json)   want_json=1; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet share — compose a one-line shareable testimonial about a single merged PR.
+
+Usage:
+  fleet share <slug> <pr-number>                 default text line on stdout
+  fleet share <slug> <pr-number> --redact        pseudonymize slug, PR, cost, repo URL
+  fleet share <slug> <pr-number> --copy          pipe through pbcopy (macOS only)
+  fleet share <slug> <pr-number> --json          structured JSON object
+  fleet share <slug> <pr-number> --redact --copy  paste-ready into a tweet
+  fleet share <slug> <pr-number> --redact --json combine both
+
+Pure reader: no events.jsonl writes, no `fleet_emit_event` calls, no
+`lib/` or `prompts/` edits, no new event types. Reuses
+`portfolio_redact_text` (ticket 0053) verbatim for --redact pseudonyms;
+reuses the cost-aggregator shape from `fleet ticket-cost` (ticket 0047)
+for the dollar figure.
+USAGE
+        exit 0 ;;
+      --) shift; break ;;
+      -*)
+        printf -- 'share: usage: bin/fleet share <slug> <pr-number> [--redact] [--copy] [--json]\n' >&2
+        exit 2 ;;
+      *)
+        if [ -z "$slug" ]; then slug="$1"
+        elif [ -z "$pr" ]; then pr="$1"
+        fi
+        shift ;;
+    esac
+  done
+
+  # Validate. share_assert_slug_and_pr echoes the manifest path on success
+  # and exits 2 on refusal (stderr carries the documented message). The
+  # helper's `exit 2` kills only the `$()` subshell, so we ALSO check
+  # `$?` and propagate the exit in the parent — per LESSONS 2026-06-01
+  # every code path of a new bin/fleet subcommand ends in `exit 0/2`.
+  local manifest assert_exit assert_err
+  assert_err="$(mktemp -t fleet-share-err.XXXXXX)"
+  set +e
+  manifest="$(share_assert_slug_and_pr "$slug" "$pr" 2>"$assert_err")"
+  assert_exit=$?
+  set -e
+  if [ "$assert_exit" != "0" ] || [ -z "$manifest" ]; then
+    cat "$assert_err" >&2
+    rm -f "$assert_err"
+    exit 2
+  fi
+  rm -f "$assert_err"
+
+  # Locate the slug's cache dir.
+  local cache
+  # shellcheck disable=SC1090
+  cache="$( ( source "$manifest" 2>/dev/null; printf -- '%s' "${CACHE_DIR:-$HOME/.cache/${SLUG:-}-agent}" ) )"
+  local events="$cache/events.jsonl"
+  local runs="$cache/runs.jsonl"
+
+  # Fetch PR metadata via gh (cached 24h). Same exit-2-from-subshell
+  # propagation pattern as `share_assert_slug_and_pr` above.
+  local pr_json fetch_exit fetch_err
+  fetch_err="$(mktemp -t fleet-share-gh-err.XXXXXX)"
+  set +e
+  pr_json="$(share_fetch_pr_metadata "$slug" "$pr" 2>"$fetch_err")"
+  fetch_exit=$?
+  set -e
+  if [ "$fetch_exit" != "0" ] || [ -z "$pr_json" ]; then
+    cat "$fetch_err" >&2
+    rm -f "$fetch_err"
+    exit 2
+  fi
+  rm -f "$fetch_err"
+
+  # Parse: additions, deletions, url.
+  local additions deletions pr_url
+  additions="$(printf -- '%s' "$pr_json" \
+                | sed -nE 's/.*"additions"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -1)"
+  deletions="$(printf -- '%s' "$pr_json" \
+                | sed -nE 's/.*"deletions"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -1)"
+  pr_url="$(printf -- '%s' "$pr_json" \
+            | sed -nE 's/.*"url"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)"
+  [ -z "$additions" ] && additions=0
+  [ -z "$deletions" ] && deletions=0
+  local lines_changed=$(( additions + deletions ))
+
+  # Walk events for the PR.
+  local walked run_ts footer_ts send_backs heal_cycles
+  walked="$(share_walk_events "$events" "$pr")"
+  IFS=$'\t' read -r run_ts footer_ts send_backs heal_cycles <<< "$walked"
+  [ "$run_ts" = "-" ]    && run_ts=""
+  [ "$footer_ts" = "-" ] && footer_ts=""
+  [ -z "$send_backs" ]   && send_backs=0
+  [ -z "$heal_cycles" ]  && heal_cycles=0
+
+  # Runtime minutes. Per LESSONS 2026-06-11 we use `date +%s` epoch
+  # subtraction with `T00:00:00` appended to date-only timestamps; ISO8601
+  # full timestamps with a trailing Z parse via the full format string.
+  local runtime_minutes=0
+  if [ -n "$run_ts" ] && [ -n "$footer_ts" ]; then
+    local run_ep footer_ep
+    # Normalize: strip fractional seconds, ensure trailing Z.
+    run_ts="${run_ts%.*Z}"
+    case "$run_ts" in *Z) : ;; *) run_ts="${run_ts}Z" ;; esac
+    footer_ts="${footer_ts%.*Z}"
+    case "$footer_ts" in *Z) : ;; *) footer_ts="${footer_ts}Z" ;; esac
+    run_ep="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$run_ts" '+%s' 2>/dev/null \
+              || date -u -d "$run_ts" '+%s' 2>/dev/null || echo 0)"
+    footer_ep="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$footer_ts" '+%s' 2>/dev/null \
+                  || date -u -d "$footer_ts" '+%s' 2>/dev/null || echo 0)"
+    if [ "$footer_ep" -gt "$run_ep" ] && [ "$run_ep" -gt 0 ]; then
+      local delta=$(( footer_ep - run_ep ))
+      # Round to the nearest minute.
+      runtime_minutes=$(( (delta + 30) / 60 ))
+    fi
+  fi
+
+  # Cost.
+  local cost_raw
+  cost_raw="$(share_sum_cost_for_pr "$runs" "$pr")"
+  local cost_field
+  if [ "$want_redact" = "1" ]; then
+    # `portfolio_redact_text` already runs a dollar-amount banding pass
+    # over its input (cursor-walk per LESSONS 2026-06-15), so we hand it
+    # the raw "$N.NN" and let it band into "<$1" / "~$5" / etc. Banding
+    # twice (here AND in the redactor) would double-prefix "~<$1".
+    cost_field="\$${cost_raw}"
+  else
+    # Operator-facing default: render "~$N.NN" so the prefix matches the
+    # ticket's testimonial example.
+    cost_field="~\$${cost_raw}"
+  fi
+
+  # LESSONS cited.
+  local lessons
+  lessons="$(share_resolve_lessons_cited "$events" "$pr")"
+
+  # Phrase branch (AC#3).
+  local phrase
+  if [ "$send_backs" -gt 0 ]; then
+    phrase="$send_backs send-back(s)"
+  elif [ "$heal_cycles" -gt 0 ]; then
+    phrase="healed in $heal_cycles cycle(s)"
+  else
+    phrase="no send-backs"
+  fi
+
+  # Compose.
+  local line_tmp; line_tmp="$(mktemp -t fleet-share-line.XXXXXX)"
+  share_compose_line "$slug" "$pr" "$lines_changed" "$runtime_minutes" \
+    "$cost_field" "$phrase" "$lessons" "$pr_url" > "$line_tmp"
+
+  # Apply redaction if requested.
+  local rendered_tmp; rendered_tmp="$(mktemp -t fleet-share-rendered.XXXXXX)"
+  if [ "$want_redact" = "1" ]; then
+    share_apply_redaction "$slug" "$pr" < "$line_tmp" > "$rendered_tmp"
+  else
+    cp "$line_tmp" "$rendered_tmp"
+  fi
+
+  # Strip the trailing newline from the rendered body for the JSON
+  # `rendered` field; keep it on the text rendering.
+  local rendered_body
+  rendered_body="$(awk 'BEGIN { count = 0 } { if (count > 0) printf "\n"; printf "%s", $0; count++ }' "$rendered_tmp")"
+
+  # JSON branch.
+  if [ "$want_json" = "1" ]; then
+    local out_slug="$slug" out_pr="$pr" out_url="$pr_url"
+    if [ "$want_redact" = "1" ]; then
+      # Pull the redacted slug / PR / URL from the rendered body itself by
+      # re-running the redactor over single-token inputs. That keeps the
+      # JSON's slug/pr/pr_url consistent with the redacted text line.
+      out_slug="$(printf -- '%s' "$slug" | share_apply_redaction "$slug" "$pr")"
+      out_pr="$(printf -- 'PR #%s' "$pr" | share_apply_redaction "$slug" "$pr" | sed -e 's/^PR #//')"
+      out_url="$(printf -- '%s' "$pr_url" | share_apply_redaction "$slug" "$pr")"
+    fi
+    share_render_json "$out_slug" "$out_pr" "$lines_changed" "$runtime_minutes" \
+      "$cost_field" "$send_backs" "$heal_cycles" "$lessons" "$out_url" \
+      "$rendered_body" "$want_redact"
+    rm -f "$line_tmp" "$rendered_tmp"
+    exit 0
+  fi
+
+  # --copy branch.
+  if [ "$want_copy" = "1" ]; then
+    local uname_kernel
+    uname_kernel="$(uname 2>/dev/null || echo "Darwin")"
+    if [ "$uname_kernel" = "Darwin" ]; then
+      # Pipe the line (without trailing newline) to pbcopy, then print a
+      # preview to stderr and the line itself to stdout.
+      printf -- '%s' "$rendered_body" | pbcopy
+      printf -- '📋 copied to clipboard. preview:\n' >&2
+      cat "$rendered_tmp"
+      rm -f "$line_tmp" "$rendered_tmp"
+      exit 0
+    else
+      printf -- 'share: --copy is macOS only; output printed to stdout instead\n' >&2
+      cat "$rendered_tmp"
+      rm -f "$line_tmp" "$rendered_tmp"
+      exit 0
+    fi
+  fi
+
+  # Default text branch.
+  cat "$rendered_tmp"
+  rm -f "$line_tmp" "$rendered_tmp"
+  exit 0
+}
+
+if [ "$CMD" = "share" ]; then
+  share "$@"
 fi
 
 # --- tail -----------------------------------------------------------------

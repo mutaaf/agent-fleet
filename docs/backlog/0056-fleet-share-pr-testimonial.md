@@ -1,7 +1,7 @@
 ---
 id: 0056
 title: fleet share <pr> composes a one-line shareable testimonial about a single merged PR
-status: groomed
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-17
@@ -550,3 +550,5 @@ Files / patterns the dev should touch.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+- 2026-06-17 — implementation-dev: opened `feat/0056-fleet-share-pr-testimonial`. Wrote tests/share.sh first (13 ACs), then implemented `share()` + 7 helpers in `bin/fleet` above the dispatcher block per LESSONS 2026-06-05. Reused `portfolio_redact_text` + `portfolio_allocate_pseudonyms` verbatim per the ticket's "no wrapper" clause. Added one help-banner line + one README "Daily ops" line. lib/, prompts/, AGENTS.md untouched.

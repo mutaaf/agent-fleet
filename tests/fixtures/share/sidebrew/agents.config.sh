@@ -1,0 +1,5 @@
+PROJECT_NAME="sidebrew"
+SLUG="sidebrew"
+NAMESPACE="com.sidebrew"
+REPO_URL="git@github.com:realuser/sidebrew.git"
+SELF_CANCEL="20990101"
