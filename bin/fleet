@@ -86,6 +86,10 @@
 #                             (ticket 0054 — pure reader of events.jsonl + agents.config.sh +
 #                              CROSS_LESSONS + morning-last-run; --all / --since / --json;
 #                              no writes, no new event types)
+#   fleet pulse               one-line daily heartbeat for prompt or banner
+#                             (ticket 0055 — pure reader; --prompt-line / --slug / --json /
+#                              --no-cache; 90s TTL cache at ~/.cache/agent-fleet/pulse-prompt-line;
+#                              streak predicate inlined per LESSONS 2026-06-15)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -14787,6 +14791,663 @@ EOS
 
 if [ "$CMD" = "morning" ]; then
   morning "$@"
+  exit $?
+fi
+
+# --- pulse (ticket 0055) -------------------------------------------------
+# `fleet pulse` is a PURE READER that prints a one-line daily heartbeat
+# (`--prompt-line`) or a 3-5 line banner (default) suitable for a shell
+# prompt or a launchd-fired iTerm banner. Where `fleet morning` is the
+# intentional pull, `fleet pulse` is the always-on glance.
+#
+# Per-slug signal precedence (highest first):
+#   paused          → ⏸                ship_paused without ship_resumed
+#   inbox_debt      → inbox=N          drafts + self_cancel + budget today
+#   streak_break    → Nd streak↓       streak ≥3d ended within last 24h
+#   pr_velocity_dip → 0PR/wk↓          trailing-7d merged=0 AND prior-7d≥1
+#   streak_growing  → Nd↑              live streak ≥3d
+#   flat            → ·                none of the above
+#
+# Hard NOs honored:
+#   - NO new event types, NO `fleet_emit_event` calls, NO
+#     `events.jsonl` writes — pure reader (asserted by tests/pulse.sh
+#     AC#13).
+#   - NO `lib/common.sh` or `prompts/` edits (asserted by AC#14).
+#   - NO shellout to `fleet streak` per-slug — the streak predicate is
+#     INLINED as a single pure-awk Julian-day walker per LESSONS
+#     2026-06-15 (`fleet streak --json` is too slow for prompt-line use
+#     and `date -j -v +1d` per day is O(window × N_slugs)).
+#   - NO `*_json_escape` wrapper — every JSON escape calls
+#     `preflight_json_escape` directly per LESSONS 2026-06-13.
+#
+# LESSONS defended against (referenced inline at each defense site):
+#   - 2026-05-26 (PATH reset → stubs under $HOME/.local/bin in tests)
+#   - 2026-05-27 (`$(cat)` round-trip → tests `cp` for backup/restore)
+#   - 2026-05-28 (printf leading-dash → every slug printf uses
+#                 `printf -- '%s'`)
+#   - 2026-05-30 (`grep -F --` flag → tests use `grep -qF -- "$kw"`)
+#   - 2026-06-01 (`grep -c || echo 0` double-print → every count uses
+#                 `awk … END { print n+0 }`)
+#   - 2026-06-01 (dispatcher fall-through → every code path ends `exit
+#                 0/2`, including `-h|--help`)
+#   - 2026-06-03 (UTF-8 sign-extension → preflight_json_escape)
+#   - 2026-06-05 (forward-reference → every pulse_* helper is defined
+#                 ABOVE the dispatcher)
+#   - 2026-06-05 (bash 3.2 LC_ALL caching → visible width uses awk +
+#                 wc -c, not bash `${#s}`)
+#   - 2026-06-08 (awk empty-string-key → `BEGIN { count = 0 }` in every
+#                 awk walker)
+#   - 2026-06-08 (IFS=$'\t' empty middle field → not applicable here;
+#                 our walker emits trailing fields only)
+#   - 2026-06-11 (BSD `date -j -f` fills missing time → cache age uses
+#                 `date +%s` minus `stat -f %m`, never `date -j -f`)
+#   - 2026-06-13 (no `*_json_escape` wrapper — direct
+#                 preflight_json_escape calls only)
+#   - 2026-06-15 (per-day `date -j -v +1d` in --all loops →
+#                 pulse_evaluate_signal walks days in pure awk math)
+
+# Resolve "now" honouring the FLEET_NOW_OVERRIDE test seam so the cache
+# TTL math and the streak window stay stable across fixture runs.
+pulse_now() {
+  echo "${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+}
+
+# Discover all installed-OR-source slugs. Same shape as
+# overview_discover / maturity_discover_slugs (union of FLEET_DISCOVERY_ROOT
+# and $HOME/.local/share/agent-fleet/projects) but emits just SLUG\tCACHE_DIR.
+# Sorted alphabetically. De-duped by SLUG.
+pulse_discover_slugs() {
+  local _seen="" m slug proj_dir
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # Pull SLUG= via awk (no source — faster, no side-effects).
+    slug="$(awk -F'=' '
+      BEGIN { count = 0 }
+      /^[[:space:]]*SLUG[[:space:]]*=/ {
+        v = $2
+        gsub(/^[[:space:]"]+|["[:space:]]+$/, "", v)
+        print v
+        exit
+      }' "$m")"
+    proj_dir="$(dirname "$m")"
+    [ -z "$slug" ] && slug="$(basename "$proj_dir")"
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf -- '%s\t%s\t%s\n' "$slug" "$proj_dir" "$HOME/.cache/${slug}-agent"
+  done | sort -t $'\t' -k1,1
+}
+
+# Check whether a slug is currently ship_paused: latest ship_paused event
+# with no LATER ship_resumed event per ticket 0006 / 0030 semantics.
+# Echoes 1 (paused) or 0 (not paused).
+pulse_check_paused() {  # $1 = events.jsonl
+  local events="$1"
+  [ -f "$events" ] || { echo 0; return 0; }
+  awk '
+    BEGIN { count = 0; latest_pause = ""; latest_resume = "" }
+    /"type"[[:space:]]*:[[:space:]]*"ship_paused"/ {
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        if (ts > latest_pause) latest_pause = ts
+      }
+    }
+    /"type"[[:space:]]*:[[:space:]]*"ship_resumed"/ {
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        if (ts > latest_resume) latest_resume = ts
+      }
+    }
+    END {
+      if (latest_pause != "" && latest_pause > latest_resume) print 1
+      else print 0
+    }
+  ' "$events"
+}
+
+# Count "inbox debt" signals for one slug. We reuse the inbox subcommand's
+# own three cheap (no-network) sections:
+#   - drafts in docs/LESSONS.md (<!-- DRAFT: --> markers)
+#   - SELF_CANCEL expiring in <=7d (or expired)
+#   - budget_block events in today's UTC day
+# stuck-PR section requires `gh` (network) and is intentionally skipped
+# on the prompt-line hot path. Echoes a single integer (the total).
+pulse_check_inbox_debt() {  # $1 = proj_dir, $2 = events.jsonl, $3 = self_cancel (YYYYMMDD), $4 = now_epoch
+  local proj_dir="$1" events="$2" self_cancel="$3" now_epoch="$4"
+  local drafts=0 sc=0 bg=0 total=0
+
+  # 1) Drafts in docs/LESSONS.md (or LESSONS.md).
+  local lf
+  for lf in "$proj_dir/docs/LESSONS.md" "$proj_dir/LESSONS.md"; do
+    [ -f "$lf" ] || continue
+    drafts="$(awk '/<!-- DRAFT: / { n++ } END { print (n+0) }' "$lf")"
+    break
+  done
+
+  # 2) SELF_CANCEL within 7d (or expired).
+  case "$self_cancel" in
+    ''|*[!0-9]*) : ;;
+    *)
+      local target today_iso today_epoch days
+      target="$(date -u -j -f "%Y%m%d" "$self_cancel" +%s 2>/dev/null || true)"
+      if [ -n "$target" ]; then
+        today_iso="$(date -u -r "$now_epoch" +%Y%m%d 2>/dev/null \
+          || date -u -d "@$now_epoch" +%Y%m%d 2>/dev/null)"
+        today_epoch="$(date -u -j -f "%Y%m%d" "$today_iso" +%s 2>/dev/null || echo 0)"
+        days=$(( (target - today_epoch) / 86400 ))
+        if [ "$days" -le 7 ]; then sc=1; fi
+      fi
+      ;;
+  esac
+
+  # 3) budget_block events in today's UTC day.
+  if [ -f "$events" ]; then
+    local today_iso
+    today_iso="$(date -u -r "$now_epoch" +%F 2>/dev/null \
+      || date -u -d "@$now_epoch" +%F 2>/dev/null)"
+    bg="$(awk -v today="$today_iso" '
+      BEGIN { count = 0 }
+      /"type"[[:space:]]*:[[:space:]]*"budget_block"/ {
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+          if (substr(ts, 1, 10) == today) count++
+        }
+      }
+      END { print (count + 0) }
+    ' "$events")"
+  fi
+
+  total=$(( drafts + sc + bg ))
+  echo "$total"
+}
+
+# PR velocity for one slug. Counts pr_footer_posted events in the
+# trailing 7d window and prior 7d window via one awk pass. Per LESSONS
+# 2026-06-08 awk scripts that index by counter declare `BEGIN { count =
+# 0; current = 0; prior = 0 }`. Echoes "<trailing>\t<prior>".
+pulse_check_pr_velocity() {  # $1 = events.jsonl, $2 = now_epoch
+  local events="$1" now_epoch="$2"
+  [ -f "$events" ] || { printf -- '0\t0\n'; return 0; }
+  local trailing_iso prior_iso
+  trailing_iso="$(date -u -r "$(( now_epoch - 7 * 86400 ))" +%FT%TZ 2>/dev/null \
+    || date -u -d "@$(( now_epoch - 7 * 86400 ))" +%FT%TZ 2>/dev/null)"
+  prior_iso="$(date -u -r "$(( now_epoch - 14 * 86400 ))" +%FT%TZ 2>/dev/null \
+    || date -u -d "@$(( now_epoch - 14 * 86400 ))" +%FT%TZ 2>/dev/null)"
+  awk -v trailing_iso="$trailing_iso" -v prior_iso="$prior_iso" '
+    BEGIN { count = 0; current = 0; prior = 0 }
+    /"type"[[:space:]]*:[[:space:]]*"pr_footer_posted"/ {
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        if (ts >= trailing_iso) current++
+        else if (ts >= prior_iso) prior++
+      }
+    }
+    END { printf("%d\t%d\n", current + 0, prior + 0) }
+  ' "$events"
+}
+
+# Compute the current live streak length AND whether the streak just
+# broke within the last 24h. Pure awk Julian-day walker per LESSONS
+# 2026-06-15 — NO `fleet streak` shellout, NO `date -j -v +1d` per day.
+# Echoes "<current_streak>\t<broken_length>" where broken_length is 0
+# unless a ≥3d streak broke within the last 24h (in which case
+# broken_length is the length of the streak that just ended).
+pulse_evaluate_streak() {  # $1 = events.jsonl, $2 = now_epoch
+  local events="$1" now_epoch="$2"
+  if [ ! -f "$events" ] || [ ! -s "$events" ]; then
+    printf -- '0\t0\n'
+    return 0
+  fi
+  local today_day cutoff_day cutoff_iso
+  today_day="$(date -u -r "$now_epoch" '+%Y-%m-%d' 2>/dev/null \
+    || date -u -d "@$now_epoch" '+%Y-%m-%d' 2>/dev/null)"
+  cutoff_day="$(date -u -r "$(( now_epoch - 29 * 86400 ))" '+%Y-%m-%d' 2>/dev/null \
+    || date -u -d "@$(( now_epoch - 29 * 86400 ))" '+%Y-%m-%d' 2>/dev/null)"
+  cutoff_iso="${cutoff_day}T00:00:00Z"
+
+  # Per LESSONS 2026-06-15: one awk pass, classify each day, walk backward
+  # from today in PURE AWK MATH (no shellout per day).
+  awk -v today_day="$today_day" -v cutoff_iso="$cutoff_iso" '
+    function days_in_month(y, m) {
+      if (m == 1 || m == 3 || m == 5 || m == 7 || m == 8 || m == 10 || m == 12) return 31
+      if (m == 4 || m == 6 || m == 9 || m == 11) return 30
+      if ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) return 29
+      return 28
+    }
+    function prev_day(d,  y, m, da) {
+      y = substr(d, 1, 4) + 0
+      m = substr(d, 6, 2) + 0
+      da = substr(d, 9, 2) + 0
+      da--
+      if (da < 1) {
+        m--
+        if (m < 1) { m = 12; y-- }
+        da = days_in_month(y, m)
+      }
+      return sprintf("%04d-%02d-%02d", y, m, da)
+    }
+    BEGIN { count = 0 }
+    {
+      ts=""; type=""; phase=""; exit_code=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (ts == "" || ts < cutoff_iso) next
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"phase"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        phase=substr($0, RSTART, RLENGTH)
+        sub(/.*"phase"[[:space:]]*:[[:space:]]*"/, "", phase); sub(/".*/, "", phase)
+      }
+      if (match($0, /"exit"[[:space:]]*:[[:space:]]*"?[^",}]*"?/)) {
+        exit_code=substr($0, RSTART, RLENGTH)
+        sub(/.*"exit"[[:space:]]*:[[:space:]]*"?/, "", exit_code)
+        sub(/"$/, "", exit_code)
+      }
+      day = substr(ts, 1, 10)
+      if (day > today_day) next
+      if (type == "ship_paused")        paused[day] = 1
+      else if (type == "budget_block")  budget[day] = 1
+      else if (type == "gate_failed" && phase == "ship") gate_unresolved[day] = 1
+      else if (type == "run_completed" && phase == "ship") {
+        if (exit_code == "0" || exit_code == 0) {
+          ship_ok[day]++
+          gate_unresolved[day] = 0
+        }
+      }
+    }
+    END {
+      # Step 1: current streak — how many consecutive green days ending
+      # today? Neutral mid-walk days preserve the streak.
+      cur_day = today_day
+      cur_streak = 0
+      for (i = 0; i < 30; i++) {
+        if ((cur_day in paused) || (cur_day in budget) || (cur_day in gate_unresolved && gate_unresolved[cur_day] == 1)) break
+        if (cur_day in ship_ok && ship_ok[cur_day] > 0) {
+          cur_streak++
+        }
+        # else: neutral, preserves streak.
+        cur_day = prev_day(cur_day)
+      }
+      # Step 2: did a streak ≥3d end within the last 24h? Look at
+      # yesterday for a break signal; if so, walk back from yesterday
+      # to count the green days in the streak that ended.
+      broken_length = 0
+      yesterday = prev_day(today_day)
+      if ((yesterday in paused) || (yesterday in budget) || (yesterday in gate_unresolved && gate_unresolved[yesterday] == 1)) {
+        cur = prev_day(yesterday)
+        for (j = 0; j < 30; j++) {
+          if ((cur in paused) || (cur in budget) || (cur in gate_unresolved && gate_unresolved[cur] == 1)) break
+          if (cur in ship_ok && ship_ok[cur] > 0) broken_length++
+          # Neutral days preserve the streak walk.
+          cur = prev_day(cur)
+        }
+      }
+      if (broken_length < 3) broken_length = 0
+      printf("%d\t%d\n", cur_streak + 0, broken_length + 0)
+    }
+  ' "$events"
+}
+
+# Evaluate one slug → emit "<signal>\t<render>\t<detail>" where
+# signal is one of paused|inbox_debt|streak_break|pr_velocity_dip|
+# streak_growing|flat and render is the cell text.
+# Per AC#3 precedence (highest first).
+pulse_evaluate_signal() {  # $1 = slug, $2 = proj_dir, $3 = events.jsonl, $4 = self_cancel, $5 = now_epoch
+  local slug="$1" proj_dir="$2" events="$3" self_cancel="$4" now_epoch="$5"
+
+  # Resilience: if events.jsonl exists but is NOT a regular file (e.g.
+  # a directory by accident), classify as flaky and let the renderer
+  # show '?'.
+  if [ -e "$events" ] && [ ! -f "$events" ]; then
+    printf -- 'flaky\t?\tevents.jsonl is not a regular file\n'
+    return 0
+  fi
+
+  # 1) paused (highest priority).
+  local is_paused
+  is_paused="$(pulse_check_paused "$events" 2>/dev/null)"
+  if [ "$is_paused" = "1" ]; then
+    printf -- 'paused\t⏸\tship_paused without resume\n'
+    return 0
+  fi
+
+  # 2) inbox_debt.
+  local n_inbox
+  n_inbox="$(pulse_check_inbox_debt "$proj_dir" "$events" "$self_cancel" "$now_epoch" 2>/dev/null)"
+  [ -z "$n_inbox" ] && n_inbox=0
+  case "$n_inbox" in ''|*[!0-9]*) n_inbox=0 ;; esac
+  if [ "$n_inbox" -ge 1 ]; then
+    printf -- 'inbox_debt\tinbox=%s\t%s open items\n' "$n_inbox" "$n_inbox"
+    return 0
+  fi
+
+  # Run the streak walker once (used for both streak_break and streak_growing).
+  local streak_out current_streak broken_length
+  streak_out="$(pulse_evaluate_streak "$events" "$now_epoch" 2>/dev/null)"
+  current_streak="$(printf -- '%s' "$streak_out" | awk -F'\t' '{ print $1+0 }')"
+  broken_length="$( printf -- '%s' "$streak_out" | awk -F'\t' '{ print $2+0 }')"
+  [ -z "$current_streak" ] && current_streak=0
+  [ -z "$broken_length" ] && broken_length=0
+
+  # 3) streak_break.
+  if [ "$broken_length" -ge 3 ]; then
+    printf -- 'streak_break\t%sd streak↓\tbroken streak length %s\n' \
+      "$broken_length" "$broken_length"
+    return 0
+  fi
+
+  # 4) pr_velocity_dip.
+  local pv current_pr prior_pr
+  pv="$(pulse_check_pr_velocity "$events" "$now_epoch" 2>/dev/null)"
+  current_pr="$(printf -- '%s' "$pv" | awk -F'\t' '{ print $1+0 }')"
+  prior_pr="$( printf -- '%s' "$pv" | awk -F'\t' '{ print $2+0 }')"
+  [ -z "$current_pr" ] && current_pr=0
+  [ -z "$prior_pr" ] && prior_pr=0
+  if [ "$current_pr" = "0" ] && [ "$prior_pr" -ge 1 ]; then
+    printf -- 'pr_velocity_dip\t0PR/wk↓\tprior 7d had %s merged PRs\n' "$prior_pr"
+    return 0
+  fi
+
+  # 5) streak_growing.
+  if [ "$current_streak" -ge 3 ]; then
+    printf -- 'streak_growing\t%sd↑\tcurrent streak %sd\n' \
+      "$current_streak" "$current_streak"
+    return 0
+  fi
+
+  # 6) flat.
+  printf -- 'flat\t·\tno signal\n'
+}
+
+# Read the slug's SELF_CANCEL from its agents.config.sh. Returns empty
+# string if missing or unparseable. Reads via awk (no source — no side
+# effects on the parent shell).
+pulse_read_self_cancel() {  # $1 = manifest path
+  local m="$1"
+  [ -f "$m" ] || { echo ""; return 0; }
+  awk -F'=' '
+    BEGIN { count = 0 }
+    /^[[:space:]]*SELF_CANCEL[[:space:]]*=/ {
+      v = $2
+      gsub(/^[[:space:]"]+|["[:space:]]+$/, "", v)
+      print v
+      exit
+    }' "$m"
+}
+
+# Render the prompt-line: one cell per slug, two-space sep, ≤120 chars
+# (truncate with '…' beyond).
+pulse_render_prompt_line() {  # $1 = TSV (slug\tsignal\trender\tdetail per line)
+  local tsv="$1"
+  local line="" first=1 slug signal render detail
+  while IFS=$'\t' read -r slug signal render detail; do
+    [ -z "$slug" ] && continue
+    local cell
+    # LESSONS 2026-05-28: printf -- guards against leading-dash slug names.
+    cell="$(printf -- '%s %s' "$slug" "$render")"
+    if [ "$first" = "1" ]; then
+      line="$cell"
+      first=0
+    else
+      line="$line  $cell"
+    fi
+    : "$detail"
+  done <<<"$tsv"
+
+  # Truncate at 120 chars (UTF-8-safe via wc -c approximation; the
+  # prompt-line is ASCII-dominant, with at most a few multi-byte
+  # signal chars (·, ↑, ↓, ⏸), so the byte-vs-char delta is small).
+  # We use bash ${#line} on the ASCII portion; per LESSONS 2026-06-05
+  # this is locale-fragile for multi-byte chars, so we use awk + wc -c.
+  local visible_bytes
+  visible_bytes="$(printf -- '%s' "$line" | wc -c | tr -d ' ')"
+  if [ "$visible_bytes" -gt 120 ]; then
+    # Truncate at 117 bytes + '…' (3 bytes) = 120 bytes total.
+    line="$(printf -- '%s' "$line" | LC_ALL=C cut -c 1-117)…"
+  fi
+
+  printf -- '%s\n' "$line"
+}
+
+# Render the multi-line banner: header + one row per slug.
+pulse_render_banner() {  # $1 = TSV, $2 = now_epoch, $3 = slug_count
+  local tsv="$1" now_epoch="$2" count="$3"
+  local stamp
+  stamp="$(date -u -r "$now_epoch" '+%a %b %d %H:%M' 2>/dev/null \
+    || date -u -d "@$now_epoch" '+%a %b %d %H:%M' 2>/dev/null)"
+  if [ "$count" = "1" ]; then
+    printf -- 'pulse — 1 slug, %s\n' "$stamp"
+  else
+    printf -- 'pulse — %s slugs, %s\n' "$count" "$stamp"
+  fi
+  local slug signal render detail
+  while IFS=$'\t' read -r slug signal render detail; do
+    [ -z "$slug" ] && continue
+    # LESSONS 2026-05-28: printf -- guards against leading-dash slug names.
+    printf -- '  %-12s %s\n' "$slug" "$render"
+    : "$signal" "$detail"
+  done <<<"$tsv"
+}
+
+# Render the JSON array — one element per slug. JSON escape via
+# preflight_json_escape directly per LESSONS 2026-06-13 (no
+# `*_json_escape` wrapper).
+pulse_render_json() {  # $1 = TSV
+  local tsv="$1"
+  printf -- '['
+  local first=1 slug signal render detail
+  while IFS=$'\t' read -r slug signal render detail; do
+    [ -z "$slug" ] && continue
+    [ "$first" = "1" ] && first=0 || printf -- ','
+    local sl si re de
+    sl="$(preflight_json_escape "$slug")"
+    si="$(preflight_json_escape "$signal")"
+    re="$(preflight_json_escape "$render")"
+    de="$(preflight_json_escape "$detail")"
+    printf -- '{"slug":"%s","signal":"%s","render":"%s","detail":{"note":"%s"}}' \
+      "$sl" "$si" "$re" "$de"
+  done <<<"$tsv"
+  printf -- ']\n'
+}
+
+# Read the prompt-line cache if it exists and is younger than 90s.
+# Echoes the cached line on stdout when fresh; returns 1 when stale or
+# absent so the caller knows to re-walk. Per LESSONS 2026-06-11 the
+# cache age uses `date +%s` minus `stat -f %m` (epoch math, no
+# `date -j -f` involved).
+pulse_cache_read() {  # $1 = cache_path, $2 = now_epoch
+  local cache_path="$1" now_epoch="$2"
+  [ -f "$cache_path" ] || return 1
+  local mtime age
+  mtime="$(stat -f %m "$cache_path" 2>/dev/null || stat -c %Y "$cache_path" 2>/dev/null)"
+  [ -z "$mtime" ] && return 1
+  age=$(( now_epoch - mtime ))
+  [ "$age" -lt 0 ] && age=0
+  if [ "$age" -lt 90 ]; then
+    cat "$cache_path"
+    return 0
+  fi
+  return 1
+}
+
+# Write the prompt-line to the cache file via temp+mv atomic write.
+pulse_cache_write() {  # $1 = cache_path, $2 = content
+  local cache_path="$1" content="$2"
+  local dir; dir="$(dirname "$cache_path")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  local tmp; tmp="$(mktemp -t pulse-cache.XXXXXX)" || return 0
+  printf -- '%s\n' "$content" > "$tmp"
+  mv -f "$tmp" "$cache_path" 2>/dev/null || rm -f "$tmp"
+}
+
+pulse() {
+  shift  # drop "pulse"
+  local mode="banner"      # banner | prompt_line | json
+  local slug_filter=""
+  local no_cache=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prompt-line)  mode="prompt_line"; shift ;;
+      --json)         mode="json"; shift ;;
+      --no-cache)     no_cache=1; shift ;;
+      --slug)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "pulse: --slug requires a value" >&2
+          exit 2
+        fi
+        slug_filter="$2"; shift 2 ;;
+      --slug=*)
+        slug_filter="${1#--slug=}"
+        if [ -z "$slug_filter" ]; then
+          echo "pulse: --slug requires a value" >&2
+          exit 2
+        fi
+        shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet pulse — one-line daily heartbeat for prompt or terminal banner.
+
+Usage:
+  fleet pulse                     default: 3-5 line banner (one row per slug)
+  fleet pulse --prompt-line       one line, prompt-friendly (≤120 chars)
+  fleet pulse --json              one structured JSON array, one element per slug
+  fleet pulse --slug NAME         restrict to one slug
+  fleet pulse --no-cache          bypass the 90s prompt-line cache (force re-walk)
+  fleet pulse --help              this message
+
+Per-slug signal precedence (highest first):
+  paused          → ⏸             ship_paused without ship_resumed
+  inbox_debt      → inbox=N        drafts + self_cancel + budget today
+  streak_break    → Nd streak↓     ≥3d green streak ended within last 24h
+  pr_velocity_dip → 0PR/wk↓        trailing-7d merged=0 AND prior-7d≥1
+  streak_growing  → Nd↑            current streak ≥3d
+  flat            → ·              none of the above
+
+Pure reader: no events.jsonl writes, no fleet_emit_event calls, no
+agents.config.sh writes. The cache at
+$HOME/.cache/agent-fleet/pulse-prompt-line is invalidatable (90s TTL).
+
+Wire it into your shell prompt:
+  PROMPT='%n@%m %1~ $(fleet pulse --prompt-line) %# '
+
+Exit code: 0 always (it is a glance); 2 on usage error.
+USAGE
+        exit 0 ;;
+      --)             shift ;;
+      -*)
+        printf -- 'pulse: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        printf -- 'pulse: unexpected argument %s\n' "$1" >&2
+        exit 2 ;;
+    esac
+  done
+
+  local now_epoch
+  now_epoch="$(pulse_now)"
+
+  # Cache fast-path: prompt-line mode + no slug filter + caching allowed.
+  local cache_path="$HOME/.cache/agent-fleet/pulse-prompt-line"
+  if [ "$mode" = "prompt_line" ] && [ -z "$slug_filter" ] && [ "$no_cache" = "0" ]; then
+    local cached
+    if cached="$(pulse_cache_read "$cache_path" "$now_epoch")"; then
+      printf -- '%s\n' "$cached"
+      exit 0
+    fi
+  fi
+
+  # Discover slugs.
+  local rows
+  rows="$(pulse_discover_slugs)"
+  if [ -z "$rows" ]; then
+    if [ "$mode" = "json" ]; then
+      printf -- '[]\n'
+      exit 0
+    fi
+    if [ "$mode" = "prompt_line" ]; then
+      # Empty line — but still exit 0 so the prompt expansion doesn't blow up.
+      printf -- '\n'
+      exit 0
+    fi
+    printf -- 'pulse: no slugs discovered. run `fleet onboard <repo>` to add the first project.\n'
+    exit 0
+  fi
+
+  # Build the per-slug evaluation TSV. Validate slug filter first.
+  local all_slugs="" slug found=0 s_slug s_dir s_cache
+  while IFS=$'\t' read -r s_slug s_dir s_cache; do
+    [ -z "$s_slug" ] && continue
+    if [ -z "$all_slugs" ]; then
+      all_slugs="$s_slug"
+    else
+      all_slugs="$all_slugs, $s_slug"
+    fi
+    if [ -n "$slug_filter" ] && [ "$s_slug" = "$slug_filter" ]; then
+      found=1
+    fi
+    : "$s_dir" "$s_cache"
+  done <<<"$rows"
+
+  if [ -n "$slug_filter" ] && [ "$found" = "0" ]; then
+    printf -- 'pulse: slug %s not found. discovered slugs: %s.\n' "$slug_filter" "$all_slugs" >&2
+    exit 2
+  fi
+
+  # Evaluate each slug.
+  local tsv_path; tsv_path="$(mktemp -t pulse-eval.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tsv_path'" EXIT
+  local count=0
+  while IFS=$'\t' read -r s_slug s_dir s_cache; do
+    [ -z "$s_slug" ] && continue
+    [ -n "$slug_filter" ] && [ "$s_slug" != "$slug_filter" ] && continue
+    local events="$s_cache/events.jsonl"
+    local manifest="$s_dir/agents.config.sh"
+    local self_cancel; self_cancel="$(pulse_read_self_cancel "$manifest")"
+    local sig_line
+    sig_line="$(pulse_evaluate_signal "$s_slug" "$s_dir" "$events" "$self_cancel" "$now_epoch")"
+    printf -- '%s\t%s\n' "$s_slug" "$sig_line" >> "$tsv_path"
+    count=$(( count + 1 ))
+  done <<<"$rows"
+
+  local tsv
+  tsv="$(cat "$tsv_path")"
+
+  case "$mode" in
+    prompt_line)
+      local line
+      line="$(pulse_render_prompt_line "$tsv")"
+      printf -- '%s\n' "$line"
+      # Write cache for hot-path future reads (only when no slug filter
+      # and caching allowed).
+      if [ -z "$slug_filter" ] && [ "$no_cache" = "0" ]; then
+        pulse_cache_write "$cache_path" "$line"
+      fi
+      ;;
+    json)
+      pulse_render_json "$tsv"
+      ;;
+    banner|*)
+      pulse_render_banner "$tsv" "$now_epoch" "$count"
+      ;;
+  esac
+  exit 0
+}
+
+if [ "$CMD" = "pulse" ]; then
+  pulse "$@"
   exit $?
 fi
 
