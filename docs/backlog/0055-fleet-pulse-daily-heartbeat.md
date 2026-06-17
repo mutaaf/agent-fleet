@@ -1,7 +1,7 @@
 ---
 id: 0055
 title: fleet pulse prints a one-line daily heartbeat suitable for a shell prompt or terminal banner
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-17
@@ -464,3 +464,9 @@ Files / patterns the dev should touch.
   so the cheapest hot-path inbox-debt check is to recompute the three
   cheap sections directly — `gh`-dependent stuck-PR section is
   intentionally skipped on the prompt-line hot path).
+- 2026-06-17 — implementation-dev: PR #117 opened, auto-merge armed
+  (squash), 14/14 ACs green in tests/pulse.sh; no regression in
+  tests/maturity.sh (16/16) or tests/streak.sh (13/13). `shellcheck -S
+  warning` clean; `FLEET_SELF_CHECK_GATE=1 bin/fleet self-check` shows
+  the same 3 baseline hits as `main` (no new traps introduced).
+  Flipping ticket frontmatter + index row to `shipped`.
