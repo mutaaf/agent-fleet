@@ -1,7 +1,7 @@
 ---
 id: 0058
 title: fleet trends <slug> renders 12-week sparkline-style trend lines for PRs / cost / send-backs
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-17
@@ -564,4 +564,10 @@ Files / patterns the dev should touch.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+2026-06-17: implementation-dev picked this ticket and flipped status
+groomed → in-progress on `feat/0058-fleet-trends-12w-sparklines`. Plan
+per AGENTS.md: tests-first under `tests/trends.sh` with fixtures at
+`tests/fixtures/trends/<slug>/{events.jsonl,runs.jsonl,agents.config.sh}`,
+then implement eight `trends_*` helpers + `trends()` dispatcher in
+`bin/fleet` ALL above the dispatcher block per LESSONS 2026-06-05.
+Pure reader: zero `lib/common.sh` / `prompts/` / events writes.
