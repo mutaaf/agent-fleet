@@ -1,7 +1,7 @@
 ---
 id: 0056
 title: fleet share <pr> composes a one-line shareable testimonial about a single merged PR
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-17

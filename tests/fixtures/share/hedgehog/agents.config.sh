@@ -1,0 +1,5 @@
+PROJECT_NAME="hedgehog"
+SLUG="hedgehog"
+NAMESPACE="com.hedgehog"
+REPO_URL="git@github.com:realuser/hedgehog.git"
+SELF_CANCEL="20990101"

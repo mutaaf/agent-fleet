@@ -1,0 +1,2 @@
+{"ts_start":"2026-06-14T10:00:00Z","slug":"sidebrew","phase":"ship","type":"run_completed","exit":"0","duration_ms":180000,"total_cost_usd":0.42,"pr_number":"42","cost_usd":0.42,"result_head":"SHIP 0056 — sidebrew shipped PR #42"}
+{"ts_start":"2026-06-15T08:00:00Z","slug":"sidebrew","phase":"ship","type":"run_completed","exit":"0","duration_ms":300000,"total_cost_usd":4.50,"pr_number":"99","cost_usd":4.50,"result_head":"SHIP 0057 — sidebrew shipped PR #99"}

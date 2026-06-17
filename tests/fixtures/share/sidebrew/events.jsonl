@@ -1,0 +1,10 @@
+{"ts":"2026-06-14T10:00:00Z","slug":"sidebrew","phase":"ship","type":"run_started","pid":"100","pr":"42"}
+{"ts":"2026-06-14T10:05:00Z","slug":"sidebrew","phase":"ship","type":"pr_opened","number":"42","branch":"feat/0056-sidebrew-feature"}
+{"ts":"2026-06-14T10:18:00Z","slug":"sidebrew","phase":"ship","type":"pr_footer_posted","number":"42"}
+{"ts":"2026-06-14T11:00:00Z","slug":"sidebrew","phase":"promote","type":"lesson_promoted","source":"sidebrew","text_sha":"deadbeef","scope":"all","pr":"42","headline":"2026-06-15 awk match self-replacement infinite loop"}
+{"ts":"2026-06-15T08:00:00Z","slug":"sidebrew","phase":"ship","type":"run_started","pid":"200","pr":"99"}
+{"ts":"2026-06-15T08:30:00Z","slug":"sidebrew","phase":"ship","type":"pr_opened","number":"99","branch":"feat/0057-sidebrew-bigger"}
+{"ts":"2026-06-15T08:45:00Z","slug":"sidebrew","phase":"ship","type":"heal_attempt","number":"99","attempt":"1"}
+{"ts":"2026-06-15T09:43:00Z","slug":"sidebrew","phase":"ship","type":"pr_footer_posted","number":"99"}
+{"ts":"2026-06-15T11:00:00Z","slug":"sidebrew","phase":"promote","type":"lesson_promoted","source":"sidebrew","text_sha":"cafef00d","scope":"all","pr":"99","headline":"2026-06-11 BSD date -j -f fills missing time fields"}
+{"ts":"2026-06-15T11:01:00Z","slug":"sidebrew","phase":"promote","type":"lesson_promoted","source":"sidebrew","text_sha":"feedface","scope":"all","pr":"99","headline":"2026-06-08 awk arr count empty-string key"}
