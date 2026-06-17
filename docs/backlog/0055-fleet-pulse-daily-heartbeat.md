@@ -1,7 +1,7 @@
 ---
 id: 0055
 title: fleet pulse prints a one-line daily heartbeat suitable for a shell prompt or terminal banner
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-17
@@ -452,4 +452,15 @@ Files / patterns the dev should touch.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-17 — implementation-dev: opened `feat/0055-fleet-pulse`. Flipped
+  status to `in-progress`. Implementing `bin/fleet pulse` as a pure reader
+  per AGENTS.md § Hard NOs (no lib/ or prompts/ edits, no new event types,
+  no events.jsonl writes). Streak predicate inlined as a pure-awk Julian-
+  day walker per LESSONS 2026-06-15 — no `fleet streak --json` shellout in
+  the per-slug loop. Inbox-debt signal is the same drafts + self_cancel +
+  budget composite the inbox subcommand renders (the ticket cites
+  `inbox-last-snapshot.jsonl` aspirationally; the actual on-disk state
+  file at `$HOME/.cache/fleet/inbox-state` is a single-epoch marker,
+  so the cheapest hot-path inbox-debt check is to recompute the three
+  cheap sections directly — `gh`-dependent stuck-PR section is
+  intentionally skipped on the prompt-line hot path).
