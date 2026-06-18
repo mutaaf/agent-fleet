@@ -571,3 +571,21 @@ per AGENTS.md: tests-first under `tests/trends.sh` with fixtures at
 then implement eight `trends_*` helpers + `trends()` dispatcher in
 `bin/fleet` ALL above the dispatcher block per LESSONS 2026-06-05.
 Pure reader: zero `lib/common.sh` / `prompts/` / events writes.
+
+2026-06-18: implementation-dev shipped the trends subcommand. Eight
+`trends_*` helpers + dispatcher placed above the `if [ "$CMD" =
+"trends" ]` block (LESSONS 2026-06-05 forward-reference trap). Bucket
+math is pure awk `(epoch - anchor) / 604800` with a Julian-day-formula
+`iso2ep` so the whole walk is one subprocess per slug (LESSONS
+2026-06-15 / 2026-06-11 defended). Today-anchor is `date +%s` minus
+`weeks * 7 * 86400`. JSON escape via `preflight_json_escape` called
+DIRECTLY per LESSONS 2026-06-13. Slope arrows in JSON are ASCII
+`up|flat|down` (LESSONS 2026-06-08). Sparkline glyphs emitted via awk
+`printf("%s", out)` from a pre-built `glyphs[1..8]` array under
+explicit `LC_ALL=C` (LESSONS 2026-06-03 / 2026-06-05). Every code path
+in `trends()` ends with an explicit `exit 0` or `exit 2` (LESSONS
+2026-06-01). Help banner block at the top of `bin/fleet` and the README
+"Daily ops" code block each got one new line. `lib/common.sh` and
+`prompts/` untouched; AC#13 passes via `git diff`. Self-check stays at
+the on-main baseline of 3 hits (no new regressions introduced). All 14
+trends acceptance criteria green; local gate green.

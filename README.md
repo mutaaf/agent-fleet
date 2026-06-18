@@ -483,6 +483,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet pulse --prompt-line                                 # one-line daily heartbeat for prompt or banner (ticket 0055 — pure reader; --prompt-line / --slug / --json / --no-cache; 90s TTL cache at ~/.cache/agent-fleet/pulse-prompt-line; streak predicate inlined per LESSONS 2026-06-15)
 ~/code/agent-fleet/bin/fleet share sidebrew 42 --redact --copy                   # compose a one-line testimonial for a single merged PR (ticket 0056 — pure reader of events.jsonl + runs.jsonl + `gh pr view`; --redact / --copy / --json; reuses portfolio_redact_text + portfolio_allocate_pseudonyms from 0053 verbatim; 24h gh PR metadata cache at ~/.cache/agent-fleet/share-gh-pr-<slug>-<n>.json)
 ~/code/agent-fleet/bin/fleet lessons-rank --top 10                                # surface the most-cited LESSONS entries for promote/prune decisions (ticket 0057 — pure reader of docs/LESSONS.md + bin/fleet + lib/*.sh + prompts/*.md + docs/backlog/*.md; --top N / --bottom N / --json / --include-tests; promote ≥10 cites & ≥5 files, prune ≤1 cite & >30d old; never writes)
+~/code/agent-fleet/bin/fleet trends sidebrew                                       # render 12-week sparklines for PRs / cost / send-backs (ticket 0058 — pure reader of events.jsonl + runs.jsonl; --all / --axis prs|cost|sendbacks / --weeks 4..52 / --json; advisory footer fires only when PR-velocity ↓ AND send-back rate ↑ for ≥3 consecutive weeks)
 ```
 
 **Dry-run mode (ticket 0010).** Setting `AGENT_DRY_RUN=1` flips

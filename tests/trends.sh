@@ -35,7 +35,7 @@ mkdir -p "$HOME/.local/bin"
 
 # Pinned epoch: 2026-06-15T00:00:00Z (Mon). The default window is the
 # trailing 12 weeks = 84 days. Anchor: now - 84*86400 = 2026-03-23.
-NOW_EPOCH=1781568000  # 2026-06-15 00:00:00 UTC
+NOW_EPOCH=1781481600  # 2026-06-15 00:00:00 UTC
 export FLEET_NOW_OVERRIDE="$NOW_EPOCH"
 
 # Convenience: emit a fully-formed ISO8601 UTC timestamp.
@@ -109,10 +109,12 @@ done
 EV_DECL="$CACHE_DECL/events.jsonl"
 RUN_DECL="$CACHE_DECL/runs.jsonl"
 : > "$EV_DECL"; : > "$RUN_DECL"
-# Pattern: 4 4 4 4 4 5 6 7 6 5 4 3  (last 4 weeks: 6,5,4,3 — declining)
-DECL_PATTERN=(4 4 4 4 4 5 6 7 6 5 4 3)
-# Send-back: 0 0 0 0 0 0 0 0 1 2 3 4  (rising in last 4 weeks)
-DECL_SB=(0 0 0 0 0 0 0 0 1 2 3 4)
+# Pattern: 4 4 4 4 5 6 7 8 6 4 2 1  (last 4 weeks: 6,4,2,1 — clearly declining,
+# monotone-non-increasing, last-4 mean 3.25 vs prior-4 mean 6.5 = -50% slope.)
+DECL_PATTERN=(4 4 4 4 5 6 7 8 6 4 2 1)
+# Send-back: 0 0 0 0 0 0 0 0 1 2 4 6  (rising in last 4 weeks, monotone-non-
+# decreasing, last-4 mean 3.25 vs prior-4 mean 0 → up.)
+DECL_SB=(0 0 0 0 0 0 0 0 1 2 4 6)
 # pr_opened (denominator): 5 5 5 5 5 5 5 5 5 5 5 5
 for k in 0 1 2 3 4 5 6 7 8 9 10 11; do
   prs="${DECL_PATTERN[$k]}"
