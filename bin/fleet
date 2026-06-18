@@ -93,6 +93,9 @@
 #   fleet share <slug> <pr>   compose a one-line testimonial for a single merged PR
 #                             (ticket 0056 — pure reader of events.jsonl + runs.jsonl + `gh pr view`;
 #                              --redact / --copy / --json; reuses portfolio_redact_text + portfolio_allocate_pseudonyms from 0053 verbatim)
+#   fleet lessons-rank        surface the most-cited LESSONS entries for promote/prune decisions
+#                             (ticket 0057 — pure reader of docs/LESSONS.md + four code trees;
+#                              --top N / --bottom N / --json / --include-tests; never writes)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -21232,6 +21235,516 @@ USAGE
 
 if [ "$CMD" = "lessons-promote" ]; then
   lessons_promote "$@"
+fi
+
+# --- lessons-rank (ticket 0057) ------------------------------------------
+# `bin/fleet lessons-rank` counts, for every `## YYYY-MM-DD` heading in
+# `docs/LESSONS.md`, how many times that date string appears in
+# `bin/fleet`, `lib/*.sh`, `prompts/*.md`, and `docs/backlog/*.md`, then
+# prints a ranked list with `→ promote-candidate` / `→ prune-candidate`
+# annotations. Pure reader: no writes to LESSONS.md, no events, no
+# `lib/` or `prompts/` edits.
+#
+# Per LESSONS 2026-06-05 every `lessons_rank_*` helper MUST be defined
+# ABOVE the `lessons_rank()` dispatcher and the `if [ "$CMD" = ... ]`
+# block — the subcommand dispatcher runs at execution time, not parse
+# time, so any forward reference would die with `command not found`
+# only at the moment the helper is called.
+#
+# Per LESSONS 2026-06-15 `lessons-rank` does NOT call any per-slug
+# helper from inside a `--all`-style loop — every grep is one file-tree
+# walk over the operator-invoked kit root, no recursive day/slug walks.
+
+# Resolve the kit root. FLEET_LESSONS_RANK_ROOT overrides for tests.
+lessons_rank_kit_root() {
+  if [ -n "${FLEET_LESSONS_RANK_ROOT:-}" ]; then
+    printf -- '%s\n' "$FLEET_LESSONS_RANK_ROOT"
+  else
+    ( cd "$( dirname "$0" )/.." && pwd )
+  fi
+}
+
+# Resolve today as YYYY-MM-DD. Test seam: FLEET_NOW_OVERRIDE (bare
+# YYYY-MM-DD or "YYYY-MM-DD HH:MM").
+lessons_rank_today() {
+  if [ -n "${FLEET_NOW_OVERRIDE:-}" ]; then
+    printf -- '%s\n' "${FLEET_NOW_OVERRIDE%% *}"
+  else
+    date -u '+%Y-%m-%d'
+  fi
+}
+
+# Walk $1 (LESSONS.md) and emit one TSV line per `## YYYY-MM-DD —
+# <headline>` heading: `<date>\t<headline>`. Per LESSONS 2026-06-05 the
+# awk pass runs under LC_ALL=C so bash 3.2's locale caching cannot
+# corrupt the regex match. Per LESSONS 2026-06-08 the BEGIN block
+# declares `count = 0` so the heading accumulator indexes from 0.
+lessons_rank_extract_headings() {  # $1 = path to docs/LESSONS.md
+  local lessons="$1"
+  [ -f "$lessons" ] || return 0
+  LC_ALL=C awk '
+    BEGIN { count = 0 }
+    /^## [0-9]{4}-[0-9]{2}-[0-9]{2} / {
+      date = substr($0, 4, 10)
+      headline = $0
+      # Strip leading "## YYYY-MM-DD " then any leading non-space token
+      # (em-dash or hyphen) + its trailing space.
+      sub(/^## [0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]+[^[:space:]]+[[:space:]]+/, "", headline)
+      print date "\t" headline
+      count++
+    }
+  ' "$lessons"
+}
+
+# Compute the YMD obtained by subtracting (or adding when delta > 0) a
+# day delta from $1 (YYYY-MM-DD). Uses Julian-day arithmetic in awk —
+# zero `date` shellouts, zero `date -j -f` involvement, so the
+# LESSONS 2026-06-11 "fills missing time with NOW-of-day" trap cannot
+# fire. $2 is the integer delta (negative subtracts, positive adds).
+lessons_rank_ymd_shift() {  # $1 = YMD, $2 = delta (int)
+  local ymd="$1" delta="$2"
+  LC_ALL=C awk -v ymd="$ymd" -v delta="$delta" '
+    BEGIN {
+      count = 0
+      y = substr(ymd, 1, 4) + 0
+      m = substr(ymd, 6, 2) + 0
+      d = substr(ymd, 9, 2) + 0
+      a = int((14 - m) / 12)
+      ym = y + 4800 - a
+      mm = m + 12 * a - 3
+      j = d + int((153 * mm + 2) / 5) + 365 * ym + int(ym / 4) - int(ym / 100) + int(ym / 400) - 32045
+      j += int(delta + 0)
+      a = j + 32044
+      b = int((4 * a + 3) / 146097)
+      c = a - int((146097 * b) / 4)
+      d2 = int((4 * c + 3) / 1461)
+      e = c - int((1461 * d2) / 4)
+      mo = int((5 * e + 2) / 153)
+      day = e - int((153 * mo + 2) / 5) + 1
+      mon = mo + 3 - 12 * int(mo / 10)
+      yr = 100 * b + d2 - 4800 + int(mo / 10)
+      printf("%04d-%02d-%02d\n", yr, mon, day)
+    }
+  '
+}
+
+# List the files under each of the four (or five) trees under kit_root.
+# Echoes a TSV: `<tree>\t<path>` lines. Trees are emitted in the order:
+# bin/fleet, lib, prompts, docs/backlog, tests (last only when
+# include_tests=1). Per LESSONS 2026-06-05 the `find` invocation is
+# guarded with `-maxdepth 1` so nested checkouts cannot poison the
+# count. Per LESSONS 2026-06-08 the BEGIN declaration is implicit (no
+# awk here) — the helper is pure shell so the rule does not apply.
+lessons_rank_enumerate_trees() {  # $1 = kit_root, $2 = include_tests (0|1)
+  local root="$1" include_tests="$2"
+  local p
+  [ -f "$root/bin/fleet" ] && printf -- 'bin\t%s\n' "$root/bin/fleet"
+  if [ -d "$root/lib" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] && printf -- 'lib\t%s\n' "$p"
+    done < <(find "$root/lib" -maxdepth 1 -type f -name '*.sh' 2>/dev/null | LC_ALL=C sort)
+  fi
+  if [ -d "$root/prompts" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] && printf -- 'prompts\t%s\n' "$p"
+    done < <(find "$root/prompts" -maxdepth 1 -type f -name '*.md' 2>/dev/null | LC_ALL=C sort)
+  fi
+  if [ -d "$root/docs/backlog" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] && printf -- 'backlog\t%s\n' "$p"
+    done < <(find "$root/docs/backlog" -maxdepth 1 -type f -name '*.md' 2>/dev/null | LC_ALL=C sort)
+  fi
+  if [ "$include_tests" = "1" ] && [ -d "$root/tests" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] && printf -- 'tests\t%s\n' "$p"
+    done < <(find "$root/tests" -maxdepth 1 -type f -name '*.sh' 2>/dev/null | LC_ALL=C sort)
+  fi
+}
+
+# Build the full citations index in ONE pass per tree (not per
+# date × tree). Reads `<tree>\t<file>` TSV on stdin; emits
+# `<date>\t<tree>\t<file>` for every matching line. The single-pass
+# shape sidesteps the LESSONS 2026-06-15 per-slug-shellout-inside-loop
+# trap by operator-invoking the scan once per dispatch.
+lessons_rank_build_citations_index() {  # stdin = TSV(tree, file), stdout = TSV(date, tree, file)
+  local tree path
+  while IFS=$'\t' read -r tree path; do
+    [ -z "$path" ] && continue
+    [ -f "$path" ] || continue
+    LC_ALL=C awk -v F="$path" -v T="$tree" '
+      BEGIN { count = 0 }
+      {
+        delete seen
+        s = $0
+        while (match(s, /[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/)) {
+          d = substr(s, RSTART, RLENGTH)
+          if (!(d in seen)) {
+            seen[d] = 1
+            printf("%s\t%s\t%s\n", d, T, F)
+          }
+          s = substr(s, RSTART + RLENGTH)
+        }
+      }
+    ' "$path"
+  done
+}
+
+# For one date, aggregate the citations index from $1 (the path to the
+# index TSV produced by lessons_rank_build_citations_index). Echoes a
+# TSV row:
+# `total\tfiles_cited\tbin_n\tlib_n\tprompts_n\tbacklog_n\ttests_n`
+# where:
+#   * `*_n` = count of LINES (one per matching row, mirroring `grep -c`)
+#     in that tree
+#   * `total` = sum of all `*_n`
+#   * `files_cited` = unique (tree, file) tuples = distinct files with
+#     at least one matching line, summed across all five trees
+# Per LESSONS 2026-06-08 the awk BEGIN declares `count = 0`. Per
+# LESSONS 2026-06-05 the awk runs under LC_ALL=C.
+lessons_rank_count_citations() {  # $1 = date, $2 = citations_index_path
+  local date="$1" idx="$2"
+  if [ ! -f "$idx" ]; then
+    printf -- '0\t0\t0\t0\t0\t0\t0\n'
+    return 0
+  fi
+  LC_ALL=C awk -v want="$date" '
+    BEGIN {
+      count = 0
+      bin_n=0; lib_n=0; prompts_n=0; backlog_n=0; tests_n=0
+    }
+    $1 == want {
+      # Per-tree line count (one row per matching line).
+      if      ($2 == "bin")     bin_n++
+      else if ($2 == "lib")     lib_n++
+      else if ($2 == "prompts") prompts_n++
+      else if ($2 == "backlog") backlog_n++
+      else if ($2 == "tests")   tests_n++
+      # Unique-files-cited dedup key: (tree, file) tuple.
+      key = $2 "\t" $3
+      if (!(key in seen_file)) {
+        seen_file[key] = 1
+        files_cited++
+      }
+    }
+    END {
+      total = bin_n + lib_n + prompts_n + backlog_n + tests_n
+      printf("%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+             total, (files_cited+0), bin_n, lib_n, prompts_n, backlog_n, tests_n)
+    }
+  ' "$idx"
+}
+
+# Classify one entry. Echoes `promote`, `prune`, or `keep`.
+# - promote: total >= 10 AND files_cited >= 5
+# - prune:   total <= 1 AND heading_date is more than 30 days before today
+# - else:    keep
+# Date comparison is a YYYY-MM-DD lexicographic compare against
+# cutoff = today - 30d (computed by lessons_rank_ymd_shift in pure awk
+# math; no `date -j -f` involved per LESSONS 2026-06-11).
+lessons_rank_classify() {  # $1 = total, $2 = files_cited, $3 = date, $4 = today
+  local total="$1" files_cited="$2" date="$3" today="$4"
+  if [ "$total" -ge 10 ] && [ "$files_cited" -ge 5 ]; then
+    printf -- 'promote\n'
+    return 0
+  fi
+  if [ "$total" -le 1 ]; then
+    local cutoff; cutoff="$(lessons_rank_ymd_shift "$today" -30)"
+    # "more than 30 days before today" means heading_date < cutoff
+    # (strict). Lexicographic YYYY-MM-DD compare works.
+    if [ "$date" \< "$cutoff" ]; then
+      printf -- 'prune\n'
+      return 0
+    fi
+  fi
+  printf -- 'keep\n'
+}
+
+# Sort the rank table. Reads TSV lines on stdin:
+# `<date>\t<headline>\t<total>\t<files>\t<bin_n>\t<lib_n>\t<prompts_n>\t<backlog_n>\t<tests_n>\t<recommendation>`
+# Sorts by descending total (col 3), ties broken by ascending date
+# (col 1). Per LESSONS 2026-06-08 the awk pass declares `count = 0`.
+lessons_rank_sort() {
+  # `sort -t$'\t' -k3,3nr -k1,1` — numeric-desc on col 3, then
+  # ascending alpha on col 1 (date). LC_ALL=C so the alpha sort is
+  # stable across locales.
+  LC_ALL=C sort -t '	' -k3,3nr -k1,1
+}
+
+# Render the text table. Reads sorted TSV from stdin. $1 = today (for
+# the EXPIRES suggestion), $2 = total entries (for the header banner),
+# $3 = "all"|"top"|"bottom" + count for the slice descriptor.
+lessons_rank_render_text() {  # $1 = today, $2 = total_entries, $3 = slice_label
+  local today="$1" total_entries="$2" slice_label="$3"
+  local rank=0
+  local expires_suggested; expires_suggested="$(lessons_rank_ymd_shift "$today" 30)"
+  printf -- 'lessons-rank — %s entries (%s)\n\n' "$total_entries" "$slice_label"
+  local date headline total files bin_n lib_n prompts_n backlog_n tests_n rec
+  while IFS=$'\t' read -r date headline total files bin_n lib_n prompts_n backlog_n tests_n rec; do
+    [ -z "$date" ] && continue
+    rank=$(( rank + 1 ))
+    # Per LESSONS 2026-05-28 every printf of a headline (may contain
+    # leading `-` or similar) goes through `printf -- '%s'`.
+    printf -- '%3d. LESSONS %s — ' "$rank" "$date"
+    printf -- '%s' "$headline"
+    printf -- '\n'
+    local files_label="files"
+    [ "$files" = "1" ] && files_label="file"
+    printf -- '     cited %s× across %s %s' "$total" "$files" "$files_label"
+    case "$rec" in
+      promote) printf -- '                → promote-candidate' ;;
+      prune)   printf -- '                → prune-candidate (EXPIRES %s suggested)' "$expires_suggested" ;;
+      *)       : ;;
+    esac
+    printf -- '\n'
+    printf -- '       bin/fleet:        %2s hits\n' "$bin_n"
+    printf -- '       lib/*.sh:         %2s hits\n' "$lib_n"
+    printf -- '       prompts/*.md:     %2s hits\n' "$prompts_n"
+    printf -- '       docs/backlog/*.md:%2s hits\n' "$backlog_n"
+    if [ "$tests_n" != "-" ] && [ "$tests_n" != "0" ]; then
+      printf -- '       tests/*.sh:       %2s hits\n' "$tests_n"
+    fi
+    printf -- '\n'
+  done
+}
+
+# Render the JSON array. Reads sorted TSV from stdin (same shape as
+# lessons_rank_render_text). Per LESSONS 2026-06-03 every string value
+# goes through `preflight_json_escape`; per LESSONS 2026-06-13 we call
+# it directly (no `*_json_escape` wrapper).
+lessons_rank_render_json() {
+  local first=1
+  local date headline total files bin_n lib_n prompts_n backlog_n tests_n rec
+  printf -- '['
+  while IFS=$'\t' read -r date headline total files bin_n lib_n prompts_n backlog_n tests_n rec; do
+    [ -z "$date" ] && continue
+    if [ "$first" = "1" ]; then
+      first=0
+    else
+      printf -- ','
+    fi
+    printf -- '{'
+    printf -- '"date":"%s",' "$(preflight_json_escape "$date")"
+    printf -- '"headline":"%s",' "$(preflight_json_escape "$headline")"
+    printf -- '"total_citations":%d,' "$total"
+    printf -- '"files_cited":%d,' "$files"
+    printf -- '"by_tree":{'
+    printf -- '"bin/fleet":%d,' "$bin_n"
+    printf -- '"lib":%d,' "$lib_n"
+    printf -- '"prompts":%d,' "$prompts_n"
+    printf -- '"docs/backlog":%d' "$backlog_n"
+    printf -- '},'
+    printf -- '"recommendation":"%s"' "$(preflight_json_escape "$rec")"
+    printf -- '}'
+  done
+  printf -- ']\n'
+}
+
+# Validate `--top N` / `--bottom N` arguments. $1 = flag-name (for the
+# error message), $2 = value. Echoes the validated positive integer on
+# stdout AND returns 0 on success. On refusal, prints the documented
+# message to stderr and returns 2 — callers MUST check the return code
+# rather than swallowing the exit inside `$( ... )` (command
+# substitution runs in a subshell and an `exit` there would NOT
+# terminate the parent). Per LESSONS 2026-06-01 the dispatcher path
+# that calls this turns the non-zero return into an explicit `exit 2`.
+lessons_rank_parse_topbottom() {  # $1 = flag-name (informational), $2 = value
+  # $1 (flag-name) reserved for future per-flag error tailoring; v1
+  # emits the same documented "requires a positive integer" message
+  # for both --top and --bottom per AC #8.
+  local _flag="${1:-}" val="${2:-}"
+  : "$_flag"
+  case "$val" in
+    ''|*[!0-9]*)
+      printf -- 'lessons-rank: --top/--bottom requires a positive integer\n' >&2
+      return 2 ;;
+  esac
+  if [ "$val" -le 0 ]; then
+    printf -- 'lessons-rank: --top/--bottom requires a positive integer\n' >&2
+    return 2
+  fi
+  printf -- '%d\n' "$val"
+  return 0
+}
+
+# Dispatcher. Per LESSONS 2026-06-01 every code path ends with explicit
+# `exit 0` or `exit 2` so the function cannot fall through to the
+# default `fleet status` block.
+lessons_rank() {
+  shift  # drop the leading "lessons-rank"
+  local want_json=0 include_tests=0
+  local top_n="" bottom_n=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<'USAGE'
+fleet lessons-rank — rank LESSONS by codebase-citation frequency.
+
+Usage:
+  fleet lessons-rank                       default ranked list on stdout
+  fleet lessons-rank --top N               show only the top N entries
+  fleet lessons-rank --bottom N            show only the bottom N entries
+  fleet lessons-rank --json                emit a structured JSON array
+  fleet lessons-rank --include-tests       also count tests/*.sh hits
+  fleet lessons-rank --help                this banner
+
+Counts, for every `## YYYY-MM-DD` heading in `docs/LESSONS.md`, how
+many times that date string appears in `bin/fleet`, `lib/*.sh`,
+`prompts/*.md`, and `docs/backlog/*.md` (and `tests/*.sh` under
+--include-tests). Prints `→ promote-candidate` next to entries cited
+≥10× across ≥5 files (ready to graduate to prompts/PRINCIPLES.md via
+0018), and `→ prune-candidate` next to entries cited ≤1× whose
+heading date is more than 30 days before today (ready to receive an
+`<!-- EXPIRES: -->` marker via 0039).
+
+Pure reader: no writes to LESSONS.md, no writes to PRINCIPLES.md, no
+events emitted, no `lib/` or `prompts/` edits, no new event types.
+USAGE
+        exit 0 ;;
+      --top)
+        if ! top_n="$(lessons_rank_parse_topbottom --top "${2:-}")"; then
+          exit 2
+        fi
+        shift 2 ;;
+      --bottom)
+        if ! bottom_n="$(lessons_rank_parse_topbottom --bottom "${2:-}")"; then
+          exit 2
+        fi
+        shift 2 ;;
+      --json)
+        want_json=1; shift ;;
+      --include-tests)
+        include_tests=1; shift ;;
+      --)
+        shift; break ;;
+      -*)
+        printf -- 'lessons-rank: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        printf -- 'lessons-rank: unexpected positional %s\n' "$1" >&2
+        exit 2 ;;
+    esac
+  done
+
+  local root; root="$(lessons_rank_kit_root)"
+  local lessons="$root/docs/LESSONS.md"
+  if [ ! -f "$lessons" ]; then
+    printf -- 'lessons-rank: no LESSONS entries found. add one via reviewer send-back (0022) or `fleet lessons-promote` (0028).\n'
+    exit 0
+  fi
+
+  # Extract headings into a tmp TSV (date, headline).
+  local headings_tsv; headings_tsv="$(mktemp -t fleet-lessons-rank.XXXXXX)"
+  lessons_rank_extract_headings "$lessons" > "$headings_tsv"
+  local entries; entries="$(awk 'BEGIN { count = 0 } NF { n++ } END { print n+0 }' "$headings_tsv")"
+  if [ "$entries" = "0" ]; then
+    rm -f "$headings_tsv"
+    printf -- 'lessons-rank: no LESSONS entries found. add one via reviewer send-back (0022) or `fleet lessons-promote` (0028).\n'
+    exit 0
+  fi
+
+  local today; today="$(lessons_rank_today)"
+  local cutoff; cutoff="$(lessons_rank_ymd_shift "$today" -30)"
+
+  # Build the citations index ONCE — one awk pass per file in the four
+  # (or five with --include-tests) trees. This is the single-pass
+  # replacement for the original per-date × per-file loop and brings
+  # the test-suite runtime under the 10s budget (LESSONS 2026-06-15:
+  # do not call per-day shellouts inside per-slug loops; lesson date
+  # IS the per-day axis here).
+  local citations_idx; citations_idx="$(mktemp -t fleet-lessons-rank-idx.XXXXXX)"
+  lessons_rank_enumerate_trees "$root" "$include_tests" \
+    | lessons_rank_build_citations_index > "$citations_idx"
+
+  # Aggregate ALL per-date counts in ONE awk pass over the citations
+  # index, joined with the headings TSV. Per LESSONS 2026-06-15 this
+  # collapses the per-date × per-tree shellout loop into a single awk
+  # invocation. The classification (`promote|prune|keep`) is computed
+  # inline to avoid a second per-date shellout to lessons_rank_classify.
+  local rows_tsv; rows_tsv="$(mktemp -t fleet-lessons-rank-rows.XXXXXX)"
+  LC_ALL=C awk -F '\t' -v cutoff="$cutoff" \
+      -v headings_file="$headings_tsv" '
+    BEGIN {
+      count = 0
+      # Load the headings TSV (date \t headline) and remember the
+      # original order so we can preserve "every heading emits one row"
+      # even when the citations index has zero matches for a date.
+      while ((getline hl < headings_file) > 0) {
+        if (hl == "") continue
+        i = index(hl, "\t")
+        if (i == 0) continue
+        d = substr(hl, 1, i-1)
+        h = substr(hl, i+1)
+        headings[d] = h
+        order[++count] = d
+        bin_n[d]=0; lib_n[d]=0; prompts_n[d]=0
+        backlog_n[d]=0; tests_n[d]=0
+        files_seen[d] = ""
+        files_cited[d] = 0
+      }
+      close(headings_file)
+    }
+    # Citations index rows: date \t tree \t file
+    {
+      d = $1; tree = $2; file = $3
+      if (!(d in headings)) next
+      if      (tree == "bin")     bin_n[d]++
+      else if (tree == "lib")     lib_n[d]++
+      else if (tree == "prompts") prompts_n[d]++
+      else if (tree == "backlog") backlog_n[d]++
+      else if (tree == "tests")   tests_n[d]++
+      key = tree "\t" file
+      seen_key = d "\t" key
+      if (!(seen[seen_key])) {
+        seen[seen_key] = 1
+        files_cited[d]++
+      }
+    }
+    END {
+      for (i = 1; i <= count; i++) {
+        d = order[i]
+        h = headings[d]
+        bn = bin_n[d]; ln = lib_n[d]; pn = prompts_n[d]
+        gn = backlog_n[d]; tn = tests_n[d]
+        total = bn + ln + pn + gn + tn
+        fc = files_cited[d]
+        rec = "keep"
+        if (total >= 10 && fc >= 5) rec = "promote"
+        else if (total <= 1 && d < cutoff) rec = "prune"
+        printf("%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n",
+               d, h, total, fc, bn, ln, pn, gn, tn, rec)
+      }
+    }
+  ' "$citations_idx" > "$rows_tsv"
+
+  # Sort the full table.
+  local sorted_tsv; sorted_tsv="$(mktemp -t fleet-lessons-rank-sorted.XXXXXX)"
+  lessons_rank_sort < "$rows_tsv" > "$sorted_tsv"
+
+  # Apply --top / --bottom slice.
+  local slice_tsv; slice_tsv="$(mktemp -t fleet-lessons-rank-slice.XXXXXX)"
+  local slice_label="all entries"
+  if [ -n "$top_n" ]; then
+    head -n "$top_n" "$sorted_tsv" > "$slice_tsv"
+    slice_label="top $top_n"
+  elif [ -n "$bottom_n" ]; then
+    tail -n "$bottom_n" "$sorted_tsv" > "$slice_tsv"
+    slice_label="bottom $bottom_n"
+  else
+    cp "$sorted_tsv" "$slice_tsv"
+  fi
+
+  if [ "$want_json" = "1" ]; then
+    lessons_rank_render_json < "$slice_tsv"
+  else
+    lessons_rank_render_text "$today" "$entries" "$slice_label" < "$slice_tsv"
+  fi
+
+  rm -f "$headings_tsv" "$rows_tsv" "$sorted_tsv" "$slice_tsv" "$citations_idx"
+  exit 0
+}
+
+if [ "$CMD" = "lessons-rank" ]; then
+  lessons_rank "$@"
 fi
 
 # --- lessons-prune --------------------------------------------------------

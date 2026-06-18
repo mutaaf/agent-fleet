@@ -1,0 +1,65 @@
+#!/bin/bash
+# Fixture bin/fleet for tests/lessons-rank.sh (ticket 0057).
+#
+# Each LESSONS date appears (as a matching LINE) the exact number of
+# times the test expects. `grep -c -F` counts MATCHING LINES, not
+# occurrences, so we keep one date per line. Comments that DESCRIBE
+# the count are intentionally written without the date to avoid
+# inflating the hit count via the description itself.
+#
+# --- entry A: 14 matching lines (expected total: 14) ---
+# LESSONS 2026-04-15 cite 1
+# LESSONS 2026-04-15 cite 2
+# LESSONS 2026-04-15 cite 3
+# LESSONS 2026-04-15 cite 4
+# LESSONS 2026-04-15 cite 5
+# LESSONS 2026-04-15 cite 6
+# LESSONS 2026-04-15 cite 7
+# LESSONS 2026-04-15 cite 8
+# LESSONS 2026-04-15 cite 9
+# LESSONS 2026-04-15 cite 10
+# LESSONS 2026-04-15 cite 11
+# LESSONS 2026-04-15 cite 12
+# LESSONS 2026-04-15 cite 13
+# LESSONS 2026-04-15 cite 14
+#
+# --- entry B: 7 matching lines (expected total: 7) ---
+# LESSONS 2026-04-20 cite 1
+# LESSONS 2026-04-20 cite 2
+# LESSONS 2026-04-20 cite 3
+# LESSONS 2026-04-20 cite 4
+# LESSONS 2026-04-20 cite 5
+# LESSONS 2026-04-20 cite 6
+# LESSONS 2026-04-20 cite 7
+#
+# --- entry C: 7 matching lines (expected total: 7) ---
+# LESSONS 2026-05-01 cite 1
+# LESSONS 2026-05-01 cite 2
+# LESSONS 2026-05-01 cite 3
+# LESSONS 2026-05-01 cite 4
+# LESSONS 2026-05-01 cite 5
+# LESSONS 2026-05-01 cite 6
+# LESSONS 2026-05-01 cite 7
+#
+# --- entry D: 5 matching lines (expected total: 5) ---
+# LESSONS 2026-05-03 cite 1
+# LESSONS 2026-05-03 cite 2
+# LESSONS 2026-05-03 cite 3
+# LESSONS 2026-05-03 cite 4
+# LESSONS 2026-05-03 cite 5
+#
+# --- entry E: 6 matching lines (expected total: 6) ---
+# LESSONS 2026-05-05 cite 1
+# LESSONS 2026-05-05 cite 2
+# LESSONS 2026-05-05 cite 3
+# LESSONS 2026-05-05 cite 4
+# LESSONS 2026-05-05 cite 5
+# LESSONS 2026-05-05 cite 6
+#
+# --- entry F: 2 matching lines (expected total: 2) ---
+# LESSONS 2026-05-15 cite 1
+# LESSONS 2026-05-15 cite 2
+#
+# --- entry G: 1 matching line (expected total: 1) ---
+# LESSONS 2026-05-12 cite 1
+exit 0
