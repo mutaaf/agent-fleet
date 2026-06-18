@@ -1,7 +1,7 @@
 ---
 id: 0057
 title: fleet lessons-rank surfaces the most-cited LESSONS entries to feed promote / prune decisions
-status: groomed
+status: in-progress
 priority: P2
 area: governance
 created: 2026-06-17
@@ -629,3 +629,38 @@ Files / patterns the dev should touch.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+### 2026-06-17 — in-progress
+
+Branch `feat/0057-fleet-lessons-rank-citation-frequency` opened off
+main. Status flipped from `groomed` to `in-progress`. README index row
+0057 updated to match. About to write `tests/lessons-rank.sh` with the
+13 acceptance-criteria scenarios, then add the seven `lessons_rank_*`
+helpers + dispatcher + help banner line + README "Daily ops" line.
+
+### 2026-06-17 — implementation
+
+Test-first: `tests/lessons-rank.sh` written with 13 assertion blocks,
+one per AC checkbox. Failing-first confirmed (the default invocation
+fell through to `fleet status` because no dispatcher existed yet).
+
+Implementation: 11 helpers (the 7 required + 4 scaffolding) inserted
+into `bin/fleet` immediately after the `lessons-promote` dispatcher
+and before the `lessons-prune` section. The hot path uses a single-pass
+awk aggregator over a pre-built citations index (one awk invocation
+per file in the four trees, not per-date × per-file) so the test
+suite stays under the 10s budget — first cut at N_dates × N_files
+greps ran 35s; the single-pass refactor brought it to 7.7s.
+
+Date math is pure-awk Julian-day in `lessons_rank_ymd_shift`, so the
+LESSONS 2026-06-11 `date -j -f` trap is structurally impossible.
+
+Help banner line and README "Daily ops" line both added in the
+single-edit shape per LESSONS 2026-05-25. Zero changes to
+`lib/common.sh`, `prompts/`, or `docs/LESSONS.md`.
+
+Local gate green: `shellcheck -S warning lib/*.sh bin/fleet`,
+`bash -n lib/*.sh bin/fleet`, `node scripts/check-backlog.mjs`,
+`FLEET_SELF_CHECK_GATE=1 bin/fleet self-check` (3 pre-existing
+hits, zero new). `bash tests/lessons-rank.sh` reports all 13 ACs
+PASSED.
