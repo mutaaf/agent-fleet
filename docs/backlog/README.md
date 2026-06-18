@@ -75,5 +75,5 @@ ones, `review` grades them.
 | 0054 | fleet maturity <slug> scores how far one project has walked the post-install activation funnel | P2 | shipped | observability |
 | 0055 | fleet pulse prints a one-line daily heartbeat suitable for a shell prompt or terminal banner | P1 | shipped | observability |
 | 0056 | fleet share <pr> composes a one-line shareable testimonial about a single merged PR | P1 | shipped | observability |
-| 0057 | fleet lessons-rank surfaces the most-cited LESSONS entries to feed promote / prune decisions | P2 | in-progress | governance |
+| 0057 | fleet lessons-rank surfaces the most-cited LESSONS entries to feed promote / prune decisions | P2 | shipped | governance |
 | 0058 | fleet trends <slug> renders 12-week sparkline-style trend lines for PRs / cost / send-backs | P1 | groomed | observability |
