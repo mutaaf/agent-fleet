@@ -1,7 +1,7 @@
 ---
 id: 0058
 title: fleet trends <slug> renders 12-week sparkline-style trend lines for PRs / cost / send-backs
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-17
