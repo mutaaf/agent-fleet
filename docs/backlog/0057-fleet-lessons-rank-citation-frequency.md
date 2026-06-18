@@ -1,7 +1,7 @@
 ---
 id: 0057
 title: fleet lessons-rank surfaces the most-cited LESSONS entries to feed promote / prune decisions
-status: in-progress
+status: shipped
 priority: P2
 area: governance
 created: 2026-06-17
@@ -664,3 +664,9 @@ Local gate green: `shellcheck -S warning lib/*.sh bin/fleet`,
 `FLEET_SELF_CHECK_GATE=1 bin/fleet self-check` (3 pre-existing
 hits, zero new). `bash tests/lessons-rank.sh` reports all 13 ACs
 PASSED.
+
+### 2026-06-17 — shipped
+
+PR #120 merged on `main` with both gating checks (`shellcheck`,
+`validate`) green. Status flipped to `shipped` here and in the
+README index row.
