@@ -1,7 +1,7 @@
 ---
 id: 0061
 title: fleet invoice <slug> emits a monthly billing-style ROI receipt suitable for forwarding to a CFO or future-self
-status: groomed
+status: in-progress
 priority: P1
 area: governance
 created: 2026-06-19
@@ -597,3 +597,5 @@ Files / patterns the dev should touch.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+- 2026-06-19 [implementation-dev] picked up ticket on `feat/0061-fleet-invoice-monthly-roi-receipt`. Plan: ~340 lines of `invoice_*` helpers in `bin/fleet` (pure reader of events.jsonl + runs.jsonl), 5 fixture slug subdirs under `tests/fixtures/invoice/`, `tests/invoice.sh` covering 14 ACs, +1 help-banner line + 1 README "Daily ops" line + 1 README paragraph documenting `MANUAL_PR_MINUTES` and `CONTRACTOR_USD_PER_HOUR` knobs. All helpers placed above the dispatcher per LESSONS 2026-06-05; awk-internal Julian-day month-bucket math per LESSONS 2026-06-15 (no per-day `date -j -v` shellout); `preflight_json_escape` called directly per LESSONS 2026-06-13; redact pass uses the cursor-walk pattern per LESSONS 2026-06-15. `invoice()` end-state is `exit 0`/`exit 2` on every code path per LESSONS 2026-06-01. NO `lib/common.sh` or `prompts/` changes.
