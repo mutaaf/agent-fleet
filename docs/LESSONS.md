@@ -534,3 +534,39 @@ becomes O(window × N_slugs) the moment a caller wraps it in a
 fleet-wide loop. Quick audit: grep for `date -u -j -v` inside
 awk `cmd | getline` blocks AND for `while … read … do; "$FLEET"
 streak "$slug" --json` shapes in any new `--all` helper.
+
+## 2026-06-19 — a `local` variable inside a new subcommand whose name matches ANOTHER subcommand's function (e.g. `rank`, `streak`, `stuck`) trips `fleet self-check`'s `dispatcher-forward-reference` pattern as a false positive
+
+While shipping ticket 0060's `flaky()`, the renderer loop used
+`local rendered_rows="" rank=0; … rank=$(( rank + 1 ))` to compose the
+"rank N <check>" table rows. `fleet self-check`'s
+`self_check_ax_dispatcher_forward_reference` walks every function body
+and, for each lowercase identifier at line start, looks up whether a
+function by that name is defined LATER in the file AND whether the
+ENCLOSING function is reached via an inline `if [ "$CMD" = "<sub>" ]; then`
+dispatcher block (the forward-reference trap from LESSONS 2026-06-05).
+`rank()` IS such a subcommand function (defined at line ~19220) and
+`flaky()` IS reached via an inline dispatcher, so the local variable
+assignment `rank=...` (NOT a function call) was flagged at line 16480
+and the gate composition `… && bin/fleet self-check` jumped from the
+on-main baseline of 3 hits to 4. Symptom: an otherwise-clean PR's gate
+step fails one over the baseline with no actual runtime trap — the
+local var shadows nothing at runtime because bash distinguishes
+variable assignments from command invocations syntactically.
+Fix: rename the local variable to something the self-check
+heuristic cannot mistake for a function call. We used `row_rank`. The
+same trap will fire for any new subcommand that uses a local named
+`rank`, `streak`, `stuck`, `digest`, `weekly`, `recap`, `incident`,
+`diff`, `morning`, `inbox`, `replay`, `tour`, `add`, `flaky`, etc. —
+the catalog of subcommand names is the kit's own `^[a-z_]+\(\)`
+definition set. Cheap defensive habit when adding a new subcommand:
+audit every `local <name>` inside the body against
+`grep -E '^[a-z_][a-z_0-9]*\(\) \{' bin/fleet` and rename any
+collision to `<prefix>_<name>` (e.g. `row_rank`, `cur_streak`,
+`my_diff`). Distinct from LESSONS 2026-05-26 (`tail()` shadows
+`/usr/bin/tail` at runtime — a real subprocess-resolution trap)
+because this is a self-check FALSE POSITIVE; the runtime behavior is
+correct. The self-check pattern could be tightened to require the
+matched token to appear as a command invocation (no `=` or `+=`
+operator immediately after), but until that lands, the rename is the
+one-line fix.
