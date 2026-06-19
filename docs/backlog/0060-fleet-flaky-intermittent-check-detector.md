@@ -1,7 +1,7 @@
 ---
 id: 0060
 title: fleet flaky surfaces CI checks that have failed-then-passed without a code change so the kit stops mis-attributing infra noise to ticket regressions
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-19
@@ -512,4 +512,14 @@ Files / patterns the dev should touch.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-19 — implementation-dev: started on `feat/0060-fleet-flaky`. Plan
+  follows the engineering notes verbatim: eight `flaky_*` helpers defined
+  ABOVE the dispatcher (LESSONS 2026-06-05); `gh` calls batched ONE list
+  per slug + ONE view per candidate run (LESSONS 2026-06-15);
+  per-(headSha, workflowName, checkName) groups detect fail→pass on same
+  SHA (flake) vs fail→pass after newer SHA (regression); JSON escape via
+  `preflight_json_escape` called directly (LESSONS 2026-06-03, no
+  wrapper per 2026-06-13); window math uses `date +%s - N*86400`, no
+  `date -j -f` (LESSONS 2026-06-11); all five fixture slug subdirs
+  (`flake-covered`, `flake-uncovered`, `regression`, `healthy`,
+  `gh-fails`) live under `tests/fixtures/flaky/`.
