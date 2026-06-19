@@ -1,7 +1,7 @@
 ---
 id: 0059
 title: fleet stuck flags every PR sitting on a non-actionable cause so the operator unblocks it in one glance
-status: groomed
+status: in-progress
 priority: P1
 area: observability
 created: 2026-06-19
@@ -424,3 +424,12 @@ Files / patterns the dev should touch.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+- 2026-06-19 — `feat/0059-fleet-stuck-pr-detector` opened. Tests-first plan:
+  one assertion block per AC in `tests/stuck.sh`, six slug subdirs under
+  `tests/fixtures/stuck/` (`behind`, `draft-armed`, `account-suspended`,
+  `flake-loop`, `healthy`, `gh-fails`). Implementation lives entirely in
+  `bin/fleet` next to `overview()`; reuses the same `_seen` discovery
+  pattern. JSON via `preflight_json_escape` direct (no `*_json_escape`
+  wrapper per LESSONS 2026-06-13). `gh` calls batched: one `pr list` per
+  slug + one `pr view` per candidate PR.
