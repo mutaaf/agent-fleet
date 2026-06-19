@@ -79,5 +79,5 @@ ones, `review` grades them.
 | 0058 | fleet trends <slug> renders 12-week sparkline-style trend lines for PRs / cost / send-backs | P1 | shipped | observability |
 | 0059 | fleet stuck flags every PR sitting on a non-actionable cause so the operator unblocks it in one glance | P1 | shipped | observability |
 | 0060 | fleet flaky surfaces CI checks that have failed-then-passed without a code change so the kit stops mis-attributing infra noise to ticket regressions | P1 | shipped | observability |
-| 0061 | fleet invoice <slug> emits a monthly billing-style ROI receipt suitable for forwarding to a CFO or future-self | P1 | groomed | governance |
+| 0061 | fleet invoice <slug> emits a monthly billing-style ROI receipt suitable for forwarding to a CFO or future-self | P1 | shipped | governance |
 | 0062 | fleet why <slug> composes the one-paragraph argument for keeping the kit installed against the slug's own telemetry | P2 | groomed | docs |

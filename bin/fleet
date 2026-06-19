@@ -106,6 +106,10 @@
 #                             (ticket 0060 — pure reader of events.jsonl + gh; --since 1d..90d default 30d /
 #                              --slug NAME / --json; classifies flake vs regression per (headSha,workflow,check);
 #                              cross-references lib/heal-catalog.sh to suggest new catalog entries)
+#   fleet invoice <slug>      monthly ROI receipt vs Cursor and contractor alternatives
+#                             (ticket 0061 — pure reader of events.jsonl + runs.jsonl; --all / --month YYYY-MM /
+#                              --ytd / --redact / --json; verdict net_positive | break_even | net_negative;
+#                              MANUAL_PR_MINUTES + CONTRACTOR_USD_PER_HOUR manifest knobs with defaults)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -4623,6 +4627,919 @@ USAGE
 
 if [ "$CMD" = "weekly" ]; then
   weekly "$@"
+fi
+
+# --- invoice (ticket 0061) ----------------------------------------------
+# `fleet invoice <slug | --all>` composes a monthly billing-style ROI
+# receipt for one project (or the fleet) so the operator has a single
+# printable artifact answering "is this still worth it?" Pure consumer
+# of events.jsonl + runs.jsonl — emits NO new event types (P-6).
+#
+# Bucket math is pure awk arithmetic (LESSONS 2026-06-15): given an
+# event's epoch, the month bucket is computed via awk's Julian-day
+# conversion, NOT a per-day `date -j -v` shellout. The default month
+# is the LAST CALENDAR MONTH relative to FLEET_NOW_OVERRIDE (or `date
+# -u +%s` when unset). The month-to-epoch path appends `T00:00:00` per
+# LESSONS 2026-06-11 (BSD `date -j -f` fills missing time fields).
+#
+# Naming clash check (LESSONS 2026-05-26): `invoice` is not a
+# coreutils binary on macOS or Linux; no `_cmd` suffix needed.
+#
+# ALL helpers below are defined ABOVE the dispatcher block (LESSONS
+# 2026-06-05 forward-reference trap) so the inline `if [ "$CMD" =
+# "invoice" ]` dispatch at the bottom of this section can call them.
+#
+# Self-check audit (LESSONS 2026-06-19): every `local <name>` inside
+# helpers / `invoice()` body must NOT shadow another subcommand
+# function name (rank, streak, stuck, digest, weekly, recap, etc.).
+# We use `cur_*` / `prev_*` / `row_*` / `tot_*` prefixes.
+#
+# JSON escaping calls `preflight_json_escape` DIRECTLY (LESSONS
+# 2026-06-13) — no `invoice_json_escape` wrapper. The dispatcher fall-
+# through trap (LESSONS 2026-06-01) is defused by ending every code
+# path in `invoice()` with `exit 0` or `exit 2`.
+
+# invoice_discover_slugs — emit one slug per line, alphabetically sorted.
+# Wraps the same union pattern as trends_discover / overview_discover.
+# Manifest reads happen INSIDE a subshell (LESSONS 2026-06-05 export-
+# in-subshell trap) so caller env stays clean.
+invoice_discover_slugs() {
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  local _seen="" m slug
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( ( source "$m" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf -- '%s\n' "$slug"
+  done | LC_ALL=C sort
+}
+
+# invoice_cache_dir — echo the per-slug cache root.
+invoice_cache_dir() {  # $1 = slug
+  printf -- '%s' "$HOME/.cache/$1-agent"
+}
+
+# invoice_resolve_manifest — echo the manifest path for a slug, empty
+# when not found.
+invoice_resolve_manifest() {  # $1 = slug
+  local want="$1"
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  local m slug
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( ( source "$m" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )
+    if [ "$slug" = "$want" ]; then
+      printf -- '%s' "$m"
+      return 0
+    fi
+  done
+}
+
+# invoice_read_manifest_knobs — read MANUAL_PR_MINUTES and
+# CONTRACTOR_USD_PER_HOUR from a slug's manifest. Echoes a TSV record:
+# `<manual_minutes>\t<contractor_rate>`. Defaults: 75 / 80. Per
+# LESSONS 2026-06-05 (export-in-subshell trap) the source happens in
+# `( … )` so the export does NOT leak to the caller.
+invoice_read_manifest_knobs() {  # $1 = slug
+  local manifest m_val r_val
+  manifest="$(invoice_resolve_manifest "$1")"
+  if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
+    printf -- '75\t80\n'
+    return 0
+  fi
+  # shellcheck disable=SC1090
+  m_val="$( ( source "$manifest" 2>/dev/null; printf -- '%s' "${MANUAL_PR_MINUTES:-}" ) )"
+  # shellcheck disable=SC1090
+  r_val="$( ( source "$manifest" 2>/dev/null; printf -- '%s' "${CONTRACTOR_USD_PER_HOUR:-}" ) )"
+  case "$m_val" in ''|*[!0-9]*) m_val=75 ;; esac
+  case "$r_val" in ''|*[!0-9]*) r_val=80 ;; esac
+  printf -- '%s\t%s\n' "$m_val" "$r_val"
+}
+
+# invoice_parse_month — validate a YYYY-MM string and emit
+# `<start_epoch>\t<end_epoch>\t<label>` for that month. Refuses
+# malformed input (exit 1). Per LESSONS 2026-06-11 the month-to-
+# epoch conversion uses the FULL format `'%Y-%m-%dT%H:%M:%S'` with
+# `T00:00:00` appended. End epoch is the LAST DAY of the month at
+# 23:59:59 UTC.
+invoice_parse_month() {  # $1 = YYYY-MM
+  local raw="$1"
+  # Strict YYYY-MM shape check.
+  case "$raw" in
+    [12][0-9][0-9][0-9]-[0-9][0-9]) : ;;
+    *) return 1 ;;
+  esac
+  local yy mm
+  yy="${raw%-*}"
+  mm="${raw#*-}"
+  # Range check on month.
+  case "$mm" in
+    01|02|03|04|05|06|07|08|09|10|11|12) : ;;
+    *) return 1 ;;
+  esac
+  local start_iso start_ep
+  start_iso="${raw}-01T00:00:00"
+  start_ep="$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "$start_iso" '+%s' 2>/dev/null \
+              || date -u -d "${start_iso}Z" '+%s' 2>/dev/null \
+              || echo "")"
+  [ -z "$start_ep" ] && return 1
+  # Compute the first day of NEXT month, then subtract 1 to land on
+  # the last second of THIS month. Pure awk arithmetic — no per-day
+  # shellout, per LESSONS 2026-06-15.
+  local next_yy next_mm
+  next_yy="$yy"
+  next_mm="$((10#$mm + 1))"
+  if [ "$next_mm" -gt 12 ]; then
+    next_mm=1
+    next_yy=$((yy + 1))
+  fi
+  local next_iso next_ep end_ep
+  next_iso="$(printf '%04d-%02d-01T00:00:00' "$next_yy" "$next_mm")"
+  next_ep="$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "$next_iso" '+%s' 2>/dev/null \
+             || date -u -d "${next_iso}Z" '+%s' 2>/dev/null \
+             || echo "")"
+  [ -z "$next_ep" ] && return 1
+  end_ep=$((next_ep - 1))
+  # Friendly label "Month YYYY".
+  local label
+  case "$mm" in
+    01) label="January $yy" ;;
+    02) label="February $yy" ;;
+    03) label="March $yy" ;;
+    04) label="April $yy" ;;
+    05) label="May $yy" ;;
+    06) label="June $yy" ;;
+    07) label="July $yy" ;;
+    08) label="August $yy" ;;
+    09) label="September $yy" ;;
+    10) label="October $yy" ;;
+    11) label="November $yy" ;;
+    12) label="December $yy" ;;
+  esac
+  printf -- '%s\t%s\t%s\n' "$start_ep" "$end_ep" "$label"
+}
+
+# invoice_default_month — given a NOW epoch, echo the YYYY-MM of the
+# LAST CALENDAR MONTH (NOT this month). Pure shell + one `date -r`
+# call.
+invoice_default_month() {  # $1 = now_epoch
+  local now="$1"
+  local cur_ym cur_yy cur_mm prev_yy prev_mm
+  cur_ym="$(date -u -r "$now" '+%Y-%m' 2>/dev/null \
+            || date -u -d "@$now" '+%Y-%m' 2>/dev/null)"
+  cur_yy="${cur_ym%-*}"
+  cur_mm="${cur_ym#*-}"
+  prev_yy="$cur_yy"
+  prev_mm="$((10#$cur_mm - 1))"
+  if [ "$prev_mm" -lt 1 ]; then
+    prev_mm=12
+    prev_yy=$((cur_yy - 1))
+  fi
+  printf -- '%04d-%02d' "$prev_yy" "$prev_mm"
+}
+
+# invoice_prev_month — given a YYYY-MM, echo the YYYY-MM of the month
+# IMMEDIATELY before it.
+invoice_prev_month() {  # $1 = YYYY-MM
+  local raw="$1" yy mm prev_yy prev_mm
+  yy="${raw%-*}"
+  mm="${raw#*-}"
+  prev_yy="$yy"
+  prev_mm="$((10#$mm - 1))"
+  if [ "$prev_mm" -lt 1 ]; then
+    prev_mm=12
+    prev_yy=$((yy - 1))
+  fi
+  printf -- '%04d-%02d' "$prev_yy" "$prev_mm"
+}
+
+# invoice_walk_events — ONE awk pass per slug over events.jsonl. Given
+# the current-month + prior-month [start, end] epoch boundaries, bins
+# every pr_footer_posted / gate_failed / lesson_draft_emitted /
+# run_completed event into either the CUR bucket or the PREV bucket
+# via pure-awk Julian-day arithmetic (LESSONS 2026-06-15). Emits two
+# TSV rows: `cur\t<prs>\t<heals>\t<sendbacks>\t<runtime_ms>` and
+# `prev\t<prs>\t<heals>\t<sendbacks>\t<runtime_ms>`. Per LESSONS
+# 2026-06-08 the BEGIN block declares all counters = 0.
+invoice_walk_events() {  # $1=events $2=cur_start $3=cur_end $4=prev_start $5=prev_end
+  local events="$1" cs="$2" ce="$3" ps="$4" pe="$5"
+  if [ ! -f "$events" ]; then
+    printf -- 'cur\t0\t0\t0\t0\nprev\t0\t0\t0\t0\n'
+    return 0
+  fi
+  awk -v cs="$cs" -v ce="$ce" -v ps="$ps" -v pe="$pe" '
+    BEGIN {
+      count = 0
+      cur_prs = 0; cur_heals = 0; cur_sb = 0; cur_rt = 0
+      prev_prs = 0; prev_heals = 0; prev_sb = 0; prev_rt = 0
+    }
+    function iso2ep(ts,   y, mo, d, h, mi, s, a, y2, m2, jdn) {
+      sub(/\.[0-9]+Z$/, "Z", ts)
+      sub(/Z$/, "", ts)
+      if (length(ts) < 19) return 0
+      y  = substr(ts, 1, 4) + 0
+      mo = substr(ts, 6, 2) + 0
+      d  = substr(ts, 9, 2) + 0
+      h  = substr(ts, 12, 2) + 0
+      mi = substr(ts, 15, 2) + 0
+      s  = substr(ts, 18, 2) + 0
+      if (y < 1970) return 0
+      a = int((14 - mo) / 12)
+      y2 = y + 4800 - a
+      m2 = mo + 12 * a - 3
+      jdn = d + int((153 * m2 + 2) / 5) + 365 * y2 + \
+            int(y2 / 4) - int(y2 / 100) + int(y2 / 400) - 32045
+      return (jdn - 2440588) * 86400 + h * 3600 + mi * 60 + s
+    }
+    {
+      ts = ""; type = ""; dur = 0
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts)
+        sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type = substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type)
+        sub(/".*/, "", type)
+      }
+      if (match($0, /"duration_ms"[[:space:]]*:[[:space:]]*"?[0-9]+"?/)) {
+        ds = substr($0, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*"?/, "", ds)
+        sub(/"?$/, "", ds)
+        dur = ds + 0
+      }
+      if (ts == "" || type == "") next
+      ep = iso2ep(ts)
+      if (ep <= 0) next
+      bucket = ""
+      if (ep >= cs && ep <= ce) bucket = "cur"
+      else if (ep >= ps && ep <= pe) bucket = "prev"
+      else next
+      if (bucket == "cur") {
+        if      (type == "pr_footer_posted")    { cur_prs++; count++ }
+        else if (type == "gate_failed")         { cur_heals++ }
+        else if (type == "lesson_draft_emitted") { cur_sb++ }
+        else if (type == "run_completed")       { cur_rt += dur }
+      } else {
+        if      (type == "pr_footer_posted")    { prev_prs++ }
+        else if (type == "gate_failed")         { prev_heals++ }
+        else if (type == "lesson_draft_emitted") { prev_sb++ }
+        else if (type == "run_completed")       { prev_rt += dur }
+      }
+    }
+    END {
+      printf("cur\t%d\t%d\t%d\t%d\n",  cur_prs + 0, cur_heals + 0, cur_sb + 0, cur_rt + 0)
+      printf("prev\t%d\t%d\t%d\t%d\n", prev_prs + 0, prev_heals + 0, prev_sb + 0, prev_rt + 0)
+    }
+  ' "$events"
+}
+
+# invoice_walk_costs — ONE awk pass per slug over runs.jsonl, same
+# bucket math as invoice_walk_events. Emits two TSV rows:
+# `cur\t<cost_sum>` and `prev\t<cost_sum>`. Per LESSONS 2026-06-08
+# BEGIN block declares accumulators = 0. Per LESSONS 2026-06-15 no
+# per-day date shellout.
+invoice_walk_costs() {  # $1=runs $2=cur_start $3=cur_end $4=prev_start $5=prev_end
+  local runs="$1" cs="$2" ce="$3" ps="$4" pe="$5"
+  if [ ! -f "$runs" ]; then
+    printf -- 'cur\t0\nprev\t0\n'
+    return 0
+  fi
+  awk -v cs="$cs" -v ce="$ce" -v ps="$ps" -v pe="$pe" '
+    BEGIN {
+      count = 0
+      cur_sum = 0; prev_sum = 0
+    }
+    function iso2ep(ts,   y, mo, d, h, mi, s, a, y2, m2, jdn) {
+      sub(/\.[0-9]+Z$/, "Z", ts)
+      sub(/Z$/, "", ts)
+      if (length(ts) < 19) return 0
+      y  = substr(ts, 1, 4) + 0
+      mo = substr(ts, 6, 2) + 0
+      d  = substr(ts, 9, 2) + 0
+      h  = substr(ts, 12, 2) + 0
+      mi = substr(ts, 15, 2) + 0
+      s  = substr(ts, 18, 2) + 0
+      if (y < 1970) return 0
+      a = int((14 - mo) / 12)
+      y2 = y + 4800 - a
+      m2 = mo + 12 * a - 3
+      jdn = d + int((153 * m2 + 2) / 5) + 365 * y2 + \
+            int(y2 / 4) - int(y2 / 100) + int(y2 / 400) - 32045
+      return (jdn - 2440588) * 86400 + h * 3600 + mi * 60 + s
+    }
+    {
+      ts = ""; c = 0
+      if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts = substr($0, RSTART, RLENGTH)
+        sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts)
+        sub(/".*/, "", ts)
+      }
+      if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        cs2 = substr($0, RSTART, RLENGTH)
+        sub(/.*:[[:space:]]*/, "", cs2)
+        c = cs2 + 0
+      }
+      if (ts == "") next
+      ep = iso2ep(ts)
+      if (ep <= 0) next
+      if (ep >= cs && ep <= ce)      { cur_sum += c; count++ }
+      else if (ep >= ps && ep <= pe) { prev_sum += c }
+    }
+    END {
+      printf("cur\t%.4f\n",  cur_sum + 0)
+      printf("prev\t%.4f\n", prev_sum + 0)
+    }
+  ' "$runs"
+}
+
+# invoice_compute_verdict — pure-shell classifier. Given the kit's
+# spend and the two alternatives, echoes one of `net_positive |
+# break_even | net_negative`. Thresholds per AC#7:
+#   kit ≤ 0.9 × min(alt) → net_positive
+#   ±10% of min(alt)     → break_even
+#   kit > 1.1 × min(alt) → net_negative
+invoice_compute_verdict() {  # $1=kit_cost $2=cursor_alt $3=contractor_alt
+  local kc="$1" cur_alt="$2" con_alt="$3"
+  awk -v kc="$kc" -v cur_alt="$cur_alt" -v con_alt="$con_alt" '
+    BEGIN {
+      k = kc + 0
+      a = cur_alt + 0
+      b = con_alt + 0
+      m = (a < b) ? a : b
+      if (m <= 0) {
+        # All alternatives free → kit cost is strictly worse unless it
+        # is also zero. Defensive: treat as net_negative when kit > 0,
+        # break_even when both 0.
+        if (k <= 0) { print "break_even"; exit }
+        print "net_negative"; exit
+      }
+      if (k <= m * 0.9) { print "net_positive"; exit }
+      if (k >= m * 1.1) { print "net_negative"; exit }
+      print "break_even"
+    }
+  '
+}
+
+# invoice_pct_delta — given two numbers (cur, prev), echo a signed
+# integer percentage like `+27` / `-12` / `0`. Empty prev (or zero)
+# → empty (caller emits "—").
+invoice_pct_delta() {  # $1=cur $2=prev
+  awk -v c="$1" -v p="$2" '
+    BEGIN {
+      if (p + 0 == 0) { print ""; exit }
+      d = ((c + 0) - (p + 0)) / (p + 0) * 100
+      if (d >= 0) printf("+%d", d + 0.5)
+      else        printf("%d",  d - 0.5)
+    }
+  '
+}
+
+# invoice_fmt_money — format a decimal as "$X.XX" (handles negative
+# values by emitting a leading `-$`).
+invoice_fmt_money() {  # $1 = decimal
+  awk -v v="$1" '
+    BEGIN {
+      x = v + 0
+      if (x < 0) printf("-$%.2f", -x)
+      else       printf("$%.2f",  x)
+    }
+  '
+}
+
+# invoice_render_text — text formatter for one month + one slug.
+# Inputs come from the dispatcher's accumulators (no awk inside —
+# this is the leaf renderer).
+#
+# Per LESSONS 2026-05-28 every printf of a slug name goes through
+# `printf -- '%s'`. Per LESSONS 2026-06-19 the `local <name>` list
+# avoids subcommand names: we use `row_*` / `cur_*` / `prev_*` /
+# `tot_*` prefixes.
+invoice_render_text() {  # many positional args (see below)
+  local row_slug="$1" row_label="$2" row_prs="$3" row_heals="$4"
+  local row_sb="$5" row_runtime_ms="$6" row_claude="$7" row_hours="$8"
+  local row_cursor="$9" row_contractor="${10}"
+  local row_verdict="${11}" row_per_pr="${12}"
+  local prev_prs="${13}" prev_claude="${14}" prev_per_pr="${15}"
+  local row_net_cur row_net_con
+  row_net_cur="$(awk -v a="$row_cursor"     -v k="$row_claude" 'BEGIN { printf("%.2f", a - k) }')"
+  row_net_con="$(awk -v a="$row_contractor" -v k="$row_claude" 'BEGIN { printf("%.2f", a - k) }')"
+  local rt_h rt_m
+  rt_h=$(( row_runtime_ms / 3600000 ))
+  rt_m=$(( (row_runtime_ms / 60000) % 60 ))
+  local hours_fmt
+  hours_fmt="$(awk -v h="$row_hours" 'BEGIN { printf("%.1f", h + 0) }')"
+
+  printf -- 'agent-fleet — invoice for %s, %s\n\n' "$row_slug" "$row_label"
+  printf -- '  PRs merged                                  %4d\n' "$row_prs"
+  printf -- '  Heal cycles                                 %4d\n' "$row_heals"
+  printf -- '  Send-backs requiring rework                 %4d\n' "$row_sb"
+  printf -- '  Total runtime                            %2dh %02dm\n' "$rt_h" "$rt_m"
+  printf -- '\n'
+  printf -- '  Claude API spend                       %8s\n' "$(invoice_fmt_money "$row_claude")"
+  printf -- '  Estimated human-equiv hours displaced  %8sh\n' "$hours_fmt"
+  printf -- '  Cursor Pro alternative (1 seat)        %8s\n' "$(invoice_fmt_money "$row_cursor")"
+  printf -- '  Contractor alt (%sh @ rate)            %8s\n' "$hours_fmt" "$(invoice_fmt_money "$row_contractor")"
+  printf -- '\n'
+  printf -- '  NET vs Cursor Pro:                     %8s\n' "$(invoice_fmt_money "$row_net_cur")"
+  printf -- '  NET vs contractor:                     %8s\n' "$(invoice_fmt_money "$row_net_con")"
+  printf -- '  Cost per PR shipped:                   %8s\n' "$(invoice_fmt_money "$row_per_pr")"
+  printf -- '\n'
+  case "$row_verdict" in
+    net_positive)
+      printf -- '  verdict: net positive — kit beats the cheapest alternative\n' ;;
+    break_even)
+      printf -- '  verdict: break-even — kit cost is close to the alternative\n' ;;
+    net_negative)
+      printf -- '  verdict: net negative — investigate before next month\n' ;;
+  esac
+  # "this month vs last month" delta line.
+  local pct_prs pct_cost pct_per_pr
+  pct_prs="$(    invoice_pct_delta "$row_prs"    "$prev_prs")"
+  pct_cost="$(   invoice_pct_delta "$row_claude" "$prev_claude")"
+  pct_per_pr="$( invoice_pct_delta "$row_per_pr" "$prev_per_pr")"
+  if [ -z "$pct_prs" ] && [ -z "$pct_cost" ] && [ -z "$pct_per_pr" ]; then
+    printf -- '  this month vs last month:  (no prior month data)\n'
+  else
+    [ -z "$pct_prs" ]    && pct_prs="—"
+    [ -z "$pct_cost" ]   && pct_cost="—"
+    [ -z "$pct_per_pr" ] && pct_per_pr="—"
+    printf -- '  this month vs last month:    PRs %s%%   cost %s%%   $/PR %s%%\n' \
+      "$pct_prs" "$pct_cost" "$pct_per_pr"
+  fi
+}
+
+# invoice_render_json — JSON formatter for one slug + one month. JSON
+# escape via `preflight_json_escape` per LESSONS 2026-06-03 called
+# DIRECTLY per LESSONS 2026-06-13 (no `invoice_json_escape` wrapper).
+invoice_render_json() {  # many positional args
+  local row_slug="$1" row_month="$2" row_prs="$3" row_heals="$4"
+  local row_sb="$5" row_runtime_min="$6" row_claude="$7" row_hours="$8"
+  local row_cursor="$9" row_contractor="${10}"
+  local row_verdict="${11}" row_per_pr="${12}"
+  local prev_prs="${13}" prev_claude="${14}" prev_per_pr="${15}"
+  local esc_slug esc_month
+  esc_slug="$(preflight_json_escape "$row_slug")"
+  esc_month="$(preflight_json_escape "$row_month")"
+  local net_cur net_con
+  net_cur="$(awk -v a="$row_cursor"     -v k="$row_claude" 'BEGIN { printf("%.2f", a - k) }')"
+  net_con="$(awk -v a="$row_contractor" -v k="$row_claude" 'BEGIN { printf("%.2f", a - k) }')"
+  # Build prior_month object (empty {} when no prior data).
+  local prior_obj="{}"
+  if [ -n "$prev_prs" ] && [ "$prev_prs" != "0" ] || \
+     [ -n "$prev_claude" ] && [ "$(awk -v p="$prev_claude" 'BEGIN { print (p+0 > 0) ? 1 : 0 }')" = "1" ]; then
+    prior_obj="$(printf -- '{"prs_merged":%d,"claude_usd":%.2f,"cost_per_pr":%.2f}' \
+                  "${prev_prs:-0}" "${prev_claude:-0}" "${prev_per_pr:-0}")"
+  fi
+  printf -- '{"slug":"%s","month":"%s","prs_merged":%d,"heal_cycles":%d,"sendbacks":%d,"runtime_minutes":%.1f,"claude_usd":%.2f,"displaced_hours":%.2f,"cursor_alt_usd":%.2f,"contractor_alt_usd":%.2f,"net_vs_cursor":%.2f,"net_vs_contractor":%.2f,"cost_per_pr":%.4f,"verdict":"%s","prior_month":%s}\n' \
+    "$esc_slug" "$esc_month" "$row_prs" "$row_heals" "$row_sb" \
+    "$row_runtime_min" "$row_claude" "$row_hours" "$row_cursor" "$row_contractor" \
+    "$net_cur" "$net_con" "$row_per_pr" "$row_verdict" "$prior_obj"
+}
+
+# invoice_redact — apply pseudonyms and dollar-banding to a single
+# input stream. Self-contained (no portfolio_* dependency because
+# those helpers live further down the file and the dispatcher
+# forward-reference trap from LESSONS 2026-06-05 would bite). The
+# rewrite uses the CURSOR-based walk pattern from LESSONS 2026-06-15
+# so a band token containing a self-matching `$<digits>` substring
+# does not cause an infinite loop.
+invoice_redact() {  # stdin = text, stdout = redacted text
+  local slug_map_file
+  slug_map_file="$(mktemp -t fleet-invoice-redact-slugs.XXXXXX)"
+  # Allocate `project-a`, `project-b`, … pseudonyms to every
+  # discovered slug (sorted, deduped).
+  invoice_discover_slugs | LC_ALL=C sort -u | awk '
+    BEGIN { count = 0 }
+    NF {
+      tok = sprintf("project-%c", 97 + (count % 26))
+      printf("%s\t%s\n", $0, tok)
+      count++
+    }
+  ' > "$slug_map_file"
+  LC_ALL=C awk -v slug_map="$slug_map_file" '
+    BEGIN {
+      count = 0
+      while ((getline line < slug_map) > 0) {
+        n = index(line, "\t")
+        if (n > 0) {
+          key = substr(line, 1, n - 1)
+          val = substr(line, n + 1)
+          slugs[key] = val
+          slug_lens[count] = length(key)
+          slug_names[count] = key
+          count++
+        }
+      }
+      close(slug_map)
+      # Sort slug_names by descending length so longer slugs are
+      # replaced first (prevents a short prefix from eating a longer
+      # slug, e.g. "agent" stripping out of "agent-fleet").
+      for (i = 0; i < count; i++) {
+        for (j = i + 1; j < count; j++) {
+          if (slug_lens[j] > slug_lens[i]) {
+            t = slug_lens[i]; slug_lens[i] = slug_lens[j]; slug_lens[j] = t
+            t = slug_names[i]; slug_names[i] = slug_names[j]; slug_names[j] = t
+          }
+        }
+      }
+    }
+    {
+      s = $0
+      # --- Repo-URL rewrite --------------------------------------
+      # `github.com[:/]<org>/<repo>` → `github.com/<redacted>/<repo>`
+      # Cursor walk per LESSONS 2026-06-15.
+      out = ""; rest = s
+      while (match(rest, /github\.com[:\/][a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+/)) {
+        out = out substr(rest, 1, RSTART - 1) "github.com/<redacted>/<repo>"
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      s = out rest
+      # --- Dollar-amount banding --------------------------------
+      # `$<digits>(.<digits>)?` → band token. Cursor walk so the
+      # `~$5` replacement does not re-match its embedded `$5`.
+      out = ""; rest = s
+      while (match(rest, /\$[0-9]+(\.[0-9]+)?/)) {
+        raw = substr(rest, RSTART, RLENGTH)
+        amt = raw
+        sub(/^\$/, "", amt)
+        a = amt + 0
+        band = ""
+        if      (a < 1)    band = "<$1"
+        else if (a < 1.5)  band = "~$1"
+        else if (a < 3.5)  band = "~$2"
+        else if (a < 7.5)  band = "~$5"
+        else if (a < 17.5) band = "~$10"
+        else if (a < 37.5) band = "~$25"
+        else if (a < 75)   band = "~$50"
+        else if (a <= 100) band = "~$100"
+        else               band = ">$100"
+        out = out substr(rest, 1, RSTART - 1) band
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      s = out rest
+      # --- Slug-name rewrite (whole-word) ------------------------
+      for (i = 0; i < count; i++) {
+        name = slug_names[i]
+        tok  = slugs[name]
+        out = ""
+        rest = s
+        while (1) {
+          idx = index(rest, name)
+          if (idx == 0) { out = out rest; break }
+          left_ok = (idx == 1)
+          if (!left_ok) {
+            prev = substr(rest, idx - 1, 1)
+            if (prev !~ /[a-zA-Z0-9_-]/) left_ok = 1
+          }
+          right_idx = idx + length(name)
+          right_ok = (right_idx > length(rest))
+          if (!right_ok) {
+            nxt = substr(rest, right_idx, 1)
+            if (nxt !~ /[a-zA-Z0-9_-]/) right_ok = 1
+          }
+          if (left_ok && right_ok) {
+            out = out substr(rest, 1, idx - 1) tok
+          } else {
+            out = out substr(rest, 1, idx - 1 + length(name))
+          }
+          rest = substr(rest, idx + length(name))
+        }
+        s = out
+      }
+      print s
+    }
+  '
+  rm -f "$slug_map_file"
+}
+
+# invoice_compute_one_slug — bring it all together for ONE slug + ONE
+# month. Echoes a TSV record the caller consumes:
+#   slug\tmonth\tprs\theals\tsb\truntime_ms\tclaude\thours\tcursor\t
+#   contractor\tcost_per_pr\tverdict\tprev_prs\tprev_claude\tprev_per_pr
+# Per LESSONS 2026-06-08 the IFS read uses `-` sentinel for empty
+# middle fields (here we always populate, but the discipline is
+# preserved).
+invoice_compute_one_slug() {  # $1=slug $2=month $3=cur_start $4=cur_end $5=prev_start $6=prev_end
+  local cur_slug="$1" cur_month="$2" cs="$3" ce="$4" ps="$5" pe="$6"
+  local cache events runs knobs manual_min rate
+  cache="$(invoice_cache_dir "$cur_slug")"
+  events="$cache/events.jsonl"
+  runs="$cache/runs.jsonl"
+  knobs="$(invoice_read_manifest_knobs "$cur_slug")"
+  manual_min="${knobs%%	*}"
+  rate="${knobs##*	}"
+
+  # Walk events once. The two-row output (cur + prev) is parsed back
+  # in via IFS=$'\t' read.
+  local ev_rows tag prs_c heals_c sb_c rt_c
+  local cur_prs=0 cur_heals=0 cur_sb=0 cur_rt=0
+  local prev_prs=0 prev_heals=0 prev_sb=0 prev_rt=0
+  ev_rows="$(invoice_walk_events "$events" "$cs" "$ce" "$ps" "$pe")"
+  while IFS=$'\t' read -r tag prs_c heals_c sb_c rt_c; do
+    [ -z "$tag" ] && continue
+    if [ "$tag" = "cur" ]; then
+      cur_prs="${prs_c:-0}"; cur_heals="${heals_c:-0}"
+      cur_sb="${sb_c:-0}";   cur_rt="${rt_c:-0}"
+    elif [ "$tag" = "prev" ]; then
+      prev_prs="${prs_c:-0}";   prev_heals="${heals_c:-0}"
+      prev_sb="${sb_c:-0}";     prev_rt="${rt_c:-0}"
+    fi
+  done <<< "$ev_rows"
+  # Quiet shellcheck: prev_heals / prev_sb / prev_rt are captured for
+  # symmetry with the cur_* tuple even though v1's "this month vs last
+  # month" line only surfaces PRs / cost / $/PR deltas. The fuller
+  # delta surface (heals, send-backs, runtime) is a follow-up ticket.
+  : "$prev_heals" "$prev_sb" "$prev_rt"
+
+  # Walk costs once.
+  local cost_rows ctag cval cur_claude="0.00" prev_claude="0.00"
+  cost_rows="$(invoice_walk_costs "$runs" "$cs" "$ce" "$ps" "$pe")"
+  while IFS=$'\t' read -r ctag cval; do
+    [ -z "$ctag" ] && continue
+    if   [ "$ctag" = "cur"  ]; then cur_claude="${cval:-0}"
+    elif [ "$ctag" = "prev" ]; then prev_claude="${cval:-0}"
+    fi
+  done <<< "$cost_rows"
+
+  # Derived: displaced hours, alternatives, verdict, cost/PR.
+  local cur_hours cur_cursor cur_contractor cur_verdict cur_per_pr
+  local prev_per_pr
+  cur_hours="$(awk -v prs="$cur_prs" -v m="$manual_min" 'BEGIN { printf("%.4f", prs * m / 60.0) }')"
+  cur_cursor="20.00"
+  cur_contractor="$(awk -v h="$cur_hours" -v r="$rate" 'BEGIN { printf("%.4f", h * r) }')"
+  cur_verdict="$(invoice_compute_verdict "$cur_claude" "$cur_cursor" "$cur_contractor")"
+  cur_per_pr="$(awk -v c="$cur_claude" -v p="$cur_prs" 'BEGIN { if (p + 0 == 0) printf("0.0000"); else printf("%.4f", c / p) }')"
+  prev_per_pr="$(awk -v c="$prev_claude" -v p="$prev_prs" 'BEGIN { if (p + 0 == 0) printf("0.0000"); else printf("%.4f", c / p) }')"
+
+  printf -- '%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n' \
+    "$cur_slug" "$cur_month" "$cur_prs" "$cur_heals" "$cur_sb" "$cur_rt" \
+    "$cur_claude" "$cur_hours" "$cur_cursor" "$cur_contractor" \
+    "$cur_per_pr" "$cur_verdict" "$prev_prs" "$prev_claude" "$prev_per_pr"
+}
+
+invoice() {
+  shift  # drop the leading "invoice"
+  local slug="" want_all=0 month_arg=""
+  local want_json=0 want_ytd=0 want_redact=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)      want_all=1; shift ;;
+      --json)     want_json=1; shift ;;
+      --ytd)      want_ytd=1; shift ;;
+      --redact)   want_redact=1; shift ;;
+      --month)    month_arg="${2:-}"; shift 2 ;;
+      --month=*)  month_arg="${1#--month=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet invoice — monthly billing-style ROI receipt for one slug or the fleet.
+
+Usage:
+  fleet invoice <slug>                    last calendar month (text)
+  fleet invoice <slug> --month YYYY-MM    override the month
+  fleet invoice --all                     fleet-wide invoice, per-slug breakdown
+  fleet invoice <slug> --ytd              year-to-date roll-up (one row per month)
+  fleet invoice <slug> --redact           pseudonymize slug name + band costs
+  fleet invoice <slug> --json             structured JSON object
+
+Compares the kit's Claude API spend to two alternatives:
+  Cursor Pro            fixed $20/seat/month
+  Contractor            displaced_hours × CONTRACTOR_USD_PER_HOUR (default 80)
+
+Where displaced_hours = PRs_merged × MANUAL_PR_MINUTES / 60 (default 75min).
+Both knobs live in the project's agents.config.sh and can be overridden.
+
+The verdict line classifies the month:
+  net_positive   kit ≤ 0.9 × min(Cursor, contractor) — kit beats the alternative
+  break_even     kit cost within ±10% of the alternative
+  net_negative   kit > 1.1 × min(alternative) — investigate before next month
+
+Pure consumer of events.jsonl + runs.jsonl — no new event types, no writes,
+no fleet_* signature changes. Exit code: 0 on success, 2 on flag / arg errors.
+USAGE
+        exit 0 ;;
+      --) shift; break ;;
+      -*) printf -- 'invoice: unknown flag %s\n' "$1" >&2
+          printf -- 'invoice: usage: bin/fleet invoice <slug|--all> [--month YYYY-MM] [--ytd] [--redact] [--json]\n' >&2
+          exit 2 ;;
+      *)  if [ -z "$slug" ]; then slug="$1"; shift
+          else
+            printf -- 'invoice: unexpected positional %s\n' "$1" >&2
+            exit 2
+          fi ;;
+    esac
+  done
+
+  # Refuse when neither slug nor --all is given.
+  if [ "$want_all" = "0" ] && [ -z "$slug" ]; then
+    printf -- 'invoice: usage: bin/fleet invoice <slug|--all> [--month YYYY-MM] [--ytd] [--redact] [--json]\n' >&2
+    exit 2
+  fi
+
+  # Resolve NOW (test seam).
+  local now_epoch
+  now_epoch="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+
+  # --month validation + future-month refusal.
+  local month_default
+  month_default="$(invoice_default_month "$now_epoch")"
+  local target_month="${month_arg:-$month_default}"
+  if [ -n "$month_arg" ]; then
+    # Validate shape + range.
+    if ! invoice_parse_month "$month_arg" >/dev/null 2>&1; then
+      printf -- 'invoice: --month must be YYYY-MM (got %s)\n' "$month_arg" >&2
+      exit 2
+    fi
+    # Future-month check.
+    local cur_ym
+    cur_ym="$(date -u -r "$now_epoch" '+%Y-%m' 2>/dev/null \
+              || date -u -d "@$now_epoch" '+%Y-%m' 2>/dev/null)"
+    if [ "$month_arg" \> "$cur_ym" ]; then
+      printf -- 'invoice: --month cannot be in the future (got %s)\n' "$month_arg" >&2
+      exit 2
+    fi
+  fi
+
+  # --ytd: render one row per month from January of the current year
+  # through the current month-to-date.
+  if [ "$want_ytd" = "1" ]; then
+    if [ "$want_all" = "1" ]; then
+      printf -- 'invoice: --ytd and --all are mutually exclusive\n' >&2
+      exit 2
+    fi
+    # Validate slug.
+    local known
+    known="$(invoice_discover_slugs)"
+    if ! printf -- '%s\n' "$known" | LC_ALL=C grep -qxF -- "$slug"; then
+      printf -- 'invoice: slug %s not found. discovered slugs: %s\n' \
+        "$slug" "$(printf -- '%s' "$known" | tr '\n' ' ' | sed -E 's/ $//')" >&2
+      exit 2
+    fi
+    local cur_ym cur_yy cur_mm tot_prs=0 tot_claude=0 tot_hours=0
+    cur_ym="$(date -u -r "$now_epoch" '+%Y-%m' 2>/dev/null \
+              || date -u -d "@$now_epoch" '+%Y-%m' 2>/dev/null)"
+    cur_yy="${cur_ym%-*}"
+    cur_mm="${cur_ym#*-}"
+    local out_buf=""
+    out_buf+="agent-fleet — YTD invoice for $slug, $cur_yy"$'\n\n'
+    out_buf+="  MONTH    PRs   $ spent   verdict"$'\n'
+    local m_idx ym row_data
+    for m_idx in $(seq 1 "$((10#$cur_mm))"); do
+      ym="$(printf -- '%04d-%02d' "$cur_yy" "$m_idx")"
+      local mep prev_ym mep_prev parsed parsed_prev
+      parsed="$(invoice_parse_month "$ym")"
+      local cs ce label
+      cs="$(printf -- '%s' "$parsed" | cut -f1)"
+      ce="$(printf -- '%s' "$parsed" | cut -f2)"
+      label="$(printf -- '%s' "$parsed" | cut -f3)"
+      prev_ym="$(invoice_prev_month "$ym")"
+      parsed_prev="$(invoice_parse_month "$prev_ym")"
+      local ps pe
+      ps="$(printf -- '%s' "$parsed_prev" | cut -f1)"
+      pe="$(printf -- '%s' "$parsed_prev" | cut -f2)"
+      row_data="$(invoice_compute_one_slug "$slug" "$ym" "$cs" "$ce" "$ps" "$pe")"
+      local r_slug r_month r_prs r_heals r_sb r_rt r_claude r_hours r_cursor r_contractor r_per_pr r_verdict r_prev_prs r_prev_claude r_prev_per_pr
+      IFS=$'\t' read -r r_slug r_month r_prs r_heals r_sb r_rt r_claude r_hours r_cursor r_contractor r_per_pr r_verdict r_prev_prs r_prev_claude r_prev_per_pr <<< "$row_data"
+      out_buf+="$(printf -- '  %s  %4d  %8s   %s' "$ym" "$r_prs" "$(invoice_fmt_money "$r_claude")" "$r_verdict")"$'\n'
+      tot_prs=$((tot_prs + r_prs))
+      tot_claude="$(awk -v a="$tot_claude" -v b="$r_claude" 'BEGIN { printf("%.4f", a + b) }')"
+      tot_hours="$(awk -v a="$tot_hours" -v b="$r_hours" 'BEGIN { printf("%.4f", a + b) }')"
+      : "$mep" "$mep_prev" "$label" "$r_heals" "$r_sb" "$r_rt" "$r_cursor" "$r_contractor" "$r_per_pr" "$r_prev_prs" "$r_prev_claude" "$r_prev_per_pr" "$r_month" "$r_slug"
+    done
+    out_buf+=$'\n'
+    out_buf+="$(printf -- '  YTD totals:  PRs %d   spend %s   displaced ~%sh' "$tot_prs" "$(invoice_fmt_money "$tot_claude")" "$(awk -v h="$tot_hours" 'BEGIN { printf("%.1f", h + 0) }')")"$'\n'
+    if [ "$want_redact" = "1" ]; then
+      printf -- '%s' "$out_buf" | invoice_redact
+    else
+      printf -- '%s' "$out_buf"
+    fi
+    exit 0
+  fi
+
+  # Parse target month.
+  local parsed cs ce label
+  parsed="$(invoice_parse_month "$target_month")"
+  cs="$(printf -- '%s' "$parsed" | cut -f1)"
+  ce="$(printf -- '%s' "$parsed" | cut -f2)"
+  label="$(printf -- '%s' "$parsed" | cut -f3)"
+  local prev_ym parsed_prev ps pe
+  prev_ym="$(invoice_prev_month "$target_month")"
+  parsed_prev="$(invoice_parse_month "$prev_ym")"
+  ps="$(printf -- '%s' "$parsed_prev" | cut -f1)"
+  pe="$(printf -- '%s' "$parsed_prev" | cut -f2)"
+
+  if [ "$want_all" = "1" ]; then
+    # Fleet-wide invoice: sum every discovered slug; per-slug breakdown.
+    local slugs_file rows_file
+    slugs_file="$(mktemp -t fleet-invoice-slugs.XXXXXX)"
+    rows_file="$(mktemp -t fleet-invoice-rows.XXXXXX)"
+    invoice_discover_slugs > "$slugs_file"
+    : > "$rows_file"
+    local one_slug
+    while IFS= read -r one_slug; do
+      [ -z "$one_slug" ] && continue
+      invoice_compute_one_slug "$one_slug" "$target_month" "$cs" "$ce" "$ps" "$pe" >> "$rows_file"
+    done < "$slugs_file"
+    # Aggregate.
+    local agg_prs agg_heals agg_sb agg_rt agg_claude agg_hours agg_cursor agg_contractor agg_prev_prs agg_prev_claude
+    agg_prs="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $3; count++ } END { print s+0 }' "$rows_file")"
+    agg_heals="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $4; count++ } END { print s+0 }' "$rows_file")"
+    agg_sb="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $5; count++ } END { print s+0 }' "$rows_file")"
+    agg_rt="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $6; count++ } END { print s+0 }' "$rows_file")"
+    agg_claude="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $7; count++ } END { printf("%.4f", s+0) }' "$rows_file")"
+    agg_hours="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $8; count++ } END { printf("%.4f", s+0) }' "$rows_file")"
+    agg_cursor="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $9; count++ } END { printf("%.4f", s+0) }' "$rows_file")"
+    agg_contractor="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $10; count++ } END { printf("%.4f", s+0) }' "$rows_file")"
+    agg_prev_prs="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $13; count++ } END { print s+0 }' "$rows_file")"
+    agg_prev_claude="$(awk -F'\t' 'BEGIN { count = 0; s = 0 } { s += $14; count++ } END { printf("%.4f", s+0) }' "$rows_file")"
+    local agg_per_pr agg_prev_per_pr agg_verdict
+    agg_per_pr="$(awk -v c="$agg_claude" -v p="$agg_prs" 'BEGIN { if (p + 0 == 0) printf("0.0000"); else printf("%.4f", c / p) }')"
+    agg_prev_per_pr="$(awk -v c="$agg_prev_claude" -v p="$agg_prev_prs" 'BEGIN { if (p + 0 == 0) printf("0.0000"); else printf("%.4f", c / p) }')"
+    agg_verdict="$(invoice_compute_verdict "$agg_claude" "$agg_cursor" "$agg_contractor")"
+
+    local out_buf=""
+    if [ "$want_json" = "1" ]; then
+      local fleet_obj
+      fleet_obj="$(invoice_render_json "fleet" "$target_month" "$agg_prs" "$agg_heals" "$agg_sb" "$(awk -v ms="$agg_rt" 'BEGIN { printf("%.1f", ms / 60000.0) }')" "$agg_claude" "$agg_hours" "$agg_cursor" "$agg_contractor" "$agg_verdict" "$agg_per_pr" "$agg_prev_prs" "$agg_prev_claude" "$agg_prev_per_pr")"
+      # Build per-slug array.
+      local slugs_json="" first=1 r_slug r_month r_prs r_heals r_sb r_rt r_claude r_hours r_cursor r_contractor r_per_pr r_verdict r_prev_prs r_prev_claude r_prev_per_pr one_json
+      while IFS=$'\t' read -r r_slug r_month r_prs r_heals r_sb r_rt r_claude r_hours r_cursor r_contractor r_per_pr r_verdict r_prev_prs r_prev_claude r_prev_per_pr; do
+        [ -z "$r_slug" ] && continue
+        one_json="$(invoice_render_json "$r_slug" "$r_month" "$r_prs" "$r_heals" "$r_sb" "$(awk -v ms="$r_rt" 'BEGIN { printf("%.1f", ms / 60000.0) }')" "$r_claude" "$r_hours" "$r_cursor" "$r_contractor" "$r_verdict" "$r_per_pr" "$r_prev_prs" "$r_prev_claude" "$r_prev_per_pr")"
+        if [ "$first" = "1" ]; then first=0; else slugs_json+=','; fi
+        slugs_json+="$one_json"
+      done < "$rows_file"
+      out_buf="$(printf -- '{"fleet":%s,"slugs":[%s]}\n' "$fleet_obj" "$slugs_json")"
+    else
+      out_buf="$(invoice_render_text "fleet" "$label" "$agg_prs" "$agg_heals" "$agg_sb" "$agg_rt" "$agg_claude" "$agg_hours" "$agg_cursor" "$agg_contractor" "$agg_verdict" "$agg_per_pr" "$agg_prev_prs" "$agg_prev_claude" "$agg_prev_per_pr")"
+      out_buf+=$'\n\n'
+      out_buf+="  per-slug breakdown:"$'\n'
+      out_buf+="    SLUG                  PRs   $ spent   verdict"$'\n'
+      local r_slug r_month r_prs r_heals r_sb r_rt r_claude r_hours r_cursor r_contractor r_per_pr r_verdict r_prev_prs r_prev_claude r_prev_per_pr
+      while IFS=$'\t' read -r r_slug r_month r_prs r_heals r_sb r_rt r_claude r_hours r_cursor r_contractor r_per_pr r_verdict r_prev_prs r_prev_claude r_prev_per_pr; do
+        [ -z "$r_slug" ] && continue
+        out_buf+="$(printf -- '    %-20s %4d   %8s  %s' "$r_slug" "$r_prs" "$(invoice_fmt_money "$r_claude")" "$r_verdict")"$'\n'
+        : "$r_month" "$r_heals" "$r_sb" "$r_rt" "$r_hours" "$r_cursor" "$r_contractor" "$r_per_pr" "$r_prev_prs" "$r_prev_claude" "$r_prev_per_pr"
+      done < "$rows_file"
+    fi
+
+    rm -f "$slugs_file" "$rows_file"
+
+    if [ "$want_redact" = "1" ] && [ "$want_json" = "0" ]; then
+      printf -- '%s' "$out_buf" | invoice_redact
+    else
+      printf -- '%s' "$out_buf"
+      printf -- '\n'
+    fi
+    exit 0
+  fi
+
+  # Single-slug mode. Validate slug.
+  local known
+  known="$(invoice_discover_slugs)"
+  if ! printf -- '%s\n' "$known" | LC_ALL=C grep -qxF -- "$slug"; then
+    printf -- 'invoice: slug %s not found. discovered slugs: %s\n' \
+      "$slug" "$(printf -- '%s' "$known" | tr '\n' ' ' | sed -E 's/ $//')" >&2
+    exit 2
+  fi
+
+  local row_data
+  row_data="$(invoice_compute_one_slug "$slug" "$target_month" "$cs" "$ce" "$ps" "$pe")"
+  local r_slug r_month r_prs r_heals r_sb r_rt r_claude r_hours r_cursor r_contractor r_per_pr r_verdict r_prev_prs r_prev_claude r_prev_per_pr
+  IFS=$'\t' read -r r_slug r_month r_prs r_heals r_sb r_rt r_claude r_hours r_cursor r_contractor r_per_pr r_verdict r_prev_prs r_prev_claude r_prev_per_pr <<< "$row_data"
+
+  local out_buf=""
+  if [ "$want_json" = "1" ]; then
+    out_buf="$(invoice_render_json "$r_slug" "$r_month" "$r_prs" "$r_heals" "$r_sb" "$(awk -v ms="$r_rt" 'BEGIN { printf("%.1f", ms / 60000.0) }')" "$r_claude" "$r_hours" "$r_cursor" "$r_contractor" "$r_verdict" "$r_per_pr" "$r_prev_prs" "$r_prev_claude" "$r_prev_per_pr")"
+  else
+    out_buf="$(invoice_render_text "$r_slug" "$label" "$r_prs" "$r_heals" "$r_sb" "$r_rt" "$r_claude" "$r_hours" "$r_cursor" "$r_contractor" "$r_verdict" "$r_per_pr" "$r_prev_prs" "$r_prev_claude" "$r_prev_per_pr")"
+    out_buf+=$'\n'
+  fi
+
+  if [ "$want_redact" = "1" ] && [ "$want_json" = "0" ]; then
+    printf -- '%s' "$out_buf" | invoice_redact
+  else
+    printf -- '%s' "$out_buf"
+  fi
+
+  : "$label"
+  exit 0
+}
+
+if [ "$CMD" = "invoice" ]; then
+  invoice "$@"
+  exit $?
 fi
 
 # --- trends (ticket 0058) -----------------------------------------------
