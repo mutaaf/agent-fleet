@@ -1,7 +1,7 @@
 ---
 id: 0059
 title: fleet stuck flags every PR sitting on a non-actionable cause so the operator unblocks it in one glance
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-19
@@ -425,6 +425,11 @@ Files / patterns the dev should touch.
 
 (Appended by the implementation-dev agent during execution.)
 
+- 2026-06-19 — shipped via PR #125 (merge commit `18316b6`). All 12 AC boxes
+  green; `gh` call batching asserted (6 slugs → 6 `pr list` + 6 `pr view`,
+  total under 30). Pure reader — no `lib/common.sh`, no `prompts/`, no
+  new event types. No LESSONS append needed: every trap the implementation
+  guards against was already documented (LESSONS 2026-05-26 .. 2026-06-15).
 - 2026-06-19 — `feat/0059-fleet-stuck-pr-detector` opened. Tests-first plan:
   one assertion block per AC in `tests/stuck.sh`, six slug subdirs under
   `tests/fixtures/stuck/` (`behind`, `draft-armed`, `account-suspended`,
