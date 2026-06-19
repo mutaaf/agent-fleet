@@ -1,0 +1,1 @@
+{"headSha":"shaAAA","workflowName":"ci.yml","conclusion":"success","createdAt":"2026-06-18T11:00:00Z","jobs":[{"name":"unit-tests","conclusion":"success","steps":[{"name":"vitest run","conclusion":"success"}]}]}

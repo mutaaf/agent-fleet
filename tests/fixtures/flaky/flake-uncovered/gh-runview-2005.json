@@ -1,0 +1,1 @@
+{"headSha":"shaCC3","workflowName":"ci.yml","conclusion":"failure","createdAt":"2026-06-17T14:00:00Z","jobs":[{"name":"install-supabase-cli","conclusion":"failure","steps":[{"name":"supabase cli rate limit hit","conclusion":"failure"}]}]}

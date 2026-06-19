@@ -1,0 +1,5 @@
+PROJECT_NAME="flake-covered"
+SLUG="flake-covered"
+NAMESPACE="com.flake-covered"
+REPO_URL="https://github.com/example/flake-covered"
+SELF_CANCEL="20990101"

@@ -1,0 +1,1 @@
+{"headSha":"shaAAA","workflowName":"ci.yml","conclusion":"failure","createdAt":"2026-06-18T10:00:00Z","jobs":[{"name":"unit-tests","conclusion":"failure","steps":[{"name":"vitest fork worker crashed","conclusion":"failure"}]}]}

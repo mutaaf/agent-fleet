@@ -1,0 +1,1 @@
+{"headSha":"shaBB2","workflowName":"ci.yml","conclusion":"success","createdAt":"2026-06-18T15:00:00Z","jobs":[{"name":"build","conclusion":"success","steps":[{"name":"docker build","conclusion":"success"}]}]}

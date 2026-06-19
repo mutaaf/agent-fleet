@@ -1,0 +1,1 @@
+{"headSha":"shaDD2","workflowName":"ci.yml","conclusion":"success","createdAt":"2026-06-16T11:00:00Z","jobs":[{"name":"lint","conclusion":"success","steps":[{"name":"shellcheck","conclusion":"success"}]}]}
