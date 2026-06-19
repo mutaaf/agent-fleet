@@ -102,6 +102,10 @@
 #   fleet stuck               flag every PR on a non-actionable cause and emit the one-command unblock
 #                             (ticket 0059 — pure reader of events.jsonl + gh; --slug / --json;
 #                              v1 catalog: BEHIND / DRAFT_armed / account_suspended / infra_flake_loop)
+#   fleet flaky               rank CI checks that fail-then-pass without a code change
+#                             (ticket 0060 — pure reader of events.jsonl + gh; --since 1d..90d default 30d /
+#                              --slug NAME / --json; classifies flake vs regression per (headSha,workflow,check);
+#                              cross-references lib/heal-catalog.sh to suggest new catalog entries)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -15728,6 +15732,781 @@ stuck_render_json() {
 
 if [ "$CMD" = "stuck" ]; then
   stuck "$@"
+fi
+
+# --- flaky ----------------------------------------------------------------
+# Ticket 0060. `fleet flaky` walks every discovered slug's last 30d of
+# `gh run list` data plus its events.jsonl `infra_flake_rerun` records,
+# groups runs by `(headSha, workflowName, checkName)`, classifies each
+# group as either a flake (same SHA, fail→pass) or a regression (fail→
+# pass only on a newer SHA), and ranks the flakiest check NAMES so the
+# operator can promote new heal-catalog entries from evidence.
+#
+# Pure reader: NO events.jsonl writes, NO `fleet_emit_event` calls, NO
+# `lib/common.sh` changes, NO writes to `lib/heal-catalog.sh`. The
+# classifier IS the moat — the "fleet's heal-catalog grows from
+# evidence" closed loop the cross-LESSONS already documents one entry
+# at a time.
+#
+# Per LESSONS 2026-06-15 the `gh` calls are batched: ONE `gh run list`
+# per slug + ONE `gh run view` per candidate run. The events.jsonl walk
+# is ONE awk pass per slug. Per LESSONS 2026-06-05 every `flaky_*`
+# helper is defined ABOVE the inline `if [ "$CMD" = "flaky" ]`
+# dispatcher block below. Per LESSONS 2026-06-11 the since-window math
+# uses `date +%s` minus `N * 86400`; no `date -j -f` involved. Per
+# LESSONS 2026-06-13 JSON escape calls `preflight_json_escape` DIRECTLY
+# — no `*_json_escape` wrapper.
+
+FLAKY_ROOT="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+FLAKY_INSTALLED="$HOME/.local/share/agent-fleet/projects"
+
+# flaky_discover_slugs — emit one TSV row per slug `<slug>\t<manifest>\t<repo_url>`
+# in slug-alpha order. Mirrors overview_discover / stuck_discover_slugs.
+flaky_discover_slugs() {
+  local _seen="" m slug repo_url
+  { find "$FLAKY_ROOT"      -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$FLAKY_INSTALLED" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( ( source "$m" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    # shellcheck disable=SC1090
+    repo_url=$( ( source "$m" 2>/dev/null; printf -- '%s' "${REPO_URL:-}" ) )
+    printf -- '%s\t%s\t%s\n' "$slug" "$m" "$repo_url"
+  done | sort -t $'\t' -k1,1
+}
+
+# flaky_read_catalog — read `lib/heal-catalog.sh` (path via FLEET_HEAL_CATALOG
+# override, mirroring `atlas_catalog_path`) and echo one catalog TOKEN per
+# line (e.g. `actions_silent`). Empty when the file is missing — atlas exits
+# 2 in that branch, but flaky degrades gracefully: an empty catalog just
+# means EVERY flaky check renders as `in-catalog? NO`.
+flaky_read_catalog() {
+  local catalog
+  if [ -n "${FLEET_HEAL_CATALOG:-}" ]; then
+    catalog="$FLEET_HEAL_CATALOG"
+  else
+    local self; self="$( cd "$( dirname "$0" )" && pwd )"
+    catalog="$self/../lib/heal-catalog.sh"
+  fi
+  [ -f "$catalog" ] || return 0
+  # Reuse atlas_parse_catalog's token-extract regex inline; we only want
+  # the token, not the lesson date.
+  awk '
+    {
+      line = $0
+      # Skip comments and blank lines (note: do NOT capture LESSON dates
+      # since flaky does not need them).
+      if (line ~ /^[[:space:]]*#/) next
+      if (line ~ /^[[:space:]]*$/) next
+      if (match(line, /"[A-Za-z0-9_]+\|/)) {
+        entry = substr(line, RSTART + 1, RLENGTH - 2)
+        gsub(/\|$/, "", entry)
+        print entry
+      }
+    }
+  ' "$catalog"
+}
+
+# flaky_list_runs — ONE `gh run list --workflow=ci.yml --status=failure
+# --limit 100 --json databaseId,conclusion,headSha,workflowName` per slug.
+# Echoes one TSV row per run:
+#   <run_id>\t<head_sha>\t<workflow>\t<conclusion>
+# Sentinel `-` on empty (LESSONS 2026-06-08 IFS=$'\t' middle-empty-field).
+# Echoes `ERROR\t<msg>` on gh failure so the caller can map to the
+# "gh failed — skipped" resilience path (AC #9). Echoes nothing on a
+# repo with zero failing runs.
+flaky_list_runs() {
+  local repo="$1"
+  [ -n "$repo" ] || return 0
+  command -v gh >/dev/null 2>&1 || { printf -- 'ERROR\tgh not installed\n'; return 0; }
+  local raw err
+  err="$TMP_FLAKY_ERR"
+  raw="$(gh run list \
+            --repo "$repo" \
+            --workflow=ci.yml \
+            --status=failure \
+            --limit 100 \
+            --json databaseId,conclusion,headSha,workflowName \
+            2>"$err")" || {
+    local msg
+    msg="$(LC_ALL=C tr -d '\n\r\t' <"$err" 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [ -z "$msg" ] && msg="gh run list failed"
+    printf -- 'ERROR\t%s\n' "$msg"
+    return 0
+  }
+  [ -z "$raw" ] || [ "$raw" = "[]" ] && return 0
+  if command -v node >/dev/null 2>&1; then
+    printf -- '%s' "$raw" | node -e '
+      try {
+        const arr = JSON.parse(require("fs").readFileSync(0, "utf8"));
+        if (!Array.isArray(arr)) process.exit(0);
+        for (const r of arr) {
+          const id = Number(r.databaseId) || 0;
+          if (!id) continue;
+          let sha = String(r.headSha || "-"); if (!sha) sha = "-";
+          let wf  = String(r.workflowName || "-"); if (!wf)  wf  = "-";
+          let cc  = String(r.conclusion || "-"); if (!cc)  cc  = "-";
+          process.stdout.write(id + "\t" + sha + "\t" + wf + "\t" + cc + "\n");
+        }
+      } catch (e) { /* drop */ }
+    '
+  else
+    # Pure-awk fallback. We do not depend on it in tests (node is a kit dep)
+    # but keep the path open for hosts without node.
+    printf -- '%s' "$raw" | tr '},' '\n\n' | awk '
+      BEGIN { count = 0; id = ""; sha = ""; wf = ""; cc = "" }
+      /"databaseId"/ {
+        if (match($0, /"databaseId"[[:space:]]*:[[:space:]]*[0-9]+/)) {
+          s = substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", s); id = s
+        }
+      }
+      /"headSha"/ {
+        if (match($0, /"headSha"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          s = substr($0, RSTART, RLENGTH); sub(/.*"headSha"[[:space:]]*:[[:space:]]*"/, "", s); sub(/".*/, "", s); sha = s
+        }
+      }
+      /"workflowName"/ {
+        if (match($0, /"workflowName"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          s = substr($0, RSTART, RLENGTH); sub(/.*"workflowName"[[:space:]]*:[[:space:]]*"/, "", s); sub(/".*/, "", s); wf = s
+        }
+      }
+      /"conclusion"/ {
+        if (match($0, /"conclusion"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          s = substr($0, RSTART, RLENGTH); sub(/.*"conclusion"[[:space:]]*:[[:space:]]*"/, "", s); sub(/".*/, "", s); cc = s
+        }
+      }
+      id != "" && sha != "" && wf != "" && cc != "" {
+        printf("%s\t%s\t%s\t%s\n", id, sha, wf, cc); id = ""; sha = ""; wf = ""; cc = ""; count++
+      }
+    '
+  fi
+}
+
+# flaky_view_one_run — ONE `gh run view <id> --json jobs,conclusion,
+# headSha,workflowName,createdAt` per candidate run. Echoes one TSV row
+# per JOB in the run:
+#   <run_id>\t<head_sha>\t<workflow>\t<check_name>\t<conclusion>\t<created_iso>\t<job_title>
+# Sentinel `-` on every column that could be empty (LESSONS 2026-06-08).
+# Empty echo on gh failure (caller treats as a no-op skip).
+flaky_view_one_run() {
+  local repo="$1" run_id="$2"
+  [ -n "$repo" ] || return 0
+  [ -n "$run_id" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local raw
+  raw="$(gh run view "$run_id" \
+           --repo "$repo" \
+           --json jobs,conclusion,headSha,workflowName,createdAt \
+           2>/dev/null)" || return 0
+  [ -z "$raw" ] && return 0
+  if command -v node >/dev/null 2>&1; then
+    printf -- '%s' "$raw" | RID="$run_id" node -e '
+      try {
+        const o = JSON.parse(require("fs").readFileSync(0, "utf8"));
+        const rid = process.env.RID || "";
+        const sha = String(o.headSha || "-") || "-";
+        const wf  = String(o.workflowName || "-") || "-";
+        const created = String(o.createdAt || "-") || "-";
+        const jobs = Array.isArray(o.jobs) ? o.jobs : [];
+        if (jobs.length === 0) {
+          // A run with no per-job records — emit one synthetic row with
+          // checkName as `-` so the classifier sees a job-level conclusion
+          // (LESSONS 2026-06-08 sentinel for empty middle column).
+          let cc = String(o.conclusion || "-") || "-";
+          process.stdout.write(rid + "\t" + sha + "\t" + wf + "\t-\t" + cc + "\t" + created + "\t-\n");
+          process.exit(0);
+        }
+        for (const j of jobs) {
+          let name = String(j.name || "-") || "-";
+          let cc   = String(j.conclusion || j.status || "-") || "-";
+          let title = "-";
+          if (Array.isArray(j.steps)) {
+            for (const st of j.steps) {
+              const stcc = String(st.conclusion || "").toUpperCase();
+              if (stcc === "FAILURE" || stcc === "FAILED" || stcc === "TIMED_OUT") {
+                title = String(st.name || "-") || "-";
+                break;
+              }
+            }
+          }
+          // TSV-safe: strip embedded \t and newlines.
+          name  = name.replace(/[\t\r\n]/g, " ");
+          title = title.replace(/[\t\r\n]/g, " ");
+          process.stdout.write(rid + "\t" + sha + "\t" + wf + "\t" + name + "\t" + cc + "\t" + created + "\t" + title + "\n");
+        }
+      } catch (e) { /* drop */ }
+    '
+  fi
+}
+
+# flaky_count_infra_flake_events — count infra_flake_rerun events in a slug's
+# events.jsonl whose ts falls within the since-window AND whose `pattern`
+# matches the supplied catalog token. Echoes one integer per token, on its
+# own line, in the order tokens are passed in. Per LESSONS 2026-06-15 this
+# is ONE awk pass per slug (not per token-per-event).
+#
+# Args: $1 = events.jsonl path, $2 = cutoff_epoch, $3..N = tokens.
+flaky_count_infra_flake_events() {
+  local events="$1" cutoff="$2"; shift 2
+  if [ ! -f "$events" ]; then
+    local t
+    for t in "$@"; do
+      [ -n "$t" ] || continue
+      echo 0
+    done
+    return 0
+  fi
+  # Write tokens to a tmp file — `awk -v` rejects newline-bearing values
+  # (LESSONS 2026-06-01 awk -v multi-line trap).
+  local tok_file
+  tok_file="$(mktemp -t fleet-flaky-toks.XXXXXX)"
+  local t
+  for t in "$@"; do
+    [ -n "$t" ] || continue
+    printf -- '%s\n' "$t" >> "$tok_file"
+  done
+  awk -v cutoff="$cutoff" -v tok_file="$tok_file" '
+    BEGIN {
+      count = 0
+      n_tok = 0
+      while ((getline line < tok_file) > 0) {
+        if (line != "") { n_tok++; toks[n_tok] = line; seen[line] = 0 }
+      }
+      close(tok_file)
+    }
+    function iso2ep(ts,    cmd, out) {
+      gsub(/\.[0-9]+Z$/, "Z", ts); sub(/Z$/, "", ts)
+      cmd = "date -u -j -f %Y-%m-%dT%H:%M:%S \"" ts "\" +%s 2>/dev/null"
+      cmd = cmd " || date -u -d \"" ts "Z\" +%s 2>/dev/null"
+      if ((cmd | getline out) <= 0) out = 0
+      close(cmd)
+      return out + 0
+    }
+    {
+      ts=""; type=""; pat=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH); sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH); sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"pattern"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        pat=substr($0, RSTART, RLENGTH); sub(/.*"pattern"[[:space:]]*:[[:space:]]*"/, "", pat); sub(/".*/, "", pat)
+      }
+      if (type != "infra_flake_rerun") next
+      if (pat == "") next
+      if (iso2ep(ts) < cutoff) next
+      if (pat in seen) seen[pat]++
+    }
+    END {
+      for (i = 1; i <= n_tok; i++) {
+        if (toks[i] == "") continue
+        printf("%d\n", seen[toks[i]] + 0)
+      }
+    }
+  ' "$events"
+  rm -f "$tok_file"
+}
+
+# flaky_suggest_catalog_name — derive a snake_case catalog entry name from
+# a check name + the first 3-5 words of the failing job's title. Lowercase,
+# `[^a-z0-9]+` collapsed to `_`, trimmed to ≤40 chars.
+flaky_suggest_catalog_name() {
+  local check_name="$1" title="$2"
+  # Normalize check_name first.
+  local check_snake
+  check_snake="$(printf -- '%s' "$check_name" \
+    | awk '{ s = tolower($0); gsub(/[^a-z0-9]+/, "_", s); sub(/^_+/, "", s); sub(/_+$/, "", s); print s }')"
+  # First 3-5 words of title.
+  local title_snake
+  title_snake="$(printf -- '%s' "$title" \
+    | awk '{
+        s = tolower($0); gsub(/[^a-z0-9 ]+/, " ", s); gsub(/[[:space:]]+/, " ", s);
+        sub(/^ /, "", s); sub(/ $/, "", s);
+        n = split(s, w, " "); out = "";
+        for (i = 1; i <= n && i <= 4; i++) {
+          if (w[i] == "") continue
+          out = (out == "" ? w[i] : out "_" w[i])
+        }
+        print out
+      }')"
+  local combined
+  if [ -n "$title_snake" ] && [ "$title_snake" != "_" ] && [ "$title_snake" != "-" ]; then
+    combined="${check_snake}_${title_snake}"
+  else
+    combined="${check_snake}_flake"
+  fi
+  # Collapse dupes; trim.
+  combined="$(printf -- '%s' "$combined" | awk '{ s = $0; gsub(/_+/, "_", s); sub(/^_/, "", s); sub(/_$/, "", s); print s }')"
+  # Trim to 40 chars.
+  printf -- '%s' "${combined:0:40}"
+}
+
+# flaky_classify_runs — ONE awk pass per slug over the collected
+# `<run_id>\t<head_sha>\t<workflow>\t<check_name>\t<conclusion>\t<created_iso>\t<title>`
+# rows. Groups by `(headSha, workflowName, checkName)` and emits one
+# summary row per check_name:
+#   <check_name>\t<failures>\t<flaked>\t<title_example>
+# Per LESSONS 2026-06-08 `BEGIN { count = 0; flake_count = 0 }`. Per
+# LESSONS 2026-06-15 the awk pass replaces the per-run-pair shell loop.
+# Per LESSONS 2026-06-15 (match infinite-loop) any regex use here uses
+# the cursor-based walk pattern; we do not do `s = before repl after`.
+flaky_classify_runs() {
+  awk -F'\t' '
+    BEGIN {
+      count = 0
+      flake_count = 0
+    }
+    NF >= 5 {
+      run_id = $1; sha = $2; wf = $3; name = $4; concl = $5
+      created = (NF >= 6 ? $6 : "-")
+      title   = (NF >= 7 ? $7 : "-")
+      if (name == "-") name = "(run-level)"
+      if (sha == "-")  next
+      if (wf == "-")   wf = "(unknown)"
+      # Per-check failure tally.
+      cl = tolower(concl)
+      if (cl == "failure" || cl == "failed" || cl == "timed_out" || cl == "cancelled") {
+        fail_count[name]++
+        # Record the most recent title example.
+        if (title != "-" && title_example[name] == "") title_example[name] = title
+      }
+      # Group key: SHA+wf+check; per-group earliest-failure ts + latest-success ts.
+      key = sha SUBSEP wf SUBSEP name
+      if (!(key in seen_any)) { seen_any[key] = 1; group_check[key] = name; group_sha[key] = sha }
+      if (cl == "failure" || cl == "failed" || cl == "timed_out" || cl == "cancelled") {
+        if (group_first_fail[key] == "" || created < group_first_fail[key]) {
+          group_first_fail[key] = created
+        }
+      }
+      if (cl == "success") {
+        if (group_last_pass[key] == "" || created > group_last_pass[key]) {
+          group_last_pass[key] = created
+        }
+      }
+      # Track per-check NEWER-SHA-pass: did we see a success on a sha != sha later?
+      # We record one timestamp per (check, sha) pair on either side.
+      tag = name SUBSEP sha
+      if (cl == "success") {
+        if (check_sha_first_pass[tag] == "" || created < check_sha_first_pass[tag]) {
+          check_sha_first_pass[tag] = created
+        }
+      }
+      check_sha_seen[tag] = 1
+      # Per-check title example.
+      if (title != "-" && check_title[name] == "") check_title[name] = title
+    }
+    END {
+      # For each group key, classify: flake (fail + later success same SHA).
+      for (k in seen_any) {
+        split(k, parts, SUBSEP)
+        sha = parts[1]; name = parts[3]
+        if (group_first_fail[k] != "" && group_last_pass[k] != "" \
+            && group_last_pass[k] >= group_first_fail[k]) {
+          per_check_flaked[name]++
+          flake_count++
+        }
+      }
+      # Emit one row per check name we saw a FAILURE on.
+      for (name in fail_count) {
+        f = fail_count[name] + 0
+        fl = (name in per_check_flaked ? per_check_flaked[name] : 0) + 0
+        t = title_example[name]
+        if (t == "") t = check_title[name]
+        if (t == "") t = "-"
+        printf("%s\t%d\t%d\t%s\n", name, f, fl, t)
+      }
+    }
+  '
+}
+
+# flaky_classify_coverage — given the per-slug catalog-hit counts (one int
+# per token) and the per-check failure counts, decide the "in-catalog?"
+# state for each check. v1 keeps it simple: every check is rated by whether
+# the slug has ANY infra_flake_rerun event for ANY token (yes), some
+# (partial), or none (no). The catalog match per CHECK NAME is approximate
+# in v1 because the catalog stores PATTERN tokens, not check names.
+#
+# Args: $1 = total_infra_flake_events_seen (int), $2 = check_failures (int),
+#       $3 = check_flaked (int).
+# Echoes one of: yes|partial|no.
+flaky_classify_coverage() {
+  local total_events="$1" flaked="$3"
+  # failures (positional $2) is currently unused — kept in the call shape
+  # for v2 (a "covered when events ≥ failures, not flaked" policy).
+  : "${2-}"
+  if [ "${total_events:-0}" -le 0 ]; then
+    echo "no"; return 0
+  fi
+  # If the slug has roughly as many infra_flake_rerun events as flaked-runs
+  # for this check, the catalog "covered" them. The heuristic v1: events ≥
+  # flaked → yes; 0 < events < flaked → partial; events == 0 → no.
+  if [ "${total_events:-0}" -ge "${flaked:-0}" ] && [ "${flaked:-0}" -gt 0 ]; then
+    echo "yes"; return 0
+  fi
+  if [ "${total_events:-0}" -gt 0 ]; then
+    echo "partial"; return 0
+  fi
+  echo "no"
+}
+
+# flaky_render_text — text formatter. Per LESSONS 2026-05-28 every printf
+# of a check name goes through `printf -- '%s'`.
+# Inputs (positional):
+#   $1 since-label, $2 total_failures, $3 N_slugs, $4 rows-blob, $5 errors-blob
+# rows-blob: lines of `rank<TAB>check<TAB>fail<TAB>flaked<TAB>pct<TAB>incat<TAB>next`
+# errors-blob: lines of `slug<TAB>msg`
+flaky_render_text() {
+  local since="$1" total_failures="$2" n_slugs="$3" rows="$4" errors="$5"
+  if [ "$total_failures" = "0" ] || [ -z "$rows" ]; then
+    printf -- 'flaky — 0 failed gating-check runs in %s (healthy CI)\n' "$since"
+    if [ -n "$errors" ]; then
+      local er_slug er_msg
+      while IFS=$'\t' read -r er_slug er_msg; do
+        [ -z "$er_slug" ] && continue
+        printf -- '  %s: gh failed — skipped (%s)\n' "$er_slug" "$er_msg"
+      done <<< "$errors"
+    fi
+    return 0
+  fi
+  printf -- 'flaky — %s failed gating-check runs across %s slugs in %s\n' \
+    "$total_failures" "$n_slugs" "$since"
+  printf -- '\n'
+  printf -- '  %-4s  %-20s  %8s  %-10s  %-12s  %s\n' \
+    "rank" "check name" "failures" "flaked" "in-catalog?" "next action"
+  local rank check fail flaked pct incat next_act
+  while IFS=$'\t' read -r rank check fail flaked pct incat next_act; do
+    [ -z "$rank" ] && continue
+    local flaked_label
+    flaked_label="$(printf -- '%s (%s%%)' "$flaked" "$pct")"
+    printf -- '  %-4s  %-20s  %8s  %-10s  %-12s  %s\n' \
+      "$rank" "$check" "$fail" "$flaked_label" "$incat" "$next_act"
+  done <<< "$rows"
+  if [ -n "$errors" ]; then
+    printf -- '\n'
+    local er_slug er_msg
+    while IFS=$'\t' read -r er_slug er_msg; do
+      [ -z "$er_slug" ] && continue
+      printf -- '  %s: gh failed — skipped (%s)\n' "$er_slug" "$er_msg"
+    done <<< "$errors"
+  fi
+}
+
+# flaky_render_json — JSON formatter. JSON escape via `preflight_json_escape`
+# called DIRECTLY (LESSONS 2026-06-13: NO `*_json_escape` wrapper around
+# the canonical escaper).
+flaky_render_json() {
+  local since="$1" total_failures="$2" n_slugs="$3" rows="$4" errors="$5"
+  local out="{\"since\":\""
+  out+="$(preflight_json_escape "$since")"
+  out+='","slugs":'
+  out+="${n_slugs:-0}"
+  out+=',"total_failures":'
+  out+="${total_failures:-0}"
+  out+=',"rows":['
+  local first=1
+  if [ -n "$rows" ]; then
+    local rank check fail flaked pct incat next_act
+    while IFS=$'\t' read -r rank check fail flaked pct incat next_act; do
+      [ -z "$rank" ] && continue
+      if [ "$first" = "1" ]; then first=0; else out+=','; fi
+      out+='{"check_name":"'
+      out+="$(preflight_json_escape "$check")"
+      out+='","failures":'
+      out+="${fail:-0}"
+      out+=',"flaked":'
+      out+="${flaked:-0}"
+      out+=',"flake_pct":'
+      out+="${pct:-0}"
+      out+=',"in_catalog":"'
+      out+="$(preflight_json_escape "$incat")"
+      out+='","next_action":'
+      case "$next_act" in
+        "" | "—") out+='null' ;;
+        *)
+          out+='"'
+          out+="$(preflight_json_escape "$next_act")"
+          out+='"'
+          ;;
+      esac
+      out+='}'
+    done <<< "$rows"
+  fi
+  out+='],"estimated_cost_usd":0.0,"errors":['
+  first=1
+  if [ -n "$errors" ]; then
+    local er_slug er_msg
+    while IFS=$'\t' read -r er_slug er_msg; do
+      [ -z "$er_slug" ] && continue
+      if [ "$first" = "1" ]; then first=0; else out+=','; fi
+      out+='{"slug":"'
+      out+="$(preflight_json_escape "$er_slug")"
+      out+='","error":"'
+      out+="$(preflight_json_escape "$er_msg")"
+      out+='"}'
+    done <<< "$errors"
+  fi
+  out+=']}'
+  printf -- '%s\n' "$out"
+}
+
+flaky() {
+  shift  # drop the leading "flaky"
+  local want_json=0 slug_filter="" since="30d"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      --slug)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "flaky: --slug requires a value" >&2
+          exit 2
+        fi
+        case "${2:-}" in
+          --*) echo "flaky: --slug requires a value" >&2; exit 2 ;;
+        esac
+        slug_filter="$2"; shift 2 ;;
+      --slug=*)
+        slug_filter="${1#--slug=}"
+        if [ -z "$slug_filter" ]; then
+          echo "flaky: --slug requires a value" >&2
+          exit 2
+        fi
+        shift ;;
+      --since)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "flaky: --since requires a value (Nd or Nw)" >&2
+          exit 2
+        fi
+        since="$2"; shift 2 ;;
+      --since=*)
+        since="${1#--since=}"
+        if [ -z "$since" ]; then
+          echo "flaky: --since requires a value (Nd or Nw)" >&2
+          exit 2
+        fi
+        shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet flaky — rank CI checks that have failed-then-passed without a code change.
+
+Usage:
+  fleet flaky                    walk every discovered slug's last 30d of CI
+  fleet flaky --since 7d         restrict the window (Nd or Nw; 1d..90d)
+  fleet flaky --slug NAME        restrict the walk to one slug
+  fleet flaky --json             structured emit { since, slugs, total_failures, rows, errors }
+  fleet flaky --help             this banner
+
+A check NAME flaked when two `gh run` records exist for the SAME headSha
++ workflow + check name where the earlier was `failure` and a later run
+was `success`. A check that went from failure to success only after a
+new commit landed on the branch counts as "regressed, not flaked."
+
+Pure reader: NO events.jsonl writes, NO writes to lib/heal-catalog.sh.
+The suggested catalog entries are PRINTED, never written — promote them
+manually.
+
+USAGE
+        exit 0 ;;
+      *)
+        echo "flaky: unknown flag '$1'" >&2
+        exit 2 ;;
+    esac
+  done
+
+  # --since: accept Nd | Nw; clamp 1..90d. Per LESSONS 2026-06-11 the
+  # window math uses `date +%s - N*86400`, no `date -j -f`.
+  local since_days=30 since_raw="$since" unit n
+  case "$since" in
+    *d) unit=d; n="${since%d}" ;;
+    *w) unit=w; n="${since%w}" ;;
+    *)  printf -- 'flaky: --since must be 1d-90d (got %s)\n' "$since" >&2; exit 2 ;;
+  esac
+  case "$n" in
+    ''|*[!0-9]*) printf -- 'flaky: --since must be 1d-90d (got %s)\n' "$since_raw" >&2; exit 2 ;;
+  esac
+  if [ "$unit" = "w" ]; then since_days=$(( n * 7 )); else since_days="$n"; fi
+  if [ "$since_days" -lt 1 ] || [ "$since_days" -gt 90 ]; then
+    printf -- 'flaky: --since must be 1d-90d (got %s)\n' "$since_raw" >&2
+    exit 2
+  fi
+
+  # Compute the cutoff epoch.
+  local now cutoff
+  now="${FLEET_FLAKY_FAKE_NOW:-${FLEET_NOW_OVERRIDE:-$(date -u +%s)}}"
+  case "$now" in
+    ''|*[!0-9]*) now="$(date -u +%s)" ;;
+  esac
+  cutoff=$(( now - since_days * 86400 ))
+
+  # tempfile for child gh stderr capture (used by flaky_list_runs).
+  local tmp_dir
+  tmp_dir="$(mktemp -d -t fleet-flaky.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp_dir'" EXIT
+  TMP_FLAKY_ERR="$tmp_dir/gh-err.log"
+  export TMP_FLAKY_ERR
+
+  # Discover slugs; apply --slug filter.
+  local discovered known=""
+  discovered="$(flaky_discover_slugs)"
+  while IFS=$'\t' read -r d_slug _d_manifest _d_repo; do
+    [ -z "$d_slug" ] && continue
+    if [ -z "$known" ]; then known="$d_slug"; else known="$known $d_slug"; fi
+  done <<< "$discovered"
+
+  if [ -n "$slug_filter" ]; then
+    local found=0 w
+    for w in $known; do
+      [ "$w" = "$slug_filter" ] && found=1
+    done
+    if [ "$found" = "0" ]; then
+      printf -- 'flaky: slug %s not found. discovered slugs: %s\n' \
+        "$slug_filter" "$known" >&2
+      exit 2
+    fi
+  fi
+
+  # Read the heal-catalog token set ONCE.
+  local catalog_tokens
+  catalog_tokens="$(flaky_read_catalog)"
+
+  # Per-fleet aggregate buffer of CLASSIFIED rows. Each row:
+  #   check<TAB>fail<TAB>flaked<TAB>title<TAB>incat
+  local agg_rows=""
+  local error_rows=""
+  local n_slugs_scanned=0
+  local total_failures=0
+
+  while IFS=$'\t' read -r s_slug _s_manifest s_repo_url; do
+    [ -z "$s_slug" ] && continue
+    [ -n "$slug_filter" ] && [ "$s_slug" != "$slug_filter" ] && continue
+    n_slugs_scanned=$(( n_slugs_scanned + 1 ))
+
+    # Derive owner/repo from REPO_URL (https://github.com/owner/name[.git]).
+    local repo
+    repo="$(printf -- '%s' "$s_repo_url" | sed -E 's#https?://github.com/##; s#\.git$##')"
+
+    # ONE `gh run list` per slug.
+    local raw_runs first_line
+    raw_runs="$(flaky_list_runs "$repo")"
+    first_line="$(printf -- '%s\n' "$raw_runs" | head -1)"
+    case "$first_line" in
+      ERROR*)
+        local msg
+        msg="$(printf -- '%s' "$first_line" | cut -f2-)"
+        [ -z "$msg" ] && msg="gh failed"
+        if [ -n "$error_rows" ]; then error_rows="$error_rows"$'\n'; fi
+        error_rows="${error_rows}${s_slug}"$'\t'"$msg"
+        continue
+        ;;
+    esac
+    [ -z "$raw_runs" ] && continue
+
+    # ONE `gh run view` per candidate run. Concatenate the per-job TSV rows.
+    local view_rows=""
+    local run_line
+    while IFS= read -r run_line; do
+      [ -z "$run_line" ] && continue
+      local rid _rsha _rwf _rcc
+      rid="$(printf -- '%s' "$run_line" | cut -f1)"
+      _rsha="$(printf -- '%s' "$run_line" | cut -f2)"
+      _rwf="$(printf -- '%s' "$run_line" | cut -f3)"
+      _rcc="$(printf -- '%s' "$run_line" | cut -f4)"
+      [ -z "$rid" ] && continue
+      local v
+      v="$(flaky_view_one_run "$repo" "$rid")"
+      [ -z "$v" ] && continue
+      if [ -n "$view_rows" ]; then view_rows="$view_rows"$'\n'; fi
+      view_rows="${view_rows}${v}"
+    done <<< "$raw_runs"
+
+    [ -z "$view_rows" ] && continue
+
+    # ONE awk pass per slug to classify.
+    local classified
+    classified="$(printf -- '%s\n' "$view_rows" | flaky_classify_runs)"
+    [ -z "$classified" ] && continue
+
+    # Count slug's infra_flake_rerun events for catalog-coverage hint
+    # (per-token tally — sum into one slug-level total for the heuristic).
+    local events_path="$HOME/.cache/${s_slug}-agent/events.jsonl"
+    local total_slug_events=0
+    if [ -n "$catalog_tokens" ]; then
+      # Pass each token; sum the counts.
+      local tok_args=()
+      while IFS= read -r tk; do
+        [ -z "$tk" ] && continue
+        tok_args+=("$tk")
+      done <<< "$catalog_tokens"
+      if [ "${#tok_args[@]}" -gt 0 ]; then
+        local counts_blob
+        counts_blob="$(flaky_count_infra_flake_events "$events_path" "$cutoff" "${tok_args[@]}")"
+        total_slug_events="$(printf -- '%s\n' "$counts_blob" | awk 'BEGIN { count = 0 } NF { count += $1 } END { print count + 0 }')"
+      fi
+    fi
+
+    # Fold per-check classification into the fleet-wide aggregate.
+    local c_name c_fail c_flaked c_title
+    while IFS=$'\t' read -r c_name c_fail c_flaked c_title; do
+      [ -z "$c_name" ] && continue
+      [ "${c_fail:-0}" -le 0 ] && continue
+      local incat
+      incat="$(flaky_classify_coverage "$total_slug_events" "$c_fail" "$c_flaked")"
+      if [ -n "$agg_rows" ]; then agg_rows="$agg_rows"$'\n'; fi
+      agg_rows="${agg_rows}${c_name}"$'\t'"$c_fail"$'\t'"$c_flaked"$'\t'"$c_title"$'\t'"$incat"
+      total_failures=$(( total_failures + c_fail ))
+    done <<< "$classified"
+  done <<< "$discovered"
+
+  # Sort aggregate by failures desc, then check_name asc. Compute pct +
+  # next_action per row.
+  local sorted=""
+  if [ -n "$agg_rows" ]; then
+    sorted="$(printf -- '%s\n' "$agg_rows" \
+      | awk -F'\t' 'BEGIN { count = 0 } NF { printf("%d\t%s\n", $2, $0) }' \
+      | sort -t $'\t' -k1,1nr -k2,2 \
+      | cut -f2-)"
+  fi
+
+  local rendered_rows="" row_rank=0
+  if [ -n "$sorted" ]; then
+    local s_name s_fail s_flaked s_title s_incat
+    while IFS=$'\t' read -r s_name s_fail s_flaked s_title s_incat; do
+      [ -z "$s_name" ] && continue
+      row_rank=$(( row_rank + 1 ))
+      local pct=0
+      if [ "${s_fail:-0}" -gt 0 ]; then
+        pct=$(( s_flaked * 100 / s_fail ))
+      fi
+      local next_act="—"
+      case "$s_incat" in
+        no|partial)
+          local suggest
+          suggest="$(flaky_suggest_catalog_name "$s_name" "$s_title")"
+          if [ -n "$suggest" ]; then
+            next_act="add: $suggest"
+          fi
+          ;;
+      esac
+      if [ -n "$rendered_rows" ]; then rendered_rows="$rendered_rows"$'\n'; fi
+      rendered_rows="${rendered_rows}${row_rank}"$'\t'"$s_name"$'\t'"$s_fail"$'\t'"$s_flaked"$'\t'"$pct"$'\t'"$s_incat"$'\t'"$next_act"
+    done <<< "$sorted"
+  fi
+
+  if [ "$want_json" = "1" ]; then
+    flaky_render_json "$since_raw" "$total_failures" "$n_slugs_scanned" "$rendered_rows" "$error_rows"
+    exit 0
+  fi
+  flaky_render_text "$since_raw" "$total_failures" "$n_slugs_scanned" "$rendered_rows" "$error_rows"
+  exit 0
+}
+
+if [ "$CMD" = "flaky" ]; then
+  flaky "$@"
 fi
 
 # --- atlas ----------------------------------------------------------------

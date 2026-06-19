@@ -1,0 +1,5 @@
+PROJECT_NAME="regression"
+SLUG="regression"
+NAMESPACE="com.regression"
+REPO_URL="https://github.com/example/regression"
+SELF_CANCEL="20990101"

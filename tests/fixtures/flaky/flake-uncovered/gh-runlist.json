@@ -1,0 +1,8 @@
+[
+  {"databaseId":2001,"conclusion":"failure","headSha":"shaCC1","workflowName":"ci.yml"},
+  {"databaseId":2002,"conclusion":"success","headSha":"shaCC1","workflowName":"ci.yml"},
+  {"databaseId":2003,"conclusion":"failure","headSha":"shaCC2","workflowName":"ci.yml"},
+  {"databaseId":2004,"conclusion":"success","headSha":"shaCC2","workflowName":"ci.yml"},
+  {"databaseId":2005,"conclusion":"failure","headSha":"shaCC3","workflowName":"ci.yml"},
+  {"databaseId":2006,"conclusion":"success","headSha":"shaCC3","workflowName":"ci.yml"}
+]

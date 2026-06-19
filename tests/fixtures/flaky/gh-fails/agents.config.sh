@@ -1,0 +1,5 @@
+PROJECT_NAME="gh-fails"
+SLUG="gh-fails"
+NAMESPACE="com.gh-fails"
+REPO_URL="https://github.com/example/gh-fails"
+SELF_CANCEL="20990101"

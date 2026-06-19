@@ -1,0 +1,4 @@
+[
+  {"databaseId":3001,"conclusion":"failure","headSha":"shaDD1","workflowName":"ci.yml"},
+  {"databaseId":3002,"conclusion":"success","headSha":"shaDD2","workflowName":"ci.yml"}
+]

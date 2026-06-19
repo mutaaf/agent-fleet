@@ -1,0 +1,10 @@
+[
+  {"databaseId":1001,"conclusion":"failure","headSha":"shaAAA","workflowName":"ci.yml"},
+  {"databaseId":1002,"conclusion":"success","headSha":"shaAAA","workflowName":"ci.yml"},
+  {"databaseId":1003,"conclusion":"failure","headSha":"shaBB1","workflowName":"ci.yml"},
+  {"databaseId":1004,"conclusion":"success","headSha":"shaBB1","workflowName":"ci.yml"},
+  {"databaseId":1005,"conclusion":"failure","headSha":"shaBB2","workflowName":"ci.yml"},
+  {"databaseId":1006,"conclusion":"success","headSha":"shaBB2","workflowName":"ci.yml"},
+  {"databaseId":1007,"conclusion":"failure","headSha":"shaBB3","workflowName":"ci.yml"},
+  {"databaseId":1008,"conclusion":"success","headSha":"shaBB3","workflowName":"ci.yml"}
+]
