@@ -99,6 +99,9 @@
 #   fleet trends <slug>       render 12-week sparklines for PRs / cost / send-backs
 #                             (ticket 0058 — pure reader; --all / --axis prs|cost|sendbacks /
 #                              --weeks 4..52 / --json; advisory footer fires only on two-axis trigger)
+#   fleet stuck               flag every PR on a non-actionable cause and emit the one-command unblock
+#                             (ticket 0059 — pure reader of events.jsonl + gh; --slug / --json;
+#                              v1 catalog: BEHIND / DRAFT_armed / account_suspended / infra_flake_loop)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -15109,6 +15112,622 @@ USAGE
 
 if [ "$CMD" = "overview" ]; then
   overview "$@"
+fi
+
+# --- stuck ----------------------------------------------------------------
+# Ticket 0059. `fleet stuck` walks every discovered slug's open
+# `feat/`/`eng/` PRs and classifies each PR's mergeability against the
+# four-shape cross-LESSONS catalog: BEHIND, DRAFT_armed, account_suspended,
+# infra_flake_loop. One row per stuck PR with the one-line operator
+# action that unblocks it. Healthy in-flight PRs render as a footer.
+#
+# Pure reader: NO events.jsonl writes, NO `fleet_emit_event` calls, NO
+# `lib/common.sh` changes, NO new event types. The classifier IS the
+# moat — every new stuck shape the fleet discovers becomes one new
+# branch in `stuck_classify_one_pr`.
+#
+# Per LESSONS 2026-06-15 the `gh` calls are batched: ONE `gh pr list`
+# per slug + ONE `gh pr view` per candidate PR. The events.jsonl walk
+# for infra_flake_loop is ONE awk pass per slug (NOT per PR). Per
+# LESSONS 2026-06-05 every `stuck_*` helper is defined ABOVE the inline
+# `if [ "$CMD" = "stuck" ]` dispatcher block below.
+
+STUCK_ROOT="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+STUCK_INSTALLED="$HOME/.local/share/agent-fleet/projects"
+
+# stuck_discover_slugs — emit one TSV row per slug `<slug>\t<manifest>\t<repo_url>`
+# in slug-alpha order. Mirrors overview_discover but trimmed for our needs.
+stuck_discover_slugs() {
+  local _seen="" m slug repo_url
+  { find "$STUCK_ROOT"      -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$STUCK_INSTALLED" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( ( source "$m" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    # shellcheck disable=SC1090
+    repo_url=$( ( source "$m" 2>/dev/null; printf -- '%s' "${REPO_URL:-}" ) )
+    printf -- '%s\t%s\t%s\n' "$slug" "$m" "$repo_url"
+  done | sort -t $'\t' -k1,1
+}
+
+# stuck_list_open_prs — ONE `gh pr list` per slug. Echoes one row per open
+# agent PR as `<pr>\t<headRefName>` (sentinel `-` per LESSONS 2026-06-08
+# when headRefName is empty). Echoes the literal string `ERROR\t<msg>` on
+# any gh failure so the caller can map to the "gh failed — skipped"
+# resilience path (AC #7). Echoes nothing when there are zero PRs.
+stuck_list_open_prs() {
+  local repo="$1"
+  [ -n "$repo" ] || return 0
+  command -v gh >/dev/null 2>&1 || { printf -- 'ERROR\tgh not installed\n'; return 0; }
+  local raw err
+  err="$TMP_STUCK_ERR"
+  raw="$(gh pr list \
+            --repo "$repo" \
+            --state open \
+            --base main \
+            --search "head:feat/ head:eng/" \
+            --json number,headRefName \
+            --limit 20 \
+            2>"$err")" || {
+    local msg
+    msg="$(LC_ALL=C tr -d '\n\r\t' <"$err" 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [ -z "$msg" ] && msg="gh pr list failed"
+    printf -- 'ERROR\t%s\n' "$msg"
+    return 0
+  }
+  [ -z "$raw" ] || [ "$raw" = "[]" ] && return 0
+  if command -v node >/dev/null 2>&1; then
+    printf -- '%s' "$raw" | node -e '
+      try {
+        const arr = JSON.parse(require("fs").readFileSync(0, "utf8"));
+        if (!Array.isArray(arr)) process.exit(0);
+        for (const p of arr) {
+          const n = Number(p.number) || 0;
+          if (!n) continue;
+          let h = String(p.headRefName || "-");
+          if (!h) h = "-";
+          process.stdout.write(n + "\t" + h + "\n");
+        }
+      } catch (e) { /* drop */ }
+    '
+  else
+    # sed fallback: pull number + headRefName per object.
+    printf -- '%s' "$raw" \
+      | tr '},' '\n\n' \
+      | awk '
+        BEGIN { count = 0; n = ""; h = "" }
+        /"number"/ {
+          if (match($0, /"number"[[:space:]]*:[[:space:]]*[0-9]+/)) {
+            s = substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", s); n = s
+          }
+        }
+        /"headRefName"/ {
+          if (match($0, /"headRefName"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+            s = substr($0, RSTART, RLENGTH); sub(/.*"headRefName"[[:space:]]*:[[:space:]]*"/, "", s); sub(/".*/, "", s); h = s
+          }
+        }
+        n != "" && h != "" {
+          if (h == "") h = "-"
+          printf("%s\t%s\n", n, h); n = ""; h = ""; count++
+        }
+      '
+  fi
+}
+
+# stuck_view_one_pr — ONE `gh pr view` per candidate PR. Echoes a TSV
+# line `mergeStateStatus\tisDraft\tautoMergePresent\tcreatedAtEpoch\tsuspendedHits\ttotalFailingChecks`.
+# Per LESSONS 2026-06-08 every awk script declares `BEGIN { count = 0 }`.
+# Per LESSONS 2026-06-11 the createdAt epoch is parsed via `date -j -f
+# '%Y-%m-%dT%H:%M:%SZ'` with the FULL format (no missing time fields).
+# Empty echoes when gh fails (caller treats as healthy fallthrough).
+stuck_view_one_pr() {
+  local repo="$1" pr="$2"
+  [ -n "$repo" ] || return 0
+  [ -n "$pr" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local raw
+  raw="$(gh pr view "$pr" \
+           --repo "$repo" \
+           --json mergeStateStatus,isDraft,autoMergeRequest,createdAt,statusCheckRollup \
+           2>/dev/null)" || { return 0; }
+  [ -z "$raw" ] && return 0
+  if command -v node >/dev/null 2>&1; then
+    printf -- '%s' "$raw" | node -e '
+      try {
+        const p = JSON.parse(require("fs").readFileSync(0, "utf8"));
+        const mss = String(p.mergeStateStatus || "").toUpperCase();
+        const isDraft = p.isDraft ? "1" : "0";
+        const amr = (p.autoMergeRequest && typeof p.autoMergeRequest === "object") ? "1" : "0";
+        let createdEpoch = 0;
+        if (p.createdAt) {
+          const t = Date.parse(p.createdAt);
+          if (!isNaN(t)) createdEpoch = Math.floor(t / 1000);
+        }
+        const roll = Array.isArray(p.statusCheckRollup) ? p.statusCheckRollup : [];
+        let suspended = 0, failing = 0;
+        for (const c of roll) {
+          const conc = String(c.conclusion || "").toUpperCase();
+          if (conc === "FAILURE" || conc === "FAILED" || conc === "TIMED_OUT" || conc === "CANCELLED") {
+            failing++;
+            const title = String((c.output && c.output.title) || c.title || c.text || c.summary || "");
+            if (title.indexOf("account is suspended") !== -1) suspended++;
+          }
+        }
+        process.stdout.write([mss, isDraft, amr, createdEpoch, suspended, failing].join("\t"));
+      } catch (e) { /* drop */ }
+    '
+  else
+    # Pure-shell fallback. Extract mergeStateStatus and createdAt only;
+    # treat checks as healthy. The CI runner has node so this branch is
+    # only exercised on a host without node.
+    local mss="" created_iso="" created_epoch=0 is_draft="0" amr_present="0"
+    mss="$(printf -- '%s' "$raw" | sed -nE 's/.*"mergeStateStatus"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)"
+    [ -z "$mss" ] && mss=""
+    created_iso="$(printf -- '%s' "$raw" | sed -nE 's/.*"createdAt"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)"
+    if [ -n "$created_iso" ]; then
+      created_epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$created_iso" +%s 2>/dev/null || echo 0)"
+    fi
+    case "$raw" in
+      *'"isDraft":true'*) is_draft=1 ;;
+    esac
+    case "$raw" in
+      *'"autoMergeRequest":null'*) amr_present=0 ;;
+      *'"autoMergeRequest":{'*)    amr_present=1 ;;
+    esac
+    printf -- '%s\t%s\t%s\t%s\t0\t0' "$mss" "$is_draft" "$amr_present" "$created_epoch"
+  fi
+}
+
+# stuck_check_infra_flake_loop — ONE awk pass over the slug's events.jsonl
+# per LESSONS 2026-06-15. Emits a `pr\trun_id\tpattern` TSV per
+# infra_flake_rerun event found. Caller then resolves the rerun's
+# conclusion via `gh run view <id>` (ONE per matched PR — far less than
+# one per PR or one per check). Per LESSONS 2026-06-08 the awk
+# accumulator declares `BEGIN { count = 0 }`.
+stuck_check_infra_flake_loop() {
+  local events="$1"
+  [ -f "$events" ] || return 0
+  awk '
+    BEGIN { count = 0 }
+    /"type"[[:space:]]*:[[:space:]]*"infra_flake_rerun"/ {
+      pr = ""; run_id = ""; pattern = ""
+      if (match($0, /"pr"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        s = substr($0, RSTART, RLENGTH); sub(/.*"pr"[[:space:]]*:[[:space:]]*"/, "", s); sub(/".*/, "", s); pr = s
+      }
+      if (match($0, /"run_id"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        s = substr($0, RSTART, RLENGTH); sub(/.*"run_id"[[:space:]]*:[[:space:]]*"/, "", s); sub(/".*/, "", s); run_id = s
+      }
+      if (match($0, /"pattern"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        s = substr($0, RSTART, RLENGTH); sub(/.*"pattern"[[:space:]]*:[[:space:]]*"/, "", s); sub(/".*/, "", s); pattern = s
+      }
+      if (pr != "" && run_id != "") {
+        printf("%s\t%s\t%s\n", pr, run_id, (pattern == "" ? "-" : pattern))
+        count++
+      }
+    }
+  ' "$events"
+}
+
+# stuck_run_conclusion — ONE `gh run view <id>`. Echoes the conclusion
+# lowercased (e.g. `failure`, `success`) or empty when gh fails.
+stuck_run_conclusion() {
+  local repo="$1" run_id="$2"
+  [ -n "$repo" ] || return 0
+  [ -n "$run_id" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local raw
+  raw="$(gh run view "$run_id" \
+           --repo "$repo" \
+           --json conclusion,status \
+           2>/dev/null)" || return 0
+  [ -z "$raw" ] && return 0
+  printf -- '%s' "$raw" | sed -nE 's/.*"conclusion"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]'
+}
+
+# stuck_classify_one_pr — pure-shell classifier. Returns ONE of
+# `BEHIND | DRAFT_armed | account_suspended | infra_flake_loop | healthy`.
+# Inputs (positional):
+#   $1 = mergeStateStatus      e.g. BEHIND / BLOCKED / CLEAN
+#   $2 = isDraft               0 or 1
+#   $3 = autoMergePresent      0 or 1
+#   $4 = age_seconds           NOW - createdAt
+#   $5 = suspended_hits        count of failing checks with "account is suspended"
+#   $6 = failing_checks        count of failing checks (total)
+#   $7 = flake_loop_match      "1" if events.jsonl has infra_flake_rerun
+#                              for this PR AND the rerun also failed; else "0"
+# Precedence: BEHIND > account_suspended > infra_flake_loop > DRAFT_armed
+# > healthy. (BEHIND wins because the one-command unblock is exact and
+# does not depend on CI state; the others assume CI has run.)
+stuck_classify_one_pr() {
+  local mss="$1" is_draft="$2" amr_present="$3" age_s="$4"
+  local suspended="$5" failing="$6" flake_match="$7"
+  case "$mss" in
+    BEHIND) printf -- '%s' "BEHIND"; return 0 ;;
+  esac
+  # account_suspended: at least one failing check AND every failing check
+  # carries the suspension substring.
+  if [ "${failing:-0}" -gt 0 ] && [ "${suspended:-0}" -eq "${failing:-0}" ]; then
+    printf -- '%s' "account_suspended"; return 0
+  fi
+  if [ "${flake_match:-0}" = "1" ]; then
+    printf -- '%s' "infra_flake_loop"; return 0
+  fi
+  # DRAFT_armed: isDraft=1, autoMergeRequest absent, age > 1h.
+  if [ "${is_draft:-0}" = "1" ] && [ "${amr_present:-0}" = "0" ] && [ "${age_s:-0}" -gt 3600 ]; then
+    printf -- '%s' "DRAFT_armed"; return 0
+  fi
+  printf -- '%s' "healthy"
+}
+
+# stuck_action_for_cause — per-cause action string. Per LESSONS 2026-05-28
+# every printf of a PR number goes through `printf -- '%s'`.
+stuck_action_for_cause() {
+  local cause="$1" slug="$2" pr="$3"
+  case "$cause" in
+    BEHIND)
+      printf -- 'gh pr update-branch %s' "$pr" ;;
+    DRAFT_armed)
+      printf -- 'gh pr ready %s && gh pr merge %s --auto --squash' "$pr" "$pr" ;;
+    account_suspended)
+      printf -- 'wait — typically clears in 30min' ;;
+    infra_flake_loop)
+      printf -- 'fleet incident %s --since 2h' "$slug" ;;
+    *)
+      printf -- '—' ;;
+  esac
+}
+
+# stuck_detail_for_cause — one-line context per cause (rendered as the
+# indented second line in text mode and the `detail` JSON field).
+stuck_detail_for_cause() {
+  local cause="$1" age_label="$2"
+  case "$cause" in
+    BEHIND)
+      printf -- 'opened %s ago, base advanced — rebase needed' "$age_label" ;;
+    DRAFT_armed)
+      printf -- 'opened %s ago, isDraft:true, autoMergeRequest:null' "$age_label" ;;
+    account_suspended)
+      printf -- 'opened %s ago, every gating check failed with "account is suspended"' "$age_label" ;;
+    infra_flake_loop)
+      printf -- 'opened %s ago, infra_flake_rerun fired and rerun also failed' "$age_label" ;;
+    *)
+      printf -- 'opened %s ago' "$age_label" ;;
+  esac
+}
+
+# stuck_age_label — render an age in human form. `42m`, `3h`, `2d`.
+stuck_age_label() {
+  local age_s="$1"
+  if   [ "${age_s:-0}" -lt 60 ];    then printf -- '%ss' "${age_s:-0}"
+  elif [ "${age_s:-0}" -lt 3600 ];  then printf -- '%dm' "$(( age_s / 60 ))"
+  elif [ "${age_s:-0}" -lt 86400 ]; then printf -- '%dh' "$(( age_s / 3600 ))"
+  else printf -- '%dd' "$(( age_s / 86400 ))"
+  fi
+}
+
+stuck() {
+  shift  # drop the leading "stuck"
+  local want_json=0 slug_filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      --slug)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ] || case "${2:-}" in --*) true ;; *) false ;; esac then
+          echo "stuck: --slug requires a value" >&2
+          exit 2
+        fi
+        slug_filter="$2"; shift 2 ;;
+      --slug=*) slug_filter="${1#--slug=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet stuck — flag every PR sitting on a non-actionable cause.
+
+Usage:
+  fleet stuck                    walk every discovered slug's open agent PRs
+  fleet stuck --slug NAME        restrict the walk to one slug
+  fleet stuck --json             structured emit: { stuck, healthy, errors }
+  fleet stuck --help             this banner
+
+Causes (v1 catalog):
+  BEHIND               mergeStateStatus is BEHIND      → gh pr update-branch <n>
+  DRAFT_armed          isDraft, no auto-merge, >1h     → gh pr ready <n> && gh pr merge <n> --auto --squash
+  account_suspended    every failing check is "account is suspended"
+                                                       → wait — typically clears in 30min
+  infra_flake_loop     infra_flake_rerun fired AND the rerun failed
+                                                       → fleet incident <slug> --since 2h
+
+Pure reader: NO events.jsonl writes, NO `fleet_emit_event` calls, NO
+runtime hot-path changes. One `gh pr list` per slug + one `gh pr view`
+per candidate PR.
+USAGE
+        exit 0 ;;
+      *)
+        echo "stuck: unknown flag '$1'" >&2
+        exit 2 ;;
+    esac
+  done
+
+  # FLEET_STUCK_FAKE_NOW seam (test-only) freezes "now" so the age > 1h
+  # predicate is deterministic. Falls back to FLEET_NOW_OVERRIDE, then
+  # real wall-clock.
+  local now
+  now="${FLEET_STUCK_FAKE_NOW:-${FLEET_NOW_OVERRIDE:-$(date -u +%s)}}"
+
+  # tempfile for child gh stderr capture (used by stuck_list_open_prs).
+  local tmp_dir
+  tmp_dir="$(mktemp -d -t fleet-stuck.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp_dir'" EXIT
+  TMP_STUCK_ERR="$tmp_dir/gh-err.log"
+  export TMP_STUCK_ERR
+
+  # Discover slugs (TSV: slug\tmanifest\trepo_url). Apply --slug filter.
+  local discovered slug_count=0 known=""
+  discovered="$(stuck_discover_slugs)"
+  while IFS=$'\t' read -r d_slug _d_manifest _d_repo; do
+    [ -z "$d_slug" ] && continue
+    if [ -z "$known" ]; then known="$d_slug"; else known="$known $d_slug"; fi
+    slug_count=$(( slug_count + 1 ))
+  done <<< "$discovered"
+
+  if [ -n "$slug_filter" ]; then
+    local found=0 w
+    for w in $known; do
+      [ "$w" = "$slug_filter" ] && found=1
+    done
+    if [ "$found" = "0" ]; then
+      printf -- 'stuck: slug %s not found. discovered slugs: %s\n' \
+        "$slug_filter" "$known" >&2
+      exit 2
+    fi
+  fi
+
+  # Buffers. Each stuck/healthy/error row is a TSV string for cheap join.
+  local stuck_rows=""    # slug\tpr\tcause\taction\tage_s\tage_label\tdetail
+  local healthy_rows=""  # slug\tpr
+  local error_rows=""    # slug\tmessage
+  local n_slugs_scanned=0
+
+  while IFS=$'\t' read -r s_slug _s_manifest s_repo_url; do
+    [ -z "$s_slug" ] && continue
+    [ -n "$slug_filter" ] && [ "$s_slug" != "$slug_filter" ] && continue
+    n_slugs_scanned=$(( n_slugs_scanned + 1 ))
+
+    # Derive owner/repo from REPO_URL (https://github.com/owner/name[.git]).
+    local repo
+    repo="$(printf -- '%s' "$s_repo_url" | sed -E 's#https?://github.com/##; s#\.git$##')"
+
+    # ONE `gh pr list` per slug.
+    local raw_prs first_line
+    raw_prs="$(stuck_list_open_prs "$repo")"
+    first_line="$(printf -- '%s\n' "$raw_prs" | head -1)"
+    case "$first_line" in
+      ERROR*)
+        local msg
+        msg="$(printf -- '%s' "$first_line" | cut -f2-)"
+        [ -z "$msg" ] && msg="gh failed"
+        if [ -n "$error_rows" ]; then error_rows="$error_rows"$'\n'; fi
+        error_rows="${error_rows}${s_slug}"$'\t'"$msg"
+        continue
+        ;;
+    esac
+
+    # Pre-scan the slug's events.jsonl for infra_flake_rerun events.
+    local events="$HOME/.cache/${s_slug}-agent/events.jsonl"
+    local flake_records=""
+    flake_records="$(stuck_check_infra_flake_loop "$events")"
+
+    # Walk each PR (ONE `gh pr view` per candidate).
+    local pr_line
+    while IFS= read -r pr_line; do
+      [ -z "$pr_line" ] && continue
+      local pr_num head_ref
+      pr_num="$(printf -- '%s' "$pr_line" | cut -f1)"
+      head_ref="$(printf -- '%s' "$pr_line" | cut -f2)"
+      [ "$head_ref" = "-" ] && head_ref=""
+      # Defensive filter: only agent branches.
+      case "$head_ref" in
+        feat/*|eng/*|"") : ;;
+        *) continue ;;
+      esac
+
+      local view mss is_draft amr_present created_epoch suspended failing
+      view="$(stuck_view_one_pr "$repo" "$pr_num")"
+      if [ -z "$view" ]; then
+        # gh view failed — treat as healthy (don't fabricate a cause).
+        if [ -n "$healthy_rows" ]; then healthy_rows="$healthy_rows"$'\n'; fi
+        healthy_rows="${healthy_rows}${s_slug}"$'\t'"$pr_num"
+        continue
+      fi
+      mss="$(            printf -- '%s' "$view" | cut -f1)"
+      is_draft="$(       printf -- '%s' "$view" | cut -f2)"
+      amr_present="$(    printf -- '%s' "$view" | cut -f3)"
+      created_epoch="$(  printf -- '%s' "$view" | cut -f4)"
+      suspended="$(      printf -- '%s' "$view" | cut -f5)"
+      failing="$(        printf -- '%s' "$view" | cut -f6)"
+
+      local age_s=0
+      if [ -n "$created_epoch" ] && [ "$created_epoch" -gt 0 ]; then
+        age_s=$(( now - created_epoch ))
+        [ "$age_s" -lt 0 ] && age_s=0
+      fi
+
+      # Determine flake_loop_match: walk flake_records for this PR.
+      local flake_match=0
+      if [ -n "$flake_records" ]; then
+        local fl_pr fl_run _fl_pat
+        while IFS=$'\t' read -r fl_pr fl_run _fl_pat; do
+          [ -z "$fl_pr" ] && continue
+          if [ "$fl_pr" = "$pr_num" ]; then
+            # Check the rerun's conclusion. ONE gh run view per matched PR.
+            local concl
+            concl="$(stuck_run_conclusion "$repo" "$fl_run")"
+            case "$concl" in
+              failure|cancelled|timed_out) flake_match=1 ;;
+            esac
+            [ "$flake_match" = "1" ] && break
+          fi
+        done <<< "$flake_records"
+      fi
+
+      local cause
+      cause="$(stuck_classify_one_pr "$mss" "$is_draft" "$amr_present" "$age_s" "$suspended" "$failing" "$flake_match")"
+
+      if [ "$cause" = "healthy" ]; then
+        if [ -n "$healthy_rows" ]; then healthy_rows="$healthy_rows"$'\n'; fi
+        healthy_rows="${healthy_rows}${s_slug}"$'\t'"$pr_num"
+      else
+        local action age_label detail
+        action="$(stuck_action_for_cause "$cause" "$s_slug" "$pr_num")"
+        age_label="$(stuck_age_label "$age_s")"
+        detail="$(stuck_detail_for_cause "$cause" "$age_label")"
+        if [ -n "$stuck_rows" ]; then stuck_rows="$stuck_rows"$'\n'; fi
+        stuck_rows="${stuck_rows}${s_slug}"$'\t'"$pr_num"$'\t'"$cause"$'\t'"$action"$'\t'"$age_s"$'\t'"$age_label"$'\t'"$detail"
+      fi
+    done <<< "$raw_prs"
+  done <<< "$discovered"
+
+  # ---- render ----
+  if [ "$want_json" = "1" ]; then
+    stuck_render_json "$stuck_rows" "$healthy_rows" "$error_rows" "$now"
+    exit 0
+  fi
+  stuck_render_text "$stuck_rows" "$healthy_rows" "$error_rows" "$now" "$n_slugs_scanned"
+  exit 0
+}
+
+# stuck_render_text — human renderer. Per LESSONS 2026-05-28 every printf
+# of a slug name or PR number goes through `printf -- '%s'`.
+stuck_render_text() {
+  local stuck_rows="$1" healthy_rows="$2" error_rows="$3" now="$4" n_slugs="$5"
+  local n_stuck=0 n_slug_set=""
+  if [ -n "$stuck_rows" ]; then
+    n_stuck="$(printf -- '%s\n' "$stuck_rows" | awk 'BEGIN { count = 0 } NF > 0 { count++ } END { print count + 0 }')"
+    n_slug_set="$(printf -- '%s\n' "$stuck_rows" | awk -F'\t' 'BEGIN { count = 0 } NF > 0 { s[$1] = 1; count++ } END { n = 0; for (k in s) n++; print n + 0 }')"
+  fi
+  [ -z "$n_slug_set" ] && n_slug_set=0
+  local now_iso
+  now_iso="$(date -u -r "$now" +%FT%TZ 2>/dev/null || date -u -d "@$now" +%FT%TZ)"
+  printf -- 'stuck — %d PRs across %d slugs, scanned at %s\n' \
+    "$n_stuck" "$n_slug_set" "$now_iso"
+  printf '\n'
+
+  # Per-row.
+  if [ -n "$stuck_rows" ]; then
+    local row s_slug s_pr s_cause s_action _s_age _s_age_label s_detail
+    while IFS=$'\t' read -r s_slug s_pr s_cause s_action _s_age _s_age_label s_detail; do
+      [ -z "$s_slug" ] && continue
+      printf -- '  %-18s PR #%-5s %-20s %s\n' "$s_slug" "$s_pr" "$s_cause" "$s_action"
+      printf -- '              %s\n' "$s_detail"
+    done <<< "$stuck_rows"
+    printf '\n'
+  fi
+
+  # Errors.
+  if [ -n "$error_rows" ]; then
+    local er_slug er_msg
+    while IFS=$'\t' read -r er_slug er_msg; do
+      [ -z "$er_slug" ] && continue
+      printf -- '  %s: gh failed — skipped (%s)\n' "$er_slug" "$er_msg"
+    done <<< "$error_rows"
+    printf '\n'
+  fi
+
+  # Healthy footer.
+  local healthy_label=""
+  if [ -n "$healthy_rows" ]; then
+    local h_slug h_pr
+    while IFS=$'\t' read -r h_slug h_pr; do
+      [ -z "$h_slug" ] && continue
+      if [ -z "$healthy_label" ]; then
+        healthy_label="${h_slug} #${h_pr}"
+      else
+        healthy_label="${healthy_label}, ${h_slug} #${h_pr}"
+      fi
+    done <<< "$healthy_rows"
+  fi
+  if [ -n "$healthy_label" ]; then
+    printf -- '  healthy in-flight (NOT stuck): %s\n' "$healthy_label"
+  else
+    printf -- '  healthy in-flight (NOT stuck): —\n'
+  fi
+}
+
+# stuck_render_json — JSON renderer. Per LESSONS 2026-06-03 every escape
+# goes through `preflight_json_escape` directly (NO `*_json_escape`
+# wrapper per LESSONS 2026-06-13). Per LESSONS 2026-06-05 the helper
+# lives ABOVE this dispatcher block so the inline `if [ "$CMD" = "stuck"
+# ]` dispatch can reach it.
+stuck_render_json() {
+  local stuck_rows="$1" healthy_rows="$2" error_rows="$3" now="$4"
+  local now_iso
+  now_iso="$(date -u -r "$now" +%FT%TZ 2>/dev/null || date -u -d "@$now" +%FT%TZ)"
+  local out="" first=1
+  out+='{"scanned_at":"'
+  out+="$(preflight_json_escape "$now_iso")"
+  out+='","stuck":['
+  if [ -n "$stuck_rows" ]; then
+    local row s_slug s_pr s_cause s_action s_age_s s_age_label s_detail
+    while IFS=$'\t' read -r s_slug s_pr s_cause s_action s_age_s s_age_label s_detail; do
+      [ -z "$s_slug" ] && continue
+      local age_hours
+      age_hours="$(awk -v s="$s_age_s" 'BEGIN { printf("%.2f", (s + 0) / 3600.0) }')"
+      if [ "$first" = "1" ]; then first=0; else out+=','; fi
+      out+='{"slug":"'
+      out+="$(preflight_json_escape "$s_slug")"
+      out+='","pr":'
+      out+="${s_pr:-0}"
+      out+=',"cause":"'
+      out+="$(preflight_json_escape "$s_cause")"
+      out+='","action":"'
+      out+="$(preflight_json_escape "$s_action")"
+      out+='","age_hours":'
+      out+="$age_hours"
+      out+=',"age_label":"'
+      out+="$(preflight_json_escape "$s_age_label")"
+      out+='","detail":"'
+      out+="$(preflight_json_escape "$s_detail")"
+      out+='"}'
+    done <<< "$stuck_rows"
+  fi
+  out+='],"healthy":['
+  first=1
+  if [ -n "$healthy_rows" ]; then
+    local h_slug h_pr
+    while IFS=$'\t' read -r h_slug h_pr; do
+      [ -z "$h_slug" ] && continue
+      if [ "$first" = "1" ]; then first=0; else out+=','; fi
+      out+='{"slug":"'
+      out+="$(preflight_json_escape "$h_slug")"
+      out+='","pr":'
+      out+="${h_pr:-0}"
+      out+='}'
+    done <<< "$healthy_rows"
+  fi
+  out+='],"errors":['
+  first=1
+  if [ -n "$error_rows" ]; then
+    local er_slug er_msg
+    while IFS=$'\t' read -r er_slug er_msg; do
+      [ -z "$er_slug" ] && continue
+      if [ "$first" = "1" ]; then first=0; else out+=','; fi
+      out+='{"slug":"'
+      out+="$(preflight_json_escape "$er_slug")"
+      out+='","error":"'
+      out+="$(preflight_json_escape "$er_msg")"
+      out+='"}'
+    done <<< "$error_rows"
+  fi
+  out+=']}'
+  printf -- '%s\n' "$out"
+}
+
+if [ "$CMD" = "stuck" ]; then
+  stuck "$@"
 fi
 
 # --- atlas ----------------------------------------------------------------
