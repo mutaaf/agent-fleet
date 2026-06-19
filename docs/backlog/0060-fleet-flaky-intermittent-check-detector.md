@@ -1,7 +1,7 @@
 ---
 id: 0060
 title: fleet flaky surfaces CI checks that have failed-then-passed without a code change so the kit stops mis-attributing infra noise to ticket regressions
-status: in-progress
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-19
