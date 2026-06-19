@@ -486,6 +486,27 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet trends sidebrew                                       # render 12-week sparklines for PRs / cost / send-backs (ticket 0058 — pure reader of events.jsonl + runs.jsonl; --all / --axis prs|cost|sendbacks / --weeks 4..52 / --json; advisory footer fires only when PR-velocity ↓ AND send-back rate ↑ for ≥3 consecutive weeks)
 ~/code/agent-fleet/bin/fleet stuck                                                 # flag every PR on a non-actionable cause and emit the one-command unblock (ticket 0059 — pure reader of events.jsonl + `gh pr list` + `gh pr view`; --slug NAME / --json; v1 catalog BEHIND → `gh pr update-branch`, DRAFT_armed → `gh pr ready && gh pr merge --auto`, account_suspended → wait, infra_flake_loop → `fleet incident`; one `gh pr list` per slug + one `gh pr view` per candidate PR)
 ~/code/agent-fleet/bin/fleet flaky --since 30d                                     # rank CI check NAMES that have failed-then-passed without a code change (ticket 0060 — pure reader of events.jsonl + `gh run list` + `gh run view`; --since 1d..90d default 30d / --slug NAME / --json; classifies each (headSha,workflow,check) group as flake vs regression; cross-references lib/heal-catalog.sh + infra_flake_rerun events to suggest catalog entries; one `gh run list` per slug + one `gh run view` per candidate run)
+~/code/agent-fleet/bin/fleet invoice sidebrew --month 2026-05                      # monthly billing-style ROI receipt for one slug or the fleet (ticket 0061 — pure reader of events.jsonl + runs.jsonl; --all / --month YYYY-MM / --ytd / --redact / --json; verdict line classifies net_positive | break_even | net_negative vs Cursor Pro ($20/mo) and contractor ($80/h) alternatives; "this month vs last month" delta line; MANUAL_PR_MINUTES + CONTRACTOR_USD_PER_HOUR manifest knobs documented below)
+```
+
+**Invoice manifest knobs (ticket 0061).** `fleet invoice <slug>` is a pure
+reader of `events.jsonl` + `runs.jsonl` that composes a monthly billing-
+style ROI receipt. Two optional knobs in the project's `agents.config.sh`
+tune the alternative-cost model:
+- `MANUAL_PR_MINUTES` (default `75`) — minutes a careful human would spend
+  writing the same diff including tests. The "human-equivalent hours
+  displaced" line is `PRs_merged × MANUAL_PR_MINUTES / 60`.
+- `CONTRACTOR_USD_PER_HOUR` (default `80`) — the contractor alternative
+  rate. The "Contractor alt" line is `displaced_hours ×
+  CONTRACTOR_USD_PER_HOUR`. The "Cursor Pro alt" line is fixed at
+  `$20/seat/month`.
+
+Manifests that omit both knobs render the default-weighted invoice — no
+breaking change. Override either knob inline:
+```bash
+# in agents.config.sh
+MANUAL_PR_MINUTES="120"        # team's experience suggests 2h per PR
+CONTRACTOR_USD_PER_HOUR="120"  # local senior contractor rate
 ```
 
 **Dry-run mode (ticket 0010).** Setting `AGENT_DRY_RUN=1` flips

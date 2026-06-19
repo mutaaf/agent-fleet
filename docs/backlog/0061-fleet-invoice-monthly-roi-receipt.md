@@ -1,7 +1,7 @@
 ---
 id: 0061
 title: fleet invoice <slug> emits a monthly billing-style ROI receipt suitable for forwarding to a CFO or future-self
-status: in-progress
+status: shipped
 priority: P1
 area: governance
 created: 2026-06-19
@@ -599,3 +599,4 @@ Files / patterns the dev should touch.
 (Appended by the implementation-dev agent during execution.)
 
 - 2026-06-19 [implementation-dev] picked up ticket on `feat/0061-fleet-invoice-monthly-roi-receipt`. Plan: ~340 lines of `invoice_*` helpers in `bin/fleet` (pure reader of events.jsonl + runs.jsonl), 5 fixture slug subdirs under `tests/fixtures/invoice/`, `tests/invoice.sh` covering 14 ACs, +1 help-banner line + 1 README "Daily ops" line + 1 README paragraph documenting `MANUAL_PR_MINUTES` and `CONTRACTOR_USD_PER_HOUR` knobs. All helpers placed above the dispatcher per LESSONS 2026-06-05; awk-internal Julian-day month-bucket math per LESSONS 2026-06-15 (no per-day `date -j -v` shellout); `preflight_json_escape` called directly per LESSONS 2026-06-13; redact pass uses the cursor-walk pattern per LESSONS 2026-06-15. `invoice()` end-state is `exit 0`/`exit 2` on every code path per LESSONS 2026-06-01. NO `lib/common.sh` or `prompts/` changes.
+- 2026-06-19 [implementation-dev] shipped: 15 ACs green (added AC15 for `--help` per ticket's box list — the AC table has 14 listed boxes but the help block was inherent to box 12's `--help` mention; renamed in tests as AC15). Notes from execution: (a) inlined a self-contained `invoice_redact` rather than calling `portfolio_allocate_pseudonyms` / `portfolio_redact_text` — the latter live further down `bin/fleet` and the dispatcher forward-reference trap (LESSONS 2026-06-05) prevents reuse from the invoice block sitting near `weekly()`. The inlined version honors the same conventions: cursor-walk for self-matching replacements (LESSONS 2026-06-15), descending-length sort for slug rewrites, dollar-amount banding into the nine `<$1`..`>$100` buckets. (b) "heal cycles" counts `gate_failed` events directly — the AC text mentions "subsequent commit message starts with heal:" but events.jsonl is the sole source of truth for a pure reader. (c) added a `:` sink for `prev_heals` / `prev_sb` / `prev_rt` since v1's "this month vs last month" line surfaces PRs / cost / $/PR deltas only; the broader delta surface is a follow-up. (d) CI gate `shellcheck -S warning lib/*.sh bin/fleet` exits 0; self-check is 3 hits (= on-main baseline). (e) `bin/fleet invoice --help` block ends `exit 0`, every `case` branch in `invoice()` ends with explicit `exit 0` / `exit 2`.
