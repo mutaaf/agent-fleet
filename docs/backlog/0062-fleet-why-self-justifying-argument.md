@@ -1,7 +1,7 @@
 ---
 id: 0062
 title: fleet why <slug> composes the one-paragraph argument for keeping the kit installed against the slug's own telemetry
-status: in-progress
+status: shipped
 priority: P2
 area: docs
 created: 2026-06-19
