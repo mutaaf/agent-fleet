@@ -1,7 +1,7 @@
 ---
 id: 0062
 title: fleet why <slug> composes the one-paragraph argument for keeping the kit installed against the slug's own telemetry
-status: groomed
+status: shipped
 priority: P2
 area: docs
 created: 2026-06-19
@@ -599,3 +599,17 @@ Files / patterns the dev should touch.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+### 2026-06-19 — implementation-dev
+
+Branch `feat/0062-fleet-why`. Tests-first per the ticket; eight
+`why_*` helpers above the `why()` dispatcher per LESSONS 2026-06-05.
+Manifest knobs `MANUAL_PR_MINUTES` (default 75) and
+`CONTRACTOR_USD_PER_HOUR` (default 80) reused from 0061. Citations
+walker: ONE awk pass per slug over `events.jsonl` + ONE pass over
+`runs.jsonl` + ONE grep of cross-LESSONS for the slug section. Prose
+composer uses the CURSOR-based walk pattern per LESSONS 2026-06-15.
+JSON escape via `preflight_json_escape` direct call per LESSONS
+2026-06-13 (no wrapper). Local var names in `why()` body are
+`why_*`-prefixed to avoid the LESSONS 2026-06-19 self-check false
+positive. No edits to `lib/common.sh`, `prompts/`, or `AGENTS.md`.

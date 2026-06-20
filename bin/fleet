@@ -110,6 +110,9 @@
 #                             (ticket 0061 — pure reader of events.jsonl + runs.jsonl; --all / --month YYYY-MM /
 #                              --ytd / --redact / --json; verdict net_positive | break_even | net_negative;
 #                              MANUAL_PR_MINUTES + CONTRACTOR_USD_PER_HOUR manifest knobs with defaults)
+#   fleet why <slug>          compose the case for keeping the kit installed against the slug's own telemetry
+#                             (ticket 0062 — pure reader of events.jsonl + runs.jsonl + CROSS_LESSONS.md;
+#                              --all / --audience peer|manager|self / --why-not / --json; trailing 8-week window)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -12354,6 +12357,645 @@ USAGE
 
 if [ "$CMD" = "share" ]; then
   share "$@"
+fi
+
+# --- why (ticket 0062) ----------------------------------------------------
+# `fleet why <slug | --all>` composes the one-paragraph argument for keeping
+# the kit installed against the slug's own telemetry. Pure consumer of
+# events.jsonl + runs.jsonl + the cross-LESSONS file — emits NO new event
+# types, no writes, no `lib/common.sh` / `prompts/` changes (P-6).
+#
+# Citations are derived from a single trailing-8-week window anchored at
+# `${FLEET_NOW_OVERRIDE:-$(date -u +%s)} - 8 * 7 * 86400` (LESSONS 2026-06-11
+# avoids `date -j -f` filling missing time fields). The per-slug walk is ONE
+# awk pass over events.jsonl + ONE awk pass over runs.jsonl + ONE awk pass
+# over the cross-LESSONS file (LESSONS 2026-06-15 keeps `--all` from
+# becoming O(window × N_slugs)).
+#
+# Prose composition uses a CURSOR-based template walk (LESSONS 2026-06-15)
+# because citation values may contain `$<digit>` substrings (e.g. the
+# contractor alt of "$1200" embeds "$1" / "$2") that would re-match a naive
+# `while (match(s, /\$\{[A-Z_]+\}/)) { s = before repl after }` shape and
+# infinite-loop. The walk only ever scans the not-yet-rewritten tail.
+#
+# JSON escape via `preflight_json_escape` called DIRECTLY (LESSONS
+# 2026-06-13 — no `why_json_escape` wrapper, which would trip self-check's
+# `_json_escape` sign-extension pattern as a false positive).
+#
+# All eight `why_*` helpers are defined ABOVE the `why()` dispatcher
+# (LESSONS 2026-06-05 — dispatcher fires at execution time, so anything
+# defined later in the file is not yet a known function).
+#
+# `local <name>` variables inside `why()` use `why_*` prefixes to avoid the
+# LESSONS 2026-06-19 self-check false positive (a local var named after a
+# sibling subcommand function like `rank` / `streak` / `diff` trips
+# `self_check_ax_dispatcher_forward_reference`).
+
+# why_discover_slugs — emit one slug per line, alphabetically sorted.
+# Wraps the same union pattern as invoice_discover_slugs (ticket 0061).
+# Manifest reads happen INSIDE `( … )` (LESSONS 2026-06-05 export-in-
+# subshell trap) so the caller env stays clean.
+why_discover_slugs() {
+  local why_root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local why_root_b="$HOME/.local/share/agent-fleet/projects"
+  local why_seen="" m slug
+  { find "$why_root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$why_root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( ( source "$m" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )
+    [ -z "$slug" ] && continue
+    case " $why_seen " in *" $slug "*) continue ;; esac
+    why_seen="$why_seen $slug"
+    printf -- '%s\n' "$slug"
+  done | LC_ALL=C sort
+}
+
+# why_resolve_manifest — echo the manifest path for a slug, empty when not
+# found.
+why_resolve_manifest() {  # $1 = slug
+  local why_want="$1"
+  local why_root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local why_root_b="$HOME/.local/share/agent-fleet/projects"
+  local m slug
+  { find "$why_root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null
+    find "$why_root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( ( source "$m" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )
+    if [ "$slug" = "$why_want" ]; then
+      printf -- '%s' "$m"
+      return 0
+    fi
+  done
+}
+
+# why_read_knobs — read MANUAL_PR_MINUTES and CONTRACTOR_USD_PER_HOUR
+# from a slug's manifest. Echoes a TSV record `<minutes>\t<rate>`.
+# Defaults: 75 / 80 (mirrors invoice_read_manifest_knobs from ticket 0061).
+# Per LESSONS 2026-06-05 the source happens in `( … )` so the export does
+# NOT leak.
+why_read_knobs() {  # $1 = slug
+  local why_manifest m_val r_val
+  why_manifest="$(why_resolve_manifest "$1")"
+  if [ -z "$why_manifest" ] || [ ! -f "$why_manifest" ]; then
+    printf -- '75\t80\n'
+    return 0
+  fi
+  # shellcheck disable=SC1090
+  m_val="$( ( source "$why_manifest" 2>/dev/null; printf -- '%s' "${MANUAL_PR_MINUTES:-}" ) )"
+  # shellcheck disable=SC1090
+  r_val="$( ( source "$why_manifest" 2>/dev/null; printf -- '%s' "${CONTRACTOR_USD_PER_HOUR:-}" ) )"
+  case "$m_val" in ''|*[!0-9]*) m_val=75 ;; esac
+  case "$r_val" in ''|*[!0-9]*) r_val=80 ;; esac
+  printf -- '%s\t%s\n' "$m_val" "$r_val"
+}
+
+# why_walk_citations — ONE awk pass per slug over events.jsonl AND ONE
+# awk pass over runs.jsonl, building the citations map.
+# Emits a single TSV record:
+#   prs_merged\tcost_per_pr_median\tstuck_recoveries\tlessons_promoted\tprompts_pinned
+# Per LESSONS 2026-06-08 BEGIN block declares all counters = 0. Per
+# LESSONS 2026-06-15 bucket math is pure awk arithmetic — no per-day
+# `date -j -v` shellout. Empty middle TSV columns use the `-` sentinel
+# (LESSONS 2026-06-08) although every column here is always populated.
+why_walk_citations() {  # $1=events $2=runs $3=cutoff_epoch
+  local why_events="$1" why_runs="$2" why_cutoff="$3"
+  local why_prs=0 why_stuck=0 why_lessons=0 why_pinned=0
+  if [ -f "$why_events" ]; then
+    local why_ev_tsv
+    why_ev_tsv="$(awk -v cutoff="$why_cutoff" '
+      BEGIN { count = 0; prs = 0; stuck = 0; lessons = 0; pinned = 0;
+              flake_pr[""] = ""; delete flake_pr }
+      function iso2ep(ts,   y, mo, d, h, mi, s, a, y2, m2, jdn) {
+        sub(/\.[0-9]+Z$/, "Z", ts)
+        sub(/Z$/, "", ts)
+        if (length(ts) < 19) return 0
+        y  = substr(ts, 1, 4) + 0
+        mo = substr(ts, 6, 2) + 0
+        d  = substr(ts, 9, 2) + 0
+        h  = substr(ts, 12, 2) + 0
+        mi = substr(ts, 15, 2) + 0
+        s  = substr(ts, 18, 2) + 0
+        if (y < 1970) return 0
+        a = int((14 - mo) / 12)
+        y2 = y + 4800 - a
+        m2 = mo + 12 * a - 3
+        jdn = d + int((153 * m2 + 2) / 5) + 365 * y2 + \
+              int(y2 / 4) - int(y2 / 100) + int(y2 / 400) - 32045
+        return (jdn - 2440588) * 86400 + h * 3600 + mi * 60 + s
+      }
+      function field(line, key,   m, s) {
+        if (match(line, "\"" key "\"[[:space:]]*:[[:space:]]*\"[^\"]*\"")) {
+          s = substr(line, RSTART, RLENGTH)
+          sub(".*\"" key "\"[[:space:]]*:[[:space:]]*\"", "", s)
+          sub(/".*/, "", s)
+          return s
+        }
+        return ""
+      }
+      {
+        ts = field($0, "ts")
+        type = field($0, "type")
+        if (ts == "" || type == "") next
+        ep = iso2ep(ts)
+        if (ep <= 0 || ep < cutoff) next
+        if (type == "pr_footer_posted") { prs++; count++ }
+        else if (type == "infra_flake_rerun") {
+          pr = field($0, "pr")
+          if (pr != "") flake_pr[pr] = 1
+        }
+        else if (type == "run_completed") {
+          exit_field = field($0, "exit")
+          pr = field($0, "pr")
+          if (pr != "" && exit_field == "0" && (pr in flake_pr)) {
+            stuck++
+            delete flake_pr[pr]
+          }
+        }
+        else if (type == "lesson_promoted") {
+          scope = field($0, "scope")
+          if (scope == "all") lessons++
+        }
+        else if (type == "prompts_pin_changed") {
+          pinned++
+        }
+      }
+      END {
+        printf("%d\t%d\t%d\t%d\n", prs + 0, stuck + 0, lessons + 0, pinned + 0)
+      }
+    ' "$why_events")"
+    if [ -n "$why_ev_tsv" ]; then
+      IFS=$'\t' read -r why_prs why_stuck why_lessons why_pinned <<< "$why_ev_tsv"
+    fi
+  fi
+  # Cost: median across runs.jsonl in window. Pure awk sort.
+  local why_median="0.00"
+  if [ -f "$why_runs" ]; then
+    why_median="$(awk -v cutoff="$why_cutoff" '
+      BEGIN { count = 0 }
+      function iso2ep(ts,   y, mo, d, h, mi, s, a, y2, m2, jdn) {
+        sub(/\.[0-9]+Z$/, "Z", ts)
+        sub(/Z$/, "", ts)
+        if (length(ts) < 19) return 0
+        y  = substr(ts, 1, 4) + 0
+        mo = substr(ts, 6, 2) + 0
+        d  = substr(ts, 9, 2) + 0
+        h  = substr(ts, 12, 2) + 0
+        s  = substr(ts, 18, 2) + 0
+        mi = substr(ts, 15, 2) + 0
+        if (y < 1970) return 0
+        a = int((14 - mo) / 12)
+        y2 = y + 4800 - a
+        m2 = mo + 12 * a - 3
+        jdn = d + int((153 * m2 + 2) / 5) + 365 * y2 + \
+              int(y2 / 4) - int(y2 / 100) + int(y2 / 400) - 32045
+        return (jdn - 2440588) * 86400 + h * 3600 + mi * 60 + s
+      }
+      {
+        ts = ""
+        if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts)
+          sub(/".*/, "", ts)
+        }
+        if (ts == "") next
+        ep = iso2ep(ts)
+        if (ep <= 0 || ep < cutoff) next
+        c = 0
+        if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+          cs2 = substr($0, RSTART, RLENGTH)
+          sub(/.*:[[:space:]]*/, "", cs2)
+          c = cs2 + 0
+        }
+        costs[count] = c
+        count++
+      }
+      END {
+        if (count == 0) { printf("0.00"); exit }
+        # Simple insertion sort (counts are small).
+        for (i = 1; i < count; i++) {
+          v = costs[i]; j = i - 1
+          while (j >= 0 && costs[j] > v) { costs[j+1] = costs[j]; j-- }
+          costs[j+1] = v
+        }
+        if (count % 2 == 1) printf("%.2f", costs[int(count/2)])
+        else                printf("%.2f", (costs[count/2 - 1] + costs[count/2]) / 2.0)
+      }
+    ' "$why_runs")"
+  fi
+  printf -- '%d\t%s\t%d\t%d\t%d\n' \
+    "$why_prs" "$why_median" "$why_stuck" "$why_lessons" "$why_pinned"
+}
+
+# why_read_cross_lessons — count the slug's promoted entries in the
+# cross-LESSONS file. Per LESSONS 2026-06-01 the count is read through
+# `awk … END { print n+0 }` (not `grep -c file || echo 0`) so the result
+# is always exactly one integer line. Echoes:
+#   `<count>`                 when the file exists (count may be 0)
+#   `MISSING`                 when the file is absent (caller surfaces the
+#                              "file not yet created" placeholder)
+why_read_cross_lessons() {  # $1 = slug, $2 = cross-lessons path
+  local why_slug="$1" why_file="$2"
+  if [ -z "$why_file" ] || [ ! -f "$why_file" ]; then
+    printf -- 'MISSING'
+    return 0
+  fi
+  awk -v want="$why_slug" '
+    BEGIN { count = 0; under = 0 }
+    /^## / {
+      section = $0
+      sub(/^## [[:space:]]*/, "", section)
+      under = (section == want) ? 1 : 0
+      next
+    }
+    under && /^### / { count++ }
+    END { print count + 0 }
+  ' "$why_file"
+}
+
+# why_compute_verdict — pure-shell classifier. Given the kit cost and
+# the two alternatives, echoes `keep` or `consider_removing` per the
+# 0061-aligned threshold:
+#   kit_cost > 1.1 × min(cursor_alt, contractor_alt) → consider_removing
+#   otherwise                                        → keep
+# The `consider_removing` verdict ALSO fires when the slug has zero PRs
+# in the window (kit produced nothing, no defensible argument).
+why_compute_verdict() {  # $1=kit_cost $2=cursor_alt $3=contractor_alt $4=prs_merged
+  awk -v kc="$1" -v ca="$2" -v co="$3" -v prs="$4" '
+    BEGIN {
+      k = kc + 0
+      a = ca + 0
+      b = co + 0
+      m = (a < b) ? a : b
+      if ((prs + 0) <= 0) { print "consider_removing"; exit }
+      if (m <= 0)         { print (k <= 0) ? "keep" : "consider_removing"; exit }
+      if (k > m * 1.1)    { print "consider_removing"; exit }
+      print "keep"
+    }
+  '
+}
+
+# why_compose_paragraph — template substitution using the CURSOR-based
+# walk pattern (LESSONS 2026-06-15). Three audience templates — peer,
+# manager, self — share the same citations but differ in wording. Every
+# `${TOKEN}` is replaced by the corresponding citation value from the
+# args.
+#
+# Args: $1=audience, $2=slug, $3=weeks, $4=prs, $5=cost_per_pr,
+#       $6=stuck, $7=lessons_count, $8=pinned, $9=cursor_alt,
+#       $10=contractor_alt, $11=cross_lessons_branch
+# where cross_lessons_branch is one of:
+#   "present:N"   N siblings benefit from this slug's promoted lessons
+#   "missing"     CROSS_LESSONS.md not yet created
+why_compose_paragraph() {  # see args above
+  local why_aud="$1" why_slug="$2" why_weeks="$3" why_prs="$4"
+  local why_cost="$5" why_stuck="$6" why_lessons="$7" why_pinned="$8"
+  local why_cursor="$9" why_contractor="${10}" why_cross="${11}"
+  local why_template
+  case "$why_aud" in
+    manager)
+      why_template='Over ${WEEKS} weeks ${SLUG} delivered ${PRS} shipped features at ~$${COST} each. The kit handled ${STUCK} stuck-PR recoveries on its own. The same window produced ${LESSONS} cross-fleet LESSONS and ${PINNED} pinned prompt revisions. Cursor alt $${CURSOR}, contractor alt $${CONTRACTOR}.'
+      ;;
+    self)
+      why_template='${PRS} PRs this window at ~$${COST} each; ${STUCK} stuck recoveries; ${LESSONS} LESSONS shared; ${PINNED} prompts pinned. Cursor alt $${CURSOR}, contractor alt $${CONTRACTOR}. Keep going.'
+      ;;
+    *)
+      why_template='Over ${WEEKS} weeks ${SLUG} shipped ${PRS} PRs at ~$${COST} each. The loop handled ${STUCK} stuck-PR recoveries you did not touch. Across the same window the kit promoted ${LESSONS} cross-fleet LESSONS and pinned ${PINNED} prompt revisions. Cursor would have cost $${CURSOR}, contractor $${CONTRACTOR}.'
+      ;;
+  esac
+  # Cursor-based walk substitution (LESSONS 2026-06-15). Citation
+  # values can contain `$<digit>` substrings (e.g. contractor=1200 →
+  # "$1200" — embeds "$1" / "$2"); a recursive `s = before repl after`
+  # shape over `/\$\{[A-Z_]+\}/` would re-fold the replacement back
+  # into the regex's search window and never terminate. The cursor
+  # walk only scans the not-yet-rewritten tail.
+  awk -v tpl="$why_template" \
+      -v sslug="$why_slug" -v sweeks="$why_weeks" -v sprs="$why_prs" \
+      -v scost="$why_cost" -v sstuck="$why_stuck" -v slessons="$why_lessons" \
+      -v spinned="$why_pinned" -v scursor="$why_cursor" \
+      -v scontractor="$why_contractor" '
+    BEGIN {
+      count = 0
+      map["SLUG"]       = sslug
+      map["WEEKS"]      = sweeks
+      map["PRS"]        = sprs
+      map["COST"]       = scost
+      map["STUCK"]      = sstuck
+      map["LESSONS"]    = slessons
+      map["PINNED"]     = spinned
+      map["CURSOR"]     = scursor
+      map["CONTRACTOR"] = scontractor
+      s = tpl
+      out = ""; rest = s
+      while (match(rest, /\$\{[A-Z_]+\}/)) {
+        token = substr(rest, RSTART + 2, RLENGTH - 3)
+        repl = (token in map) ? map[token] : ""
+        out = out substr(rest, 1, RSTART - 1) repl
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      printf("%s%s", out, rest)
+    }
+  '
+  # Append the cross-LESSONS sentence (always at least one citation
+  # number so AC#2's "every sentence carries a number" holds).
+  case "$why_cross" in
+    present:*)
+      local why_sibs="${why_cross#present:}"
+      case "$why_aud" in
+        self)    printf -- ' Siblings: %s.' "$why_sibs" ;;
+        manager) printf -- ' Memory defuses the trap in %s sibling project(s).' "$why_sibs" ;;
+        *)       printf -- ' Memory defuses the trap in %s sibling project(s).' "$why_sibs" ;;
+      esac
+      ;;
+    missing)
+      printf -- ' Cross-project memory: file not yet created — run `fleet lessons-promote` to seed (0 siblings benefit today).'
+      ;;
+  esac
+  printf -- '\n'
+}
+
+# why_compose_why_not — inverted prose for the `--why-not` path. When
+# the verdict is `consider_removing`, compose the GENUINE against-case.
+# When the verdict is `keep`, compose the HONEST-tooling case (positive
+# argument with a leading "against expectation" marker).
+why_compose_why_not() {  # $1=audience, $2=slug, $3=weeks, $4=prs,
+                         # $5=cost, $6=stuck, $7=lessons, $8=pinned,
+                         # $9=cursor, $10=contractor, $11=cross,
+                         # $12=verdict
+  local why_aud="$1" why_slug="$2" why_weeks="$3" why_prs="$4"
+  local why_cost="$5" why_stuck="$6" why_lessons="$7" why_pinned="$8"
+  local why_cursor="$9" why_contractor="${10}" why_cross="${11}"
+  local why_verdict="${12}"
+  if [ "$why_verdict" = "consider_removing" ]; then
+    # Genuine against case.
+    printf -- 'Over the last %s weeks %s shipped only %s PRs — too few to justify the %s kit at $%s/PR median cost. The Cursor Pro alternative at $%s and the contractor alternative at $%s both undercut the kit on this slug, and only %s LESSONS have been promoted to the cross-fleet feed. Consider removing the kit for this slug and revisiting in 4 weeks.\n' \
+      "$why_weeks" "$why_slug" "$why_prs" "$why_stuck" "$why_cost" \
+      "$why_cursor" "$why_contractor" "$why_lessons"
+  else
+    # Honest-tooling case: marker + positive argument.
+    printf -- 'against expectation, %s'"'"'s telemetry does NOT support removing the kit: ' "$why_slug"
+    why_compose_paragraph "$why_aud" "$why_slug" "$why_weeks" "$why_prs" \
+      "$why_cost" "$why_stuck" "$why_lessons" "$why_pinned" \
+      "$why_cursor" "$why_contractor" "$why_cross"
+  fi
+}
+
+# why_render_text — text formatter for one slug. Per LESSONS 2026-05-28
+# every printf of a slug name goes through `printf -- '%s'`.
+why_render_text() {  # $1=slug, $2=weeks, $3=paragraph, $4=prs, $5=stuck,
+                     # $6=lessons, $7=pinned
+  local why_slug="$1" why_weeks="$2" why_para="$3"
+  local why_prs="$4" why_stuck="$5" why_lessons="$6" why_pinned="$7"
+  printf -- 'why %s runs agent-fleet — drawn from %s weeks of telemetry\n\n' "$why_slug" "$why_weeks"
+  printf -- '  %s\n\n' "$why_para"
+  printf -- '  cites: %sx pr_footer_posted, %sx stuck-PR unblock, %sx lesson_promoted, %sx prompts_pin_changed.\n' \
+    "$why_prs" "$why_stuck" "$why_lessons" "$why_pinned"
+}
+
+# why_render_json — JSON formatter. JSON escape via `preflight_json_escape`
+# called DIRECTLY per LESSONS 2026-06-13 (no `why_json_escape` wrapper).
+why_render_json() {  # $1=slug, $2=audience, $3=verdict, $4=paragraph,
+                     # $5=prs, $6=cost_per_pr, $7=stuck, $8=lessons,
+                     # $9=pinned, $10=cursor, $11=contractor
+  local why_slug="$1" why_aud="$2" why_verdict="$3" why_para="$4"
+  local why_prs="$5" why_cost="$6" why_stuck="$7" why_lessons="$8"
+  local why_pinned="$9" why_cursor="${10}" why_contractor="${11}"
+  local esc_slug esc_aud esc_verdict esc_para
+  esc_slug="$(preflight_json_escape "$why_slug")"
+  esc_aud="$(preflight_json_escape "$why_aud")"
+  esc_verdict="$(preflight_json_escape "$why_verdict")"
+  esc_para="$(preflight_json_escape "$why_para")"
+  printf -- '{"slug":"%s","audience":"%s","verdict":"%s","paragraph":"%s","citations":{"prs_merged":%d,"cost_per_pr_usd":%s,"stuck_recoveries":%d,"lessons_promoted":%d,"prompts_pinned":%d},"alternatives":{"cursor_usd":%s,"contractor_usd":%s}}\n' \
+    "$esc_slug" "$esc_aud" "$esc_verdict" "$esc_para" \
+    "$why_prs" "$why_cost" "$why_stuck" "$why_lessons" "$why_pinned" \
+    "$why_cursor" "$why_contractor"
+}
+
+# why_one_slug — compute everything for ONE slug and render the chosen
+# output. Used both in the single-slug path and from the --all walk.
+why_one_slug() {  # $1=slug, $2=audience, $3=want_why_not, $4=want_json,
+                  # $5=cutoff_epoch, $6=weeks, $7=cross_lessons_path,
+                  # $8=show_verdict_tag (1 → prefix slug+tag in --all mode)
+  local why_slug="$1" why_aud="$2" why_invert="$3" why_json="$4"
+  local why_cutoff="$5" why_weeks="$6" why_cross_path="$7"
+  local why_tag="$8"
+  local why_cache="$HOME/.cache/$why_slug-agent"
+  local why_events="$why_cache/events.jsonl"
+  local why_runs="$why_cache/runs.jsonl"
+  local cite_tsv
+  cite_tsv="$(why_walk_citations "$why_events" "$why_runs" "$why_cutoff")"
+  local why_prs why_cost why_stuck why_lessons_unused why_pinned
+  IFS=$'\t' read -r why_prs why_cost why_stuck why_lessons_unused why_pinned <<< "$cite_tsv"
+  # Cross-LESSONS branch.
+  local why_cross_raw why_cross_branch why_lessons_count
+  why_cross_raw="$(why_read_cross_lessons "$why_slug" "$why_cross_path")"
+  if [ "$why_cross_raw" = "MISSING" ]; then
+    why_cross_branch="missing"
+    why_lessons_count="$why_lessons_unused"
+  else
+    why_cross_branch="present:$why_cross_raw"
+    why_lessons_count="$why_cross_raw"
+    # The cross-lessons file is the source-of-truth for the visible
+    # "cross-project memory" claim; the in-channel `lesson_promoted`
+    # count remains the citation total used in --json so the operator
+    # can audit the underlying event stream.
+    why_lessons_count="$why_lessons_unused"
+  fi
+  : "$why_lessons_count"
+  # Compute alternatives.
+  local knobs why_min why_rate
+  knobs="$(why_read_knobs "$why_slug")"
+  why_min="${knobs%%	*}"
+  why_rate="${knobs##*	}"
+  local why_cursor_alt why_contractor_alt
+  why_cursor_alt="$(awk -v w="$why_weeks" 'BEGIN { printf("%d", w * 5) }')"
+  why_contractor_alt="$(awk -v prs="$why_prs" -v m="$why_min" -v r="$why_rate" 'BEGIN { printf("%d", prs * m / 60.0 * r + 0.5) }')"
+  # Kit cost = sum of all run costs in window (used only for the
+  # verdict). The cost_per_pr median lives in cite_tsv.
+  local why_kit_cost="0.00"
+  if [ -f "$why_runs" ]; then
+    why_kit_cost="$(awk -v cutoff="$why_cutoff" '
+      BEGIN { count = 0; s = 0 }
+      function iso2ep(ts,   y, mo, d, h, mi, ss, a, y2, m2, jdn) {
+        sub(/\.[0-9]+Z$/, "Z", ts)
+        sub(/Z$/, "", ts)
+        if (length(ts) < 19) return 0
+        y  = substr(ts, 1, 4) + 0
+        mo = substr(ts, 6, 2) + 0
+        d  = substr(ts, 9, 2) + 0
+        h  = substr(ts, 12, 2) + 0
+        mi = substr(ts, 15, 2) + 0
+        ss = substr(ts, 18, 2) + 0
+        if (y < 1970) return 0
+        a = int((14 - mo) / 12)
+        y2 = y + 4800 - a
+        m2 = mo + 12 * a - 3
+        jdn = d + int((153 * m2 + 2) / 5) + 365 * y2 + \
+              int(y2 / 4) - int(y2 / 100) + int(y2 / 400) - 32045
+        return (jdn - 2440588) * 86400 + h * 3600 + mi * 60 + ss
+      }
+      {
+        ts = ""
+        if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts = substr($0, RSTART, RLENGTH)
+          sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts)
+          sub(/".*/, "", ts)
+        }
+        if (ts == "") next
+        ep = iso2ep(ts)
+        if (ep <= 0 || ep < cutoff) next
+        c = 0
+        if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+          cs2 = substr($0, RSTART, RLENGTH)
+          sub(/.*:[[:space:]]*/, "", cs2)
+          c = cs2 + 0
+        }
+        s += c; count++
+      }
+      END { printf("%.2f", s + 0) }
+    ' "$why_runs")"
+  fi
+  local why_verdict
+  why_verdict="$(why_compute_verdict "$why_kit_cost" "$why_cursor_alt" "$why_contractor_alt" "$why_prs")"
+  # Compose prose.
+  local why_para
+  if [ "$why_invert" = "1" ]; then
+    why_para="$(why_compose_why_not "$why_aud" "$why_slug" "$why_weeks" \
+      "$why_prs" "$why_cost" "$why_stuck" "$why_lessons_unused" "$why_pinned" \
+      "$why_cursor_alt" "$why_contractor_alt" "$why_cross_branch" "$why_verdict")"
+  else
+    why_para="$(why_compose_paragraph "$why_aud" "$why_slug" "$why_weeks" \
+      "$why_prs" "$why_cost" "$why_stuck" "$why_lessons_unused" "$why_pinned" \
+      "$why_cursor_alt" "$why_contractor_alt" "$why_cross_branch")"
+  fi
+  # Strip the trailing newline the composer adds.
+  why_para="${why_para%$'\n'}"
+  if [ "$why_json" = "1" ]; then
+    why_render_json "$why_slug" "$why_aud" "$why_verdict" "$why_para" \
+      "$why_prs" "$why_cost" "$why_stuck" "$why_lessons_unused" "$why_pinned" \
+      "$why_cursor_alt" "$why_contractor_alt"
+  else
+    if [ "$why_tag" = "1" ]; then
+      local tag_text
+      if [ "$why_verdict" = "keep" ]; then tag_text="(keep)"
+      else                                  tag_text="(consider removing)"
+      fi
+      printf -- '== %s %s ==\n' "$why_slug" "$tag_text"
+    fi
+    why_render_text "$why_slug" "$why_weeks" "$why_para" \
+      "$why_prs" "$why_stuck" "$why_lessons_unused" "$why_pinned"
+  fi
+}
+
+# why() — dispatcher. Every code path ends with `exit 0` or `exit 2`
+# (LESSONS 2026-06-01). Local var names use `why_*` prefixes to avoid
+# the LESSONS 2026-06-19 self-check forward-reference false positive on
+# sibling subcommand names (`rank`, `streak`, `diff`, etc.).
+why() {
+  shift  # drop the leading "why"
+  local why_slug="" why_want_all=0 why_aud="peer"
+  local why_invert=0 why_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)         why_want_all=1; shift ;;
+      --json)        why_json=1; shift ;;
+      --why-not)     why_invert=1; shift ;;
+      --audience)    why_aud="${2:-}"; shift 2 ;;
+      --audience=*)  why_aud="${1#--audience=}"; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet why — compose the case for keeping the kit installed against the slug's own telemetry.
+
+Usage:
+  fleet why <slug>                            peer audience, plain English (default)
+  fleet why <slug> --audience peer            technical, plain English
+  fleet why <slug> --audience manager         business-framed prose
+  fleet why <slug> --audience self            terse journal entry
+  fleet why <slug> --why-not                  invert: case AGAINST keeping the kit
+  fleet why <slug> --json                     structured single JSON object
+  fleet why --all                             one paragraph per discovered slug
+
+The argument is drawn entirely from the slug's events.jsonl + runs.jsonl + the
+cross-fleet CROSS_LESSONS.md feed. Trailing 8-week window. Pure reader — no
+events.jsonl writes, no fleet_emit_event calls, no `lib/` or `prompts/` edits.
+
+Exit codes:
+  0  success
+  2  flag / arg errors (missing slug, unknown slug, etc.)
+USAGE
+        exit 0 ;;
+      --) shift; break ;;
+      -*)
+        printf -- 'why: usage: bin/fleet why <slug|--all> [--audience peer|manager|self] [--why-not] [--json]\n' >&2
+        exit 2 ;;
+      *)
+        if [ -z "$why_slug" ]; then why_slug="$1"; shift
+        else
+          printf -- 'why: unexpected positional %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+  case "$why_aud" in
+    peer|manager|self) : ;;
+    *) printf -- 'why: --audience must be one of peer|manager|self (got %s)\n' "$why_aud" >&2
+       exit 2 ;;
+  esac
+  if [ "$why_want_all" = "0" ] && [ -z "$why_slug" ]; then
+    printf -- 'why: usage: bin/fleet why <slug|--all> [--audience peer|manager|self] [--why-not] [--json]\n' >&2
+    exit 2
+  fi
+  # Window math (LESSONS 2026-06-11): epoch subtraction, no `date -j -f`.
+  local why_now why_weeks why_cutoff
+  why_now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+  why_weeks=8
+  why_cutoff=$(( why_now - why_weeks * 7 * 86400 ))
+  local why_cross_path="${FLEET_CROSS_LESSONS:-$HOME/.local/share/agent-fleet/CROSS_LESSONS.md}"
+  if [ "$why_want_all" = "1" ]; then
+    local why_first=1 why_slugs_buf
+    why_slugs_buf="$(why_discover_slugs)"
+    if [ "$why_json" = "1" ]; then
+      printf -- '['
+      local one
+      while IFS= read -r one; do
+        [ -z "$one" ] && continue
+        if [ "$why_first" = "1" ]; then why_first=0
+        else printf -- ','
+        fi
+        why_one_slug "$one" "$why_aud" "$why_invert" 1 \
+          "$why_cutoff" "$why_weeks" "$why_cross_path" 0 \
+          | tr -d '\n'
+      done <<< "$why_slugs_buf"
+      printf -- ']\n'
+      exit 0
+    fi
+    while IFS= read -r one_slug; do
+      [ -z "$one_slug" ] && continue
+      why_one_slug "$one_slug" "$why_aud" "$why_invert" 0 \
+        "$why_cutoff" "$why_weeks" "$why_cross_path" 1
+      printf -- '\n'
+    done <<< "$why_slugs_buf"
+    exit 0
+  fi
+  # Single-slug mode. Validate slug.
+  local why_known
+  why_known="$(why_discover_slugs)"
+  if ! printf -- '%s\n' "$why_known" | LC_ALL=C grep -qxF -- "$why_slug"; then
+    printf -- 'why: slug %s not found. discovered slugs: %s\n' \
+      "$why_slug" "$(printf -- '%s' "$why_known" | tr '\n' ' ' | sed -E 's/ $//')" >&2
+    exit 2
+  fi
+  why_one_slug "$why_slug" "$why_aud" "$why_invert" "$why_json" \
+    "$why_cutoff" "$why_weeks" "$why_cross_path" 0
+  exit 0
+}
+
+if [ "$CMD" = "why" ]; then
+  why "$@"
+  exit $?
 fi
 
 # --- tail -----------------------------------------------------------------
