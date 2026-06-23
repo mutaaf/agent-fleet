@@ -570,3 +570,37 @@ correct. The self-check pattern could be tightened to require the
 matched token to appear as a command invocation (no `=` or `+=`
 operator immediately after), but until that lands, the rename is the
 one-line fix.
+
+## 2026-06-23 — `sha256(tar -cf <stage>)` is non-deterministic; a self-verifying export manifest MUST hash a content-digest LIST, not the tarball bytes
+
+While shipping ticket 0063's `migrate_compute_sansmanifest_sha256`, the
+first cut packed the export's staging directory (sans the manifest
+file) into a tmp tarball and hashed THAT: `tar -cf $tmp -C $stage . &&
+shasum -a 256 < $tmp`. The same computation runs on both the export
+side (to SEAL the manifest with `tarball_sha256`) and the import side
+(to VALIDATE the manifest by re-computing and comparing). Symptom in
+`tests/migrate.sh` AC #6: the import refused EVERY healthy export with
+`migrate: tarball sha256 mismatch (expected <X>, got <Y>)` even though
+the file content round-tripped byte-exact through `tar -xzf`. Cause:
+`tar`'s ustar header embeds the mtime of each file at archive time,
+plus uname/gname/mode bits — so a freshly-built staging dir (mktemp -d
+under the export's HOME, mtimes "now") produces a DIFFERENT tarball
+sha than the freshly-extracted staging dir on the import side (mktemp
+-d under a different HOME, mtimes from `tar -xzf` defaulting to
+extract-time). Even on the SAME machine, two consecutive `tar -cf`
+passes seconds apart produced different sha256s. The trap also bites
+any future attempt to use `--mtime`/`--owner` flags as a portability
+fix — BSD `tar` and GNU `tar` disagree on those flag names and the
+test harness must run on macOS + Linux. Fix: hash a CONTENT-DIGEST
+LIST instead — for every regular file under the stage EXCEPT
+`fleet-export.json` (and any sidecar files), emit
+`<sorted-rel-path>\t<file-sha256>\n` and hash the resulting stream.
+File CONTENTS round-trip byte-exact through `tar -xzf` regardless of
+metadata, so the same digest list is reconstructible on both ends.
+Cheap defensive habit: any future hash-in-manifest pattern in this
+kit MUST hash file CONTENTS, never tar bytes. Same trap applies to
+`zip`, `cpio`, and any container format whose headers carry mtimes;
+the content-digest-list shape is portable across all of them. (A
+deterministic `tar` does exist via `--mtime --owner --group --sort` on
+GNU `tar` but NOT on BSD `tar` — and the kit dogfoods macOS where BSD
+`tar` ships by default. Don't go down that path.)

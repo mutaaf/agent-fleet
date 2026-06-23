@@ -1,0 +1,5 @@
+PROJECT_NAME="beta-quiet"
+SLUG="beta-quiet"
+NAMESPACE="com.beta-quiet"
+REPO_URL="https://github.com/example/beta-quiet"
+SELF_CANCEL="20990101"

@@ -1,0 +1,5 @@
+PROJECT_NAME="delta-empty"
+SLUG="delta-empty"
+NAMESPACE="com.delta-empty"
+REPO_URL="https://github.com/example/delta-empty"
+SELF_CANCEL="20990101"

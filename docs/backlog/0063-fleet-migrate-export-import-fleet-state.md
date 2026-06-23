@@ -873,3 +873,35 @@ Plan: define ~16 `migrate_*` helpers ABOVE the dispatcher (between the
 acceptance boxes, then run the local gate. No `lib/common.sh` /
 `prompts/` / `AGENTS.md` changes. No new event types. Self-check
 baseline on main is 3 hits; PR must not exceed.
+
+### 2026-06-23 — shipped
+
+- 16 `migrate_*` helpers landed in `bin/fleet` (~720 LoC) ABOVE the
+  dispatcher per LESSONS 2026-06-05 (forward-reference trap), plus
+  `migrate_json_escape` — an INLINE COPY of `preflight_json_escape`'s
+  body (not a delegating wrapper) per LESSONS 2026-06-13 (no
+  `*_json_escape` wrappers) and LESSONS 2026-06-05 (forward-reference
+  trap from `migrate_render_manifest_json` at line ~1894 to
+  `preflight_json_escape` at line ~2648).
+- `tests/migrate.sh` covers all 14 acceptance boxes (70 PASS, 0 FAIL,
+  ~10s wall-clock).
+- Self-check: 3 hits, unchanged from main's baseline.
+- `tarball_sha256` is a CONTENT-DIGEST not a tar-archive sha256 —
+  hashing the sorted stream of `<rel-path>\t<file-sha256>\n` lines
+  for every regular file under the stage EXCEPT `fleet-export.json`
+  and the `.migrate-repo-*` sidecars. This is deterministic across
+  export+import because tar metadata (mtimes, ownership) does NOT
+  round-trip through the kit's `tar -czf`/`tar -xzf` cycle, but file
+  CONTENTS do. The earlier "pack twice and hash the tarball" approach
+  produced different hashes on each pack because tar embeds mtimes.
+- No new event types (verified by AGENTS.md § Telemetry diff).
+- `lib/common.sh`, `prompts/`, `AGENTS.md` untouched (verified by
+  test's AC #14 git-diff assertion).
+- Public API: additive. `bin/fleet migrate` is a new subcommand;
+  `FLEET_EXPORT_PASS` is a new OPTIONAL env var read only by the
+  `--encrypt` paths.
+- Reinstall: NO — `lib/` is untouched.
+
+Novel lesson appended to docs/LESSONS.md: tar's mtime-in-header
+prevents using `sha256(tar -cf ...)` as a self-verifying export
+manifest digest — content-digest-list is the deterministic shape.

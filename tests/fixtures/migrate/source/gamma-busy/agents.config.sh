@@ -1,0 +1,5 @@
+PROJECT_NAME="gamma-busy"
+SLUG="gamma-busy"
+NAMESPACE="com.gamma-busy"
+REPO_URL="https://github.com/example/gamma-busy"
+SELF_CANCEL="20990101"

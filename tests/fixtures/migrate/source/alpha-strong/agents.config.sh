@@ -1,0 +1,5 @@
+PROJECT_NAME="alpha-strong"
+SLUG="alpha-strong"
+NAMESPACE="com.alpha-strong"
+REPO_URL="https://github.com/example/alpha-strong"
+SELF_CANCEL="20990101"

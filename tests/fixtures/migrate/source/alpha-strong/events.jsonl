@@ -1,0 +1,11 @@
+{"ts":"2026-06-01T10:00:00Z","slug":"alpha-strong","phase":"ship","type":"run_started","pid":"100"}
+{"ts":"2026-06-01T10:05:00Z","slug":"alpha-strong","phase":"ship","type":"pr_opened","number":"1","branch":"feat/a"}
+{"ts":"2026-06-01T11:00:00Z","slug":"alpha-strong","phase":"ship","type":"pr_footer_posted","pr":"1"}
+{"ts":"2026-06-02T10:05:00Z","slug":"alpha-strong","phase":"ship","type":"pr_opened","number":"2","branch":"feat/b"}
+{"ts":"2026-06-02T11:00:00Z","slug":"alpha-strong","phase":"ship","type":"pr_footer_posted","pr":"2"}
+{"ts":"2026-06-02T12:00:00Z","slug":"alpha-strong","phase":"promote","type":"lesson_promoted","source":"alpha-strong","text_sha":"abc12345","scope":"all"}
+{"ts":"2026-06-03T10:05:00Z","slug":"alpha-strong","phase":"ship","type":"pr_opened","number":"3","branch":"feat/c"}
+{"ts":"2026-06-03T11:00:00Z","slug":"alpha-strong","phase":"ship","type":"pr_footer_posted","pr":"3"}
+{"ts":"2026-06-04T10:05:00Z","slug":"alpha-strong","phase":"ship","type":"pr_opened","number":"4","branch":"feat/d"}
+{"ts":"2026-06-04T15:00:00Z","slug":"alpha-strong","phase":"promote","type":"lesson_promoted","source":"alpha-strong","text_sha":"def67890","scope":"all"}
+{"ts":"2026-06-05T10:05:00Z","slug":"alpha-strong","phase":"ship","type":"pr_opened","number":"5","branch":"feat/e"}
