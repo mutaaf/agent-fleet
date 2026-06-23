@@ -366,6 +366,32 @@ postcard.
     operator-/gate-initiated diagnostic action, one typed event,
     no transcript scraping required to reconstruct "did the heal
     step push a regression of a documented trap?"
+  - `lessons_imported {source, version, count, dedup_skipped, unsigned, reason?}`
+    — emitted by `bin/fleet lessons-import <url|file>` (ticket 0065)
+    once per successful adoption of a signed third-party LESSON PACK
+    into the operator's `CROSS_LESSONS.md`. `source` is the pack's
+    `publisher` field; `version` is the pack's `version` field;
+    `count` is the number of paragraphs actually inserted (after the
+    dedupe pass); `dedup_skipped` is the number skipped because their
+    8-char `text_sha` already appears in `CROSS_LESSONS.md` (same
+    normalization 0028 uses); `unsigned` is `0` on the
+    signature-verified happy path and `1` on the `--allow-unsigned`
+    escape-hatch path; `reason` is present only when
+    `--allow-unsigned --reason "<ascii text>"` was used, recorded
+    verbatim through `_json_escape`. Carries `phase=lessons-import`
+    and lives in the AGENT-FLEET kit-as-project `events.jsonl` (per
+    the `lesson_promoted` (0028) / `prompts_reverted` (0035) /
+    `lessons_pruned` (0039) / `self_check_failed` (0040) pattern —
+    the kit IS a project for telemetry purposes). Dry-run paths
+    (`--dry-run`) emit NO event; refusal paths (invalid JSON,
+    untrusted publisher without override, pubkey_sha256 mismatch,
+    signature mismatch, missing `--reason` under `--allow-unsigned`,
+    non-ASCII `--reason`, failed download) emit NO event — only
+    successful imports do. Mirrors the shape of `lesson_promoted`
+    (0028) and `lessons_pruned` (0039): one operator-initiated
+    cross-fleet-memory action, one typed event, no transcript
+    scraping required to reconstruct what third-party wisdom landed
+    in `CROSS_LESSONS.md` when.
 
 **Demo path (ticket 0023) and onboarding-check (ticket 0041).** `bin/fleet
 kickstart --demo` walks a credential-less synthetic ship cycle and emits

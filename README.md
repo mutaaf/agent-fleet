@@ -469,6 +469,7 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet replay courtiq --pr 17              # replay PR #17 through CURRENT prompts in dry-run (review by default; --phase ship to ask "what would the ship runner do?")
 ~/code/agent-fleet/bin/fleet replay courtiq --batch --since 14d  # grade current prompts against every agent-merged PR in the window (matrix + verdict; --json for fleet prompts-score)
 ~/code/agent-fleet/bin/fleet lessons-promote agent-fleet --lesson "<title>"   # curate one local lesson into cross-fleet (ticket 0028)
+~/code/agent-fleet/bin/fleet lessons-import https://peer.example/lessons.pack.json  # import a third-party lesson pack into your cross-LESSONS feed (ticket 0065 — schema_version=1, ed25519-signed; --file/--dry-run/--allow-unsigned/--reason/--json)
 ~/code/agent-fleet/bin/fleet lessons-prune --dry-run                           # list expired LESSONS entries; --commit --cause "<text>" moves them to LESSONS-ARCHIVE.md (ticket 0039)
 ~/code/agent-fleet/bin/fleet self-check                                        # run the LESSONS-derived static linter against the kit's own shell (ticket 0040 — 12 patterns; --list/--pattern/--json; FLEET_SELF_CHECK_GATE=1 in local gate)
 ~/code/agent-fleet/bin/fleet streak                                            # current + longest continuous green-day run per project (ticket 0042 — pure reader of events.jsonl; --since Nd|YYYY-MM-DD default 90d, --slug, --json)
@@ -490,6 +491,27 @@ tail -f ~/.cache/<slug>-agent/logs/ship-*.log
 ~/code/agent-fleet/bin/fleet why sidebrew --audience peer                          # compose the case for keeping the kit installed against the slug's own telemetry (ticket 0062 — pure reader of events.jsonl + runs.jsonl + CROSS_LESSONS.md; --all walks every discovered slug, --audience peer|manager|self, --why-not inverts to the case AGAINST, --json emits a structured object; trailing 8-week window; reuses 0061's MANUAL_PR_MINUTES + CONTRACTOR_USD_PER_HOUR knobs)
 ~/code/agent-fleet/bin/fleet catchup                                              # re-orientation briefing after a >=72h absence — ranked actions, three at a time (ticket 0064 — pure reader of events.jsonl + runs.jsonl + morning/inbox state mtimes; auto-detects "last seen" from $HOME/.local/state/agent-fleet/morning-last-run + $HOME/.cache/fleet/inbox-state; --since Nh|Nd|YYYY-MM-DD / --all / --slug / --json; no writes, no new event types)
 ```
+
+**Third-party lesson packs (ticket 0065).** `fleet lessons-import
+<url|file>` adopts a peer's curated LESSONS into your local
+`CROSS_LESSONS.md` so a fresh fleet inherits a friend's 3 months of
+operational wisdom without copy-paste. The pack format is a minimal
+JSON envelope: `schema_version: 1`, `publisher`, `version`,
+`created_at` (ISO8601 UTC), `signature` (base64 ed25519 over the
+canonical body without the `signature` field), `pubkey_sha256` (hex
+sha256 of the resolved pubkey payload), and `lessons[]` with `date`,
+`title`, `body`, optional `expires`. The operator's
+`$HOME/.local/share/agent-fleet/trusted-pubkeys.txt` is the source of
+truth for trusted publishers — one entry per line in the form
+`<publisher> <pubkey-payload> # <free-text-comment>`. The kit ships
+with NO bundled pubkeys; operators add the peer's pubkey BEFORE the
+first import. Imported paragraphs land under `## from
+<publisher>:v<version>` so they never pollute your own per-slug
+sections. `--dry-run` previews without writing or emitting; `--json`
+emits one structured object. The `--allow-unsigned --reason "<ascii
+text>"` escape hatch is for air-gapped operators or publishers whose
+signing setup is pending — the reason is mandatory and recorded
+verbatim in the `lessons_imported` event payload.
 
 **Invoice manifest knobs (ticket 0061).** `fleet invoice <slug>` is a pure
 reader of `events.jsonl` + `runs.jsonl` that composes a monthly billing-

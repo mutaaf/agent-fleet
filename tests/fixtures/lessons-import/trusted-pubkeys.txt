@@ -1,0 +1,7 @@
+# test-only pubkey file for tests/lessons-import.sh
+# format: <publisher>  <pubkey-payload>  # <free-text-comment>
+# the pubkey payload is hashed with shasum -a 256 and compared to the pack's
+# pubkey_sha256 field. publishers absent from this file refuse import unless
+# --allow-unsigned --reason "<text>" is passed.
+peer-good TEST-PUBKEY-AAAA # peer-good's signing key 2026-06-23
+peer-bbbb TEST-PUBKEY-BBBB # alternate key for a different publisher

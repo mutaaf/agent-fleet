@@ -1,0 +1,9 @@
+{
+  "schema_version": 99,
+  "publisher": "peer-good",
+  "version": "9.9.9",
+  "created_at": "2026-06-20T12:00:00Z",
+  "signature": "STUB_VALID_SIG_BASE64",
+  "pubkey_sha256": "7f3194f44a2854400eba8d249c5209cbb2caf513691b3c7f64505b95954e92ec",
+  "lessons": []
+}

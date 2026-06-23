@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "publisher": "peer-good",
+  "version": "3.2.0",
+  "created_at": "2026-06-20T12:00:00Z",
+  "signature": "STUB_VALID_SIG_BASE64",
+  "pubkey_sha256": "7f3194f44a2854400eba8d249c5209cbb2caf513691b3c7f64505b95954e92ec",
+  "lessons": [
+    {
+      "date": "2026-05-12",
+      "title": "supabase port-bind on docs-only PR",
+      "body": "When a docs-only PR triggers the supabase CI image, it can race the port bind and time out. Use gh run rerun --failed once; do NOT heal with a code fix.",
+      "expires": null
+    },
+    {
+      "date": "2026-05-18",
+      "title": "em-dash sign-extension under LC_ALL=C",
+      "body": "An em-dash byte run in JSON output trips bash 3.2 string-length under LC_ALL=C. Always preflight via preflight_json_escape, never roll your own.",
+      "expires": null
+    },
+    {
+      "date": "2026-06-01",
+      "title": "node:sqlite types narrow only after .all()",
+      "body": "Calling node:sqlite prepared.run() returns unknown columns; .all() returns the typed shape. Adopt .all() in adapters.",
+      "expires": "2027-06-01"
+    },
+    {
+      "date": "2026-06-05",
+      "title": "forward-reference helpers in bin/fleet",
+      "body": "A new helper defined BELOW the dispatcher block dies at runtime with command not found because the if-check runs at execution time. Always define helpers ABOVE.",
+      "expires": null
+    },
+    {
+      "date": "2026-06-10",
+      "title": "gh pr create needs --head user:branch from agent runs",
+      "body": "Agent checkouts run inside cache dirs; the local branch is not a tracking branch for the operator. Pass --head user:branch explicitly.",
+      "expires": null
+    }
+  ]
+}
