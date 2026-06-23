@@ -1,7 +1,7 @@
 ---
 id: 0064
 title: fleet catchup composes a re-orientation briefing after the operator's been away >72h so returning to a 4-slug fleet stops feeling like triage
-status: groomed
+status: shipped
 priority: P1
 area: observability
 created: 2026-06-23
@@ -910,4 +910,11 @@ Files / patterns the dev should touch.
 
 ## Implementation log
 
-(Appended by the implementation-dev agent during execution.)
+- 2026-06-23 — implementation-dev: feat/0064-fleet-catchup-reorientation
+  opened. Tests-first per P-2: `tests/catchup.sh` with one block per
+  AC checkbox, then `catchup()` + helpers in `bin/fleet`. Pure reader,
+  no `lib/` / `prompts/` / event-type changes.
+- 2026-06-23 — implementation-dev: all 13 ACs pass; local gate green
+  (shellcheck -S warning rc=0, bash -n rc=0, check-backlog rc=0,
+  self-check 3 hits = on-main baseline). No new event types, no
+  `lib/common.sh` / `prompts/` diff. Status flipped to `shipped`.
