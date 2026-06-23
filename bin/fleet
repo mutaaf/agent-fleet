@@ -27539,9 +27539,15 @@ USAGE
   local lessons_import_env
   lessons_import_env=$(lessons_import_validate_envelope "$lessons_import_pack_file") || exit 3
   local lessons_import_publisher lessons_import_version lessons_import_created
-  local lessons_import_sig_b64 lessons_import_pack_pksha lessons_import_pack_count
+  local lessons_import_pack_pksha lessons_import_pack_count
+  # The TSV's signature column is intentionally discarded into `_` -
+  # we re-derive the signature inside lessons_import_verify_signature
+  # from the pack file itself so the canonical body / signature pair
+  # stays atomic. Per LESSONS 2026-06-08 every middle column carries
+  # at least one non-empty token (the validator guarantees signature
+  # is a non-empty string) so the IFS=$'\t' read does not shift left.
   IFS=$'\t' read -r lessons_import_publisher lessons_import_version lessons_import_created \
-    lessons_import_sig_b64 lessons_import_pack_pksha lessons_import_pack_count \
+    _ lessons_import_pack_pksha lessons_import_pack_count \
     <<< "$lessons_import_env"
 
   # Signature path: lookup publisher → trust file → pubkey payload →
