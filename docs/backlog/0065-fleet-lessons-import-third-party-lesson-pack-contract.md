@@ -1,7 +1,7 @@
 ---
 id: 0065
 title: fleet lessons-import codifies a third-party lesson-pack contract so a peer's hard-won LESSONS can pre-load a fresh fleet without copy-paste
-status: groomed
+status: shipped
 priority: P2
 area: engine
 created: 2026-06-23
@@ -330,7 +330,7 @@ follows.
 
 Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
 
-- [ ] `bin/fleet lessons-import <url-or-file>` is a new
+- [x] `bin/fleet lessons-import <url-or-file>` is a new
       subcommand. Required arg is a URL OR a `--file
       <path>` flag with a local file. Both missing:
       prints `lessons-import: usage: bin/fleet lessons-
@@ -341,7 +341,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       "$kw"`. Test asserts both refusal AND the URL/file
       branches.
 
-- [ ] The pack schema is a JSON envelope:
+- [x] The pack schema is a JSON envelope:
       `{"schema_version": 1, "publisher": "<str>",
       "version": "<semver>", "created_at":
       "<ISO8601-UTC>", "signature": "<base64-ed25519>",
@@ -360,7 +360,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       JSON pack, a missing required field
       (`publisher`), a wrong `schema_version`.
 
-- [ ] The signature is ed25519 over the canonical
+- [x] The signature is ed25519 over the canonical
       serialization of the envelope WITHOUT the
       `signature` field. v1 uses `openssl dgst
       -sha256 -verify <pubkey> -signature <sig>
@@ -383,7 +383,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       path AND the `--allow-unsigned --reason`
       override path.
 
-- [ ] The dedupe pass walks every paragraph in the
+- [x] The dedupe pass walks every paragraph in the
       pack AND every paragraph in the destination
       `CROSS_LESSONS.md` (resolved via
       `${FLEET_CROSS_LESSONS:-$HOME/.local/share/
@@ -404,7 +404,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       cross-LESSONS paragraphs, imports 6 and
       skips 4.
 
-- [ ] Imported paragraphs are written under a
+- [x] Imported paragraphs are written under a
       clearly-attributed namespace section
       heading: `## from <publisher>:<pack-slug>`
       where `pack-slug` is the lesson's
@@ -425,7 +425,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       re-import appends without duplicating
       existing paragraphs.
 
-- [ ] `bin/fleet lessons-import` emits a new
+- [x] `bin/fleet lessons-import` emits a new
       typed event: `lessons_imported {source,
       version, count, dedup_skipped, unsigned}`.
       `source` is the pack's `publisher` field.
@@ -452,7 +452,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       fires on happy path AND is silent on
       every refusal/dry-run path.
 
-- [ ] `bin/fleet lessons-import --dry-run`
+- [x] `bin/fleet lessons-import --dry-run`
       walks the validate + dedupe pass and
       prints the preview WITHOUT writing to
       CROSS_LESSONS.md AND WITHOUT emitting the
@@ -466,13 +466,13 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       tail is unchanged before and after
       dry-run.
 
-- [ ] `bin/fleet lessons-import --file <path>`
+- [x] `bin/fleet lessons-import --file <path>`
       accepts a LOCAL pack file (no download).
       Missing file: prints `lessons-import:
       file <path> not found` to stderr, exit 2.
       Test asserts both branches.
 
-- [ ] `bin/fleet lessons-import <url>` downloads
+- [x] `bin/fleet lessons-import <url>` downloads
       the URL via `curl -fsSL` into a `mktemp`
       file BEFORE validation. Failed download:
       prints `lessons-import: failed to download
@@ -483,7 +483,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       2026-05-26 (PATH reset) the URL path AND
       the failed-download branch.
 
-- [ ] `bin/fleet lessons-import --allow-unsigned
+- [x] `bin/fleet lessons-import --allow-unsigned
       --reason "<text>"` is the escape hatch
       for an air-gapped operator OR a pack from
       a publisher whose signing setup is
@@ -501,7 +501,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       `reason=<text>` (verbatim). Test
       asserts both branches.
 
-- [ ] `bin/fleet lessons-import --json` emits
+- [x] `bin/fleet lessons-import --json` emits
       one structured JSON object: `{"pack":
       {"publisher": "<str>", "version":
       "<str>", "created_at": "<ISO8601>"},
@@ -514,7 +514,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       `preflight_json_escape` directly. Test
       asserts JSON validity via Node.
 
-- [ ] `bin/fleet lessons-import --help` prints
+- [x] `bin/fleet lessons-import --help` prints
       USAGE mentioning `--file`, `--dry-run`,
       `--allow-unsigned`, `--reason`,
       `--json`. Per LESSONS 2026-05-30 test
@@ -522,7 +522,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       "$help_out"`. Help block ends with
       `exit 0` per LESSONS 2026-06-01.
 
-- [ ] `bin/fleet lessons-import` writes ONLY
+- [x] `bin/fleet lessons-import` writes ONLY
       to the destination CROSS_LESSONS.md AND
       the kit's `events.jsonl`. NO writes to
       any slug's `agents.config.sh`, NO writes
@@ -535,7 +535,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       mutated files are CROSS_LESSONS.md and
       the kit's events.jsonl.
 
-- [ ] `lib/common.sh` — NO changes (the
+- [x] `lib/common.sh` — NO changes (the
       `_json_escape` and `fleet_emit_event`
       helpers stay byte-identical). `prompts/`
       — NO changes. `AGENTS.md` is UPDATED in
@@ -553,7 +553,7 @@ Each box maps 1:1 to a test scenario in `tests/lessons-import.sh`.
       HEAD -- lib/common.sh prompts/` returns
       empty.
 
-- [ ] `tests/lessons-import.sh` covers all
+- [x] `tests/lessons-import.sh` covers all
       14 boxes above using `$HOME/.local/bin`
       stubs (`curl`, `openssl`, `shasum`)
       per LESSONS 2026-05-26 (PATH reset).
@@ -1122,3 +1122,16 @@ Files / patterns the dev should touch.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+- 2026-06-23 — implementation-dev: branch `feat/0065-lessons-import` opened;
+  flipped status groomed → in-progress; tests-first under
+  `tests/lessons-import.sh` with fixtures under
+  `tests/fixtures/lessons-import/`; helpers `lessons_import_*` all defined
+  ABOVE the dispatcher per LESSONS 2026-06-05; locals prefixed
+  `lessons_import_*` per LESSONS 2026-06-19; no changes to `lib/` or
+  `prompts/` (BREAKING=NO, Reinstall=NO).
+- 2026-06-23 — implementation-dev: all 15 acceptance-criteria boxes
+  green; local gate (shellcheck + bash -n + check-backlog +
+  FLEET_SELF_CHECK_GATE=1 self-check) clean — zero new self-check
+  hits introduced (baseline 3 hits unchanged); status flipped
+  in-progress → shipped.

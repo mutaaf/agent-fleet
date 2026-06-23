@@ -1,0 +1,2 @@
+{"ts":"2026-06-22T10:00:00Z","slug":"agent-fleet","phase":"ship","type":"run_started","pid":"12345"}
+{"ts":"2026-06-22T10:01:00Z","slug":"agent-fleet","phase":"ship","type":"run_completed","exit":"0","duration_ms":"60000"}

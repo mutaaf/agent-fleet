@@ -211,6 +211,14 @@ tour_catalog_self_check_failed() {
     'Documented traps regress; the gate event names the pattern plus LESSON date plus file:line so the heal step can fix it before merging.'
 }
 
+# --- lessons_imported ------------------------------------------------------
+tour_catalog_lessons_imported() {
+  printf '%s\t%s\t%s\n' \
+    'P-8' \
+    'Operator ran fleet lessons-import <url|file>. A signed, schema-validated third-party LESSON PACK was merged into CROSS_LESSONS.md under a `## from <publisher>:v<version>` namespace section.' \
+    'Cross-operator operational memory compounds the moat: every imported pack pre-loads a fresh fleet with a peer hard-won wisdom without copy-paste, and the event is the audit trail tying every namespace section back to its publisher plus version.'
+}
+
 # --- Principle titles (quoted from prompts/PRINCIPLES.md so the renderer
 # can compose "P-N (<title>)" without re-reading the file at runtime).
 tour_catalog_principle_title() {  # $1 = P-N

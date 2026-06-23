@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "publisher": "stranger-danger",
+  "version": "0.1.0",
+  "created_at": "2026-06-20T12:00:00Z",
+  "signature": "STUB_VALID_SIG_BASE64",
+  "pubkey_sha256": "7f3194f44a2854400eba8d249c5209cbb2caf513691b3c7f64505b95954e92ec",
+  "lessons": [
+    {
+      "date": "2026-06-15",
+      "title": "a lesson from someone we do not trust yet",
+      "body": "Operator must add stranger-danger's pubkey to trusted-pubkeys.txt before this can land.",
+      "expires": null
+    }
+  ]
+}

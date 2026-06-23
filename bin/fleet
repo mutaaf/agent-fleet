@@ -26,6 +26,8 @@
 #   fleet lessons-promote <slug> --lesson "<title>"
 #                             curate one lesson into cross-fleet
 #                             (ticket 0028 — operator's curation primitive)
+#   fleet lessons-import <url|file>  import a third-party lesson pack into your cross-LESSONS feed
+#                             (ticket 0065 — schema_version=1, ed25519-signed; --file/--dry-run/--allow-unsigned/--reason/--json)
 #   fleet lessons-prune --dry-run
 #                             list expired LESSONS entries (operator-invoked archival)
 #                             (ticket 0039 — --commit --cause "<text>" moves to LESSONS-ARCHIVE.md)
@@ -26855,6 +26857,856 @@ USAGE
 
 if [ "$CMD" = "lessons-promote" ]; then
   lessons_promote "$@"
+fi
+
+# --- lessons-import (ticket 0065) ----------------------------------------
+# `bin/fleet lessons-import <url|file>` accepts a versioned, signed,
+# schema-validated LESSON PACK from a third-party publisher and merges
+# its lessons into the operator's CROSS_LESSONS.md under a clearly
+# attributed `## from <publisher>:<pack-slug>` namespace section. The
+# pack is a JSON envelope: schema_version, publisher, version,
+# created_at, signature (ed25519, base64), pubkey_sha256 (hex),
+# lessons[] (date, title, body, expires|null). Verification path:
+# (1) Node JSON.parse the envelope; (2) shasum -a 256 the resolved
+# pubkey file content and compare to pack.pubkey_sha256; (3) shell
+# out to openssl dgst -sha256 -verify <pubkey> -signature <sig>
+# <body>. The trusted-pubkeys.txt at $HOME/.local/share/agent-fleet/
+# is the source of truth for trusted publishers; lines look like:
+#   <publisher> <pubkey-payload> # <free-text-comment>
+# Dedupe walks pack.lessons + existing CROSS_LESSONS.md in one awk
+# pass each, computing the same 8-char text_sha 0028 uses. Emits one
+# new `lessons_imported {source, version, count, dedup_skipped,
+# unsigned, reason?}` event into the AGENT-FLEET kit-as-project
+# events.jsonl on success; dry-run and refusal paths emit no event.
+#
+# Per LESSONS 2026-06-05 every lessons_import_* helper is defined
+# ABOVE the lessons_import() dispatcher AND ABOVE the `if [ "$CMD" =
+# "lessons-import" ]; then` block - forward references die at runtime
+# inside the inline dispatcher.
+#
+# Per LESSONS 2026-06-19 every `local` inside lessons_import() is
+# prefixed `lessons_import_*` so the self-check's
+# dispatcher-forward-reference pattern does not false-positive on
+# locals that happen to share names with other subcommand functions
+# (`promote`, `prune`, `rank`, `streak`, `stuck`, etc.).
+#
+# Per LESSONS 2026-06-13 the event payload uses the existing
+# fleet_emit_event writer (which calls lib/common.sh's _json_escape
+# internally); the `--json` renderer calls preflight_json_escape
+# DIRECTLY, never through a `lessons_import_json_escape` wrapper.
+#
+# Per LESSONS 2026-06-03 (UTF-8 sign-extension) the parser preserves
+# UTF-8 byte sequences in lesson body text - Node's built-in
+# JSON.parse handles the round-trip; we never re-encode bodies in
+# bash.
+#
+# Per LESSONS 2026-06-08 (`IFS=$'\t'` middle-empty collapse) the
+# dedupe walker emits TSV rows with a literal `-` sentinel in the
+# `expires` column when the JSON value is null/absent.
+
+# Resolve the destination CROSS_LESSONS.md path. Same env precedence
+# 0028 / 0051 / 0063 use: FLEET_CROSS_LESSONS overrides; otherwise
+# $HOME/.local/share/agent-fleet/CROSS_LESSONS.md. Creates the parent
+# dir lazily so a first import on a fresh machine does not die on
+# ENOENT.
+lessons_import_resolve_target_path() {
+  local lessons_import_path
+  if [ -n "${FLEET_CROSS_LESSONS:-}" ]; then
+    lessons_import_path="$FLEET_CROSS_LESSONS"
+  else
+    lessons_import_path="$HOME/.local/share/agent-fleet/CROSS_LESSONS.md"
+  fi
+  mkdir -p "$(dirname "$lessons_import_path")" 2>/dev/null || true
+  printf -- '%s\n' "$lessons_import_path"
+}
+
+# Resolve trusted-pubkeys.txt. FLEET_TRUSTED_PUBKEYS overrides; default
+# is $HOME/.local/share/agent-fleet/trusted-pubkeys.txt. Echoes the
+# path on success; on missing-file emits a clear stderr nudge AND
+# returns 1 so the caller can decide whether the --allow-unsigned
+# override branch applies.
+lessons_import_resolve_pubkey_file() {
+  local lessons_import_path
+  if [ -n "${FLEET_TRUSTED_PUBKEYS:-}" ]; then
+    lessons_import_path="$FLEET_TRUSTED_PUBKEYS"
+  else
+    lessons_import_path="$HOME/.local/share/agent-fleet/trusted-pubkeys.txt"
+  fi
+  if [ ! -f "$lessons_import_path" ]; then
+    printf -- 'lessons-import: no trusted-pubkeys.txt at %s. add one ed25519 pubkey per line, OR re-run with --allow-unsigned --reason "<text>".\n' \
+      "$lessons_import_path" >&2
+    return 1
+  fi
+  printf -- '%s\n' "$lessons_import_path"
+}
+
+# Download a pack from a URL into a mktemp file. Echoes the temp path
+# on success; on failure prints the canonical refusal AND returns
+# non-zero so the caller can exit 3. The temp file is registered with
+# a trap by the caller (we do not own the trap here - one shell-level
+# trap covers all temp files).
+lessons_import_download_pack() {  # $1 = url, $2 = tmpfile
+  local lessons_import_url="$1" lessons_import_out="$2"
+  local lessons_import_rc=0
+  curl -fsSL "$lessons_import_url" -o "$lessons_import_out" || lessons_import_rc=$?
+  if [ "$lessons_import_rc" != "0" ]; then
+    printf -- 'lessons-import: failed to download %s (curl exit %s)\n' \
+      "$lessons_import_url" "$lessons_import_rc" >&2
+    return 1
+  fi
+  printf -- '%s\n' "$lessons_import_out"
+}
+
+# Node-based envelope validator. Reads $1 (pack-file). Echoes a TSV
+# line: `<publisher>\t<version>\t<created_at>\t<signature>\t<pubkey_sha256>\t<lesson_count>`
+# on success. On JSON parse failure or missing field, prints a
+# refusal line to stderr AND returns 1 - the caller exits 3. Per
+# LESSONS 2026-06-03 Node's built-in JSON.parse preserves UTF-8 byte
+# sequences without sign-extension.
+lessons_import_validate_envelope() {  # $1 = pack-file
+  local lessons_import_pack="$1"
+  node -e '
+    const fs = require("fs");
+    const path = process.argv[1];
+    let raw, obj;
+    try { raw = fs.readFileSync(path, "utf8"); } catch (e) {
+      process.stderr.write("lessons-import: cannot read pack file (" + e.message + ")\n");
+      process.exit(3);
+    }
+    try { obj = JSON.parse(raw); } catch (e) {
+      // Best-effort line extraction from Node JSON parser error.
+      const m = /position (\d+)/.exec(e.message);
+      let line = "?";
+      if (m) {
+        const pos = parseInt(m[1], 10);
+        line = (raw.slice(0, pos).match(/\n/g) || []).length + 1;
+      }
+      process.stderr.write("lessons-import: invalid JSON in pack file (line " + line + ": " + e.message + ")\n");
+      process.exit(3);
+    }
+    if (obj.schema_version !== 1) {
+      process.stderr.write("lessons-import: unsupported schema_version (got " + JSON.stringify(obj.schema_version) + ", want 1)\n");
+      process.exit(3);
+    }
+    for (const k of ["publisher", "version", "created_at", "signature", "pubkey_sha256", "lessons"]) {
+      if (!(k in obj)) {
+        process.stderr.write("lessons-import: pack missing required field: " + k + "\n");
+        process.exit(3);
+      }
+    }
+    if (!Array.isArray(obj.lessons)) {
+      process.stderr.write("lessons-import: pack lessons field must be an array\n");
+      process.exit(3);
+    }
+    for (const f of [obj.publisher, obj.version, obj.created_at, obj.signature, obj.pubkey_sha256]) {
+      if (typeof f !== "string" || f.length === 0) {
+        process.stderr.write("lessons-import: pack metadata fields must be non-empty strings\n");
+        process.exit(3);
+      }
+    }
+    // Validate created_at as full ISO8601 UTC per LESSONS 2026-06-11.
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(obj.created_at)) {
+      process.stderr.write("lessons-import: created_at must match %Y-%m-%dT%H:%M:%SZ (got " + obj.created_at + ")\n");
+      process.exit(3);
+    }
+    process.stdout.write([obj.publisher, obj.version, obj.created_at, obj.signature, obj.pubkey_sha256, obj.lessons.length].join("\t") + "\n");
+  ' "$lessons_import_pack"
+}
+
+# Look up a publisher in the trusted-pubkeys.txt and emit the pubkey
+# payload to stdout, OR return 1 when absent. Format of each line in
+# the trust file:
+#   <publisher>  <pubkey-payload>  # <free-text-comment>
+# Comment lines (starting `#`) and blank lines are skipped. Per
+# LESSONS 2026-05-28 every printf goes through `printf -- '%s'`.
+lessons_import_lookup_publisher() {  # $1 = trust-file, $2 = publisher
+  local lessons_import_trust="$1" lessons_import_publisher="$2"
+  awk -v want="$lessons_import_publisher" '
+    BEGIN { count = 0 }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    {
+      # Field 1 = publisher; field 2 = pubkey payload; rest = comment.
+      pub = $1
+      key = $2
+      if (pub == want) {
+        print key
+        count = count + 1
+        exit
+      }
+    }
+    END { if (count == 0) exit 1 }
+  ' "$lessons_import_trust"
+}
+
+# Cross-check the pack's pubkey_sha256 against the resolved pubkey
+# content. Argv: <pubkey-payload> <pack-pubkey-sha256-hex>. Echoes the
+# resolved hex on success; returns 1 on mismatch (no stderr - caller
+# composes the refusal line so the format string lives there).
+lessons_import_check_pubkey_sha() {  # $1 = pubkey-payload, $2 = expected-sha
+  local lessons_import_pubkey="$1" lessons_import_expected="$2"
+  local lessons_import_actual
+  lessons_import_actual=$(printf -- '%s' "$lessons_import_pubkey" | shasum -a 256 | awk '{print $1}')
+  if [ "$lessons_import_actual" != "$lessons_import_expected" ]; then
+    printf -- '%s\n' "$lessons_import_actual"
+    return 1
+  fi
+  printf -- '%s\n' "$lessons_import_actual"
+}
+
+# Verify the pack body's ed25519 signature. The body is the envelope
+# JSON with the `signature` field removed and re-canonicalized via
+# Node's JSON.stringify (key order preserved as parsed). Per
+# cross-LESSONS fleet-control 2026-05-26 the test stub under
+# $HOME/.local/bin/openssl is the injection point.
+lessons_import_verify_signature() {  # $1 = pack-file, $2 = pubkey-payload
+  local lessons_import_pack="$1" lessons_import_pubkey="$2"
+  local lessons_import_body lessons_import_sig lessons_import_pubfile
+  lessons_import_body="$(mktemp -t fleet-lessons-import-body.XXXXXX)"
+  lessons_import_sig="$(mktemp -t fleet-lessons-import-sig.XXXXXX)"
+  lessons_import_pubfile="$(mktemp -t fleet-lessons-import-pub.XXXXXX)"
+  node -e '
+    const fs = require("fs");
+    const obj = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    fs.writeFileSync(process.argv[2], obj.signature || "");
+    delete obj.signature;
+    fs.writeFileSync(process.argv[3], JSON.stringify(obj));
+  ' "$lessons_import_pack" "$lessons_import_sig" "$lessons_import_body" \
+    || { rm -f "$lessons_import_body" "$lessons_import_sig" "$lessons_import_pubfile"; return 1; }
+  printf -- '%s' "$lessons_import_pubkey" > "$lessons_import_pubfile"
+  local lessons_import_rc=0
+  openssl dgst -sha256 -verify "$lessons_import_pubfile" \
+    -signature "$lessons_import_sig" "$lessons_import_body" \
+    >/dev/null 2>&1 || lessons_import_rc=$?
+  rm -f "$lessons_import_body" "$lessons_import_sig" "$lessons_import_pubfile"
+  return "$lessons_import_rc"
+}
+
+# Compute the 8-char text_sha of a normalized lesson body. Mirrors
+# lessons_promote_paragraph_sha minus the heading-skip (the body
+# arrives WITHOUT its `## ...` heading already). Normalization: strip
+# `<!-- EXPIRES: YYYY-MM-DD -->` metadata lines (so a pack body and
+# its imported copy hash identically); strip trailing whitespace per
+# line; trim leading + trailing blank lines; collapse internal
+# blank-line runs.
+lessons_import_compute_text_sha() {
+  awk '
+    BEGIN { count = 0 }
+    /^<!-- EXPIRES:/ { next }
+    {
+      sub(/[[:space:]]+$/, "", $0)
+      lines[++n] = $0
+    }
+    END {
+      start = 1
+      while (start <= n && lines[start] == "") start = start + 1
+      end = n
+      while (end >= start && lines[end] == "") end = end - 1
+      last_blank = 0
+      for (i = start; i <= end; i = i + 1) {
+        if (lines[i] == "") {
+          if (last_blank) continue
+          last_blank = 1
+        } else {
+          last_blank = 0
+        }
+        print lines[i]
+      }
+    }
+  ' | shasum -a 256 | awk '{print substr($1, 1, 8)}'
+}
+
+# Walk the existing CROSS_LESSONS.md in ONE awk pass and emit a sorted,
+# unique list of text_sha values - the dedupe needle table. Uses a temp
+# directory keyed by pid + nonce so concurrent invocations cannot stomp
+# each other. Per LESSONS 2026-06-15 the walk is one pass, no per-day
+# shellouts.
+lessons_import_existing_shas() {  # $1 = target-path
+  local lessons_import_target="$1" lessons_import_paratmp
+  [ -f "$lessons_import_target" ] || return 0
+  lessons_import_paratmp="$(mktemp -t fleet-lessons-import-paras.XXXXXX)"
+  # awk emits one record per paragraph: `BEGINPARA\nbody-line-1\n...\nENDPARA`.
+  awk '
+    BEGIN { count = 0; in_para = 0 }
+    /^### [0-9]{4}-[0-9]{2}-[0-9]{2}/ {
+      if (in_para) print "ENDPARA"
+      print "BEGINPARA"
+      in_para = 1
+      next
+    }
+    /^## / {
+      if (in_para) { print "ENDPARA"; in_para = 0 }
+      next
+    }
+    {
+      if (in_para) print
+    }
+    END { if (in_para) print "ENDPARA" }
+  ' "$lessons_import_target" > "$lessons_import_paratmp"
+  local lessons_import_body lessons_import_sha
+  lessons_import_body="$(mktemp -t fleet-lessons-import-body.XXXXXX)"
+  : > "$lessons_import_body"
+  local lessons_import_in=0
+  while IFS= read -r line; do
+    case "$line" in
+      BEGINPARA) : > "$lessons_import_body"; lessons_import_in=1 ;;
+      ENDPARA)
+        if [ -s "$lessons_import_body" ]; then
+          lessons_import_sha=$(lessons_import_compute_text_sha < "$lessons_import_body")
+          printf -- '%s\n' "$lessons_import_sha"
+        fi
+        : > "$lessons_import_body"
+        lessons_import_in=0
+        ;;
+      *)
+        if [ "$lessons_import_in" = "1" ]; then
+          printf -- '%s\n' "$line" >> "$lessons_import_body"
+        fi
+        ;;
+    esac
+  done < "$lessons_import_paratmp"
+  rm -f "$lessons_import_paratmp" "$lessons_import_body"
+}
+
+# Walk the pack and emit one TSV row per lesson, computing each
+# lesson's text_sha alongside. Output:
+#   <date>\t<title>\t<text_sha>\t<expires-or-dash>\t<body-tmpfile-path>
+# Per LESSONS 2026-06-08 the optional `expires` column uses a literal
+# `-` sentinel so IFS=$'\t' read does not shift left. Per LESSONS
+# 2026-06-15 this is ONE Node pass over the lessons array - no
+# per-day shellouts. The body-tmpfile paths live under
+# `$lessons_import_workdir` so the caller can clean up after the
+# section writer is done.
+lessons_import_walk_pack() {  # $1 = pack-file, $2 = workdir
+  local lessons_import_pack="$1" lessons_import_workdir="$2"
+  node -e '
+    const fs = require("fs");
+    const crypto = require("crypto");
+    const path = require("path");
+    const obj = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const workdir = process.argv[2];
+    function normalize(body) {
+      let lines = body.split("\n")
+        .filter(l => !/^<!-- EXPIRES:/.test(l))
+        .map(l => l.replace(/[\t ]+$/, ""));
+      while (lines.length && lines[0] === "") lines.shift();
+      while (lines.length && lines[lines.length-1] === "") lines.pop();
+      const out = [];
+      let lastBlank = false;
+      for (const l of lines) {
+        if (l === "") {
+          if (lastBlank) continue;
+          lastBlank = true;
+        } else {
+          lastBlank = false;
+        }
+        out.push(l);
+      }
+      return out.join("\n");
+    }
+    obj.lessons.forEach((les, i) => {
+      const body = les.body || "";
+      const norm = normalize(body);
+      // text_sha matches awk + shasum -a 256 first 8 hex chars of the
+      // normalized body PLUS a trailing newline (matches how the bash
+      // helper pipes it through shasum via stdin).
+      const sha = crypto.createHash("sha256").update(norm + "\n").digest("hex").slice(0, 8);
+      const bodyPath = path.join(workdir, "body-" + i + ".txt");
+      fs.writeFileSync(bodyPath, body);
+      const expires = (typeof les.expires === "string" && les.expires.length > 0) ? les.expires : "-";
+      process.stdout.write([les.date || "?", les.title || "?", sha, expires, bodyPath].join("\t") + "\n");
+    });
+  ' "$lessons_import_pack" "$lessons_import_workdir"
+}
+
+# Build the `## from <publisher>:<pack-slug>` section heading string.
+# Per LESSONS 2026-05-28 every printf goes through `printf -- '%s'`.
+lessons_import_build_section_heading() {  # $1 = publisher, $2 = version
+  local lessons_import_publisher="$1" lessons_import_version="$2"
+  printf -- '%s\n' "## from $lessons_import_publisher:v$lessons_import_version"
+}
+
+# Locate the namespace section in $1 and echo its starting line number.
+# Per LESSONS 2026-06-15 (`while (match(s, /pat/)) { s = before repl
+# after }` infinite-loop trap - the `## from <publisher>` heading
+# contains the literal text the finder is matching) we use the
+# CURSOR-based walk pattern: one linear NR-keyed pass that records
+# the line number of the first exact-string match and stops. Echoes
+# 0 if the section is absent.
+lessons_import_find_section_lineno() {  # $1 = target-path, $2 = heading-line
+  local lessons_import_target="$1" lessons_import_heading="$2"
+  [ -f "$lessons_import_target" ] || { echo 0; return 0; }
+  awk -v want="$lessons_import_heading" '
+    BEGIN { count = 0; cursor = 0; found = 0 }
+    {
+      cursor = NR
+      if (!found && $0 == want) {
+        found = cursor
+        # We do NOT exit - per LESSONS 2026-06-15 the cursor-walk
+        # pattern explicitly avoids the recursive while/match shape;
+        # walking the rest of the file is O(N) and safe.
+      }
+    }
+    END { print found+0 }
+  ' "$lessons_import_target"
+}
+
+# Append a single lesson paragraph under the namespace section. The
+# section is created at EOF if absent. The paragraph itself is
+# emitted as `### <date> — <title>` followed by the body and a
+# trailing blank line.
+lessons_import_insert_paragraph() {  # $1=target $2=heading $3=date $4=title $5=body-file $6=expires
+  local lessons_import_target="$1" lessons_import_heading="$2"
+  local lessons_import_date="$3" lessons_import_title="$4"
+  local lessons_import_bodyfile="$5" lessons_import_expires="$6"
+  local lessons_import_section_line
+  lessons_import_section_line=$(lessons_import_find_section_lineno "$lessons_import_target" "$lessons_import_heading")
+  local lessons_import_tmp
+  lessons_import_tmp="$(mktemp -t fleet-lessons-import-insert.XXXXXX)"
+  if [ "$lessons_import_section_line" = "0" ]; then
+    if [ -f "$lessons_import_target" ]; then
+      cp "$lessons_import_target" "$lessons_import_tmp"
+      if [ -n "$(tail -c1 "$lessons_import_tmp" 2>/dev/null)" ]; then
+        printf -- '\n' >> "$lessons_import_tmp"
+      fi
+    else
+      : > "$lessons_import_tmp"
+    fi
+    printf -- '\n%s\n\n' "$lessons_import_heading" >> "$lessons_import_tmp"
+    printf -- '### %s — %s\n' "$lessons_import_date" "$lessons_import_title" >> "$lessons_import_tmp"
+    if [ "$lessons_import_expires" != "-" ]; then
+      printf -- '<!-- EXPIRES: %s -->\n' "$lessons_import_expires" >> "$lessons_import_tmp"
+    fi
+    printf -- '\n' >> "$lessons_import_tmp"
+    cat "$lessons_import_bodyfile" >> "$lessons_import_tmp"
+    printf -- '\n\n' >> "$lessons_import_tmp"
+  else
+    # Append the paragraph BEFORE the next `## ` sibling header, OR
+    # at EOF if the namespace section is the last one in the file.
+    awk -v section_line="$lessons_import_section_line" \
+        -v heading="### $lessons_import_date — $lessons_import_title" \
+        -v expires="$lessons_import_expires" \
+        -v bodyfile="$lessons_import_bodyfile" '
+      function load_body(   line) {
+        body = ""
+        while ((getline line < bodyfile) > 0) {
+          body = (body == "" ? line : body "\n" line)
+        }
+        close(bodyfile)
+      }
+      BEGIN { count = 0; inserted = 0; load_body() }
+      {
+        if (!inserted && NR > section_line && /^## /) {
+          print heading
+          if (expires != "-") print "<!-- EXPIRES: " expires " -->"
+          print ""
+          print body
+          print ""
+          inserted = 1
+        }
+        print
+      }
+      END {
+        if (!inserted) {
+          print heading
+          if (expires != "-") print "<!-- EXPIRES: " expires " -->"
+          print ""
+          print body
+          print ""
+        }
+      }
+    ' "$lessons_import_target" > "$lessons_import_tmp"
+  fi
+  mv -f "$lessons_import_tmp" "$lessons_import_target"
+}
+
+# Emit lessons_imported event into the AGENT-FLEET kit-as-project
+# events.jsonl. Mirrors lessons_prune_emit_event (~line 27620) and
+# prompts_revert_emit_event (~line 616). Per LESSONS 2026-06-13 the
+# event's JSON escaping happens inside fleet_emit_event via
+# lib/common.sh's _json_escape - we pass k=v raw and let the writer
+# escape.
+lessons_import_emit_event() {  # $1=source $2=version $3=count $4=dedup $5=unsigned $6=reason
+  local lessons_import_source="$1" lessons_import_version="$2"
+  local lessons_import_count="$3" lessons_import_dedup="$4"
+  local lessons_import_unsigned="$5" lessons_import_reason="$6"
+  local lessons_import_lib_root
+  lessons_import_lib_root="$( cd "$( dirname "$0" )/.." && pwd )"
+  [ -f "$lessons_import_lib_root/lib/common.sh" ] || return 0
+  local lessons_import_cache="$HOME/.cache/agent-fleet-agent"
+  mkdir -p "$lessons_import_cache"
+  (
+    export SLUG="agent-fleet"
+    export CACHE_DIR="$lessons_import_cache"
+    export FLEET_PHASE="lessons-import"
+    # shellcheck disable=SC1090
+    source "$lessons_import_lib_root/lib/common.sh" >/dev/null 2>&1
+    if [ -n "$lessons_import_reason" ]; then
+      fleet_emit_event lessons_imported \
+        "source=$lessons_import_source" \
+        "version=$lessons_import_version" \
+        "count=$lessons_import_count" \
+        "dedup_skipped=$lessons_import_dedup" \
+        "unsigned=$lessons_import_unsigned" \
+        "reason=$lessons_import_reason"
+    else
+      fleet_emit_event lessons_imported \
+        "source=$lessons_import_source" \
+        "version=$lessons_import_version" \
+        "count=$lessons_import_count" \
+        "dedup_skipped=$lessons_import_dedup" \
+        "unsigned=$lessons_import_unsigned"
+    fi
+  ) || true
+}
+
+# Render the human dry-run/confirm preview. Width via
+# preflight_visible_width per LESSONS 2026-06-05. Per LESSONS
+# 2026-05-28 every printf of a publisher or path uses `printf -- '%s'`.
+lessons_import_render_preview() {  # $1=mode $2=publisher $3=version $4=created $5=heading $6=pack_count $7=new $8=skipped $9=lesson_dates_csv
+  local lessons_import_mode="$1" lessons_import_publisher="$2"
+  local lessons_import_version="$3" lessons_import_created="$4"
+  local lessons_import_heading="$5" lessons_import_pack_count="$6"
+  local lessons_import_new="$7" lessons_import_skipped="$8"
+  local lessons_import_dates="$9"
+  printf -- 'lessons-import: %s pack from %s v%s\n' \
+    "$lessons_import_mode" "$lessons_import_publisher" "$lessons_import_version"
+  printf -- '  created_at: %s\n' "$lessons_import_created"
+  printf -- '  lessons in pack: %s\n' "$lessons_import_pack_count"
+  printf -- '  imported: %s\n' "$lessons_import_new"
+  printf -- '  dedup_skipped: %s\n' "$lessons_import_skipped"
+  printf -- '  section heading: %s\n' "$lessons_import_heading"
+  printf -- '  first lesson dates: %s\n' "$lessons_import_dates"
+}
+
+# Render the structured JSON object for `--json` mode. Per LESSONS
+# 2026-06-13 every string is escaped via preflight_json_escape CALLED
+# DIRECTLY (no `lessons_import_json_escape` wrapper - the self-check
+# pattern would fire). Per LESSONS 2026-06-08 the dates accumulator
+# uses `BEGIN { count = 0 }` (implicit here - we use bash). Per
+# LESSONS 2026-05-28 every printf of a path or slug uses `printf --
+# '%s'`.
+lessons_import_render_json() {  # $1=pub $2=ver $3=created $4=validated $5=signed $6=count $7=skipped $8=heading $9=dates_csv
+  local lessons_import_publisher; lessons_import_publisher="$(preflight_json_escape "$1")"
+  local lessons_import_version; lessons_import_version="$(preflight_json_escape "$2")"
+  local lessons_import_created; lessons_import_created="$(preflight_json_escape "$3")"
+  local lessons_import_validated="$4"
+  local lessons_import_signed="$5"
+  local lessons_import_count="$6"
+  local lessons_import_skipped="$7"
+  local lessons_import_heading; lessons_import_heading="$(preflight_json_escape "$8")"
+  local lessons_import_dates_csv="$9"
+  # Walk the dates CSV and emit a JSON array of escaped strings.
+  local lessons_import_dates_json="["
+  local lessons_import_first=1
+  local IFS=','
+  local d
+  for d in $lessons_import_dates_csv; do
+    [ -z "$d" ] && continue
+    if [ "$lessons_import_first" = "1" ]; then
+      lessons_import_first=0
+    else
+      lessons_import_dates_json+=","
+    fi
+    lessons_import_dates_json+="\"$(preflight_json_escape "$d")\""
+  done
+  lessons_import_dates_json+="]"
+  printf -- '{"pack":{"publisher":"%s","version":"%s","created_at":"%s"},"validated":%s,"signed":%s,"imported_count":%s,"dedup_skipped_count":%s,"section_heading":"%s","lesson_dates":%s}\n' \
+    "$lessons_import_publisher" "$lessons_import_version" "$lessons_import_created" \
+    "$lessons_import_validated" "$lessons_import_signed" \
+    "$lessons_import_count" "$lessons_import_skipped" \
+    "$lessons_import_heading" "$lessons_import_dates_json"
+}
+
+lessons_import() {
+  shift  # drop the leading "lessons-import"
+
+  local lessons_import_url="" lessons_import_file=""
+  local lessons_import_dry_run=0 lessons_import_allow_unsigned=0
+  local lessons_import_reason="" lessons_import_json=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<USAGE
+fleet lessons-import — adopt a peer's signed LESSON PACK into your cross-LESSONS feed.
+
+Usage:
+  fleet lessons-import <url> [--dry-run] [--json]
+  fleet lessons-import --file <path> [--dry-run] [--json]
+  fleet lessons-import <url|--file ...> --allow-unsigned --reason "<ascii text>"
+
+Reads a signed JSON pack (schema_version=1) from a URL or local file,
+verifies the publisher's ed25519 signature against
+\$HOME/.local/share/agent-fleet/trusted-pubkeys.txt, dedupes against
+your existing CROSS_LESSONS.md, and appends the new paragraphs under
+a \`## from <publisher>:v<version>\` namespace section. Emits a
+lessons_imported {source, version, count, dedup_skipped, unsigned,
+reason?} event into the kit's events.jsonl on success.
+
+Flags:
+  --file <path>          read a local pack file instead of downloading
+  --dry-run              validate + dedupe + preview; do not mutate
+  --allow-unsigned       skip the signature check (mandatory --reason)
+  --reason "<text>"      ASCII rationale for --allow-unsigned (recorded verbatim)
+  --json                 emit one structured JSON object instead of human prose
+  -h, --help             this message
+
+Pack format (JSON envelope, UTF-8):
+  schema_version: 1
+  publisher:      "<str>"
+  version:        "<semver>"
+  created_at:     "%Y-%m-%dT%H:%M:%SZ"
+  signature:      "<base64 ed25519 over canonical body>"
+  pubkey_sha256:  "<hex sha256 of pubkey payload>"
+  lessons:        [{ date, title, body, expires?|null }, ...]
+
+Trust file (one entry per line, plus optional comment):
+  <publisher>  <pubkey-payload>  # <free-text-comment>
+
+Defends against LESSONS 2026-05-{26,27,28,30}, 2026-06-{01,03,05,08,11,13,15,19}.
+USAGE
+        exit 0 ;;
+      --file)
+        lessons_import_file="${2:-}"; shift 2 ;;
+      --dry-run)
+        lessons_import_dry_run=1; shift ;;
+      --allow-unsigned)
+        lessons_import_allow_unsigned=1; shift ;;
+      --reason)
+        lessons_import_reason="${2:-}"; shift 2 ;;
+      --json)
+        lessons_import_json=1; shift ;;
+      --)
+        shift; break ;;
+      -*)
+        printf -- 'lessons-import: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+      *)
+        if [ -z "$lessons_import_url" ]; then
+          lessons_import_url="$1"; shift
+        else
+          printf -- 'lessons-import: unexpected positional %s\n' "$1" >&2
+          exit 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$lessons_import_url" ] && [ -z "$lessons_import_file" ]; then
+    printf -- 'lessons-import: usage: bin/fleet lessons-import <url> | --file <path> [--dry-run] [--allow-unsigned --reason "<text>"] [--json]\n' >&2
+    exit 2
+  fi
+  if [ -n "$lessons_import_url" ] && [ -n "$lessons_import_file" ]; then
+    printf -- 'lessons-import: pass exactly one of <url> or --file <path>\n' >&2
+    exit 2
+  fi
+
+  if [ "$lessons_import_allow_unsigned" = "1" ] && [ -z "$lessons_import_reason" ]; then
+    printf -- 'lessons-import: --allow-unsigned requires --reason "<text>"\n' >&2
+    exit 2
+  fi
+  if [ -n "$lessons_import_reason" ]; then
+    # ASCII-only guard per LESSONS 2026-06-03. Pattern: every byte must
+    # be in 0x20-0x7e (printable ASCII). `LC_ALL=C grep` keeps the
+    # locale stable.
+    if printf -- '%s' "$lessons_import_reason" | LC_ALL=C grep -q '[^ -~]'; then
+      printf -- 'lessons-import: --reason must be ASCII only (drop em-dashes / smart quotes / non-Latin)\n' >&2
+      exit 2
+    fi
+  fi
+
+  # Resolve / download the pack into a temp file. The trap registered
+  # here cleans up the temp file on ANY exit path (success, refusal,
+  # SIGINT).
+  local lessons_import_pack_file=""
+  local lessons_import_workdir
+  lessons_import_workdir="$(mktemp -d -t fleet-lessons-import.XXXXXX)"
+  # shellcheck disable=SC2064  # the workdir path is fixed at trap time, intentional
+  trap "rm -rf '$lessons_import_workdir'" EXIT
+  if [ -n "$lessons_import_file" ]; then
+    if [ ! -f "$lessons_import_file" ]; then
+      printf -- 'lessons-import: file %s not found\n' "$lessons_import_file" >&2
+      exit 2
+    fi
+    lessons_import_pack_file="$lessons_import_file"
+  else
+    lessons_import_pack_file="$lessons_import_workdir/pack.json"
+    lessons_import_download_pack "$lessons_import_url" "$lessons_import_pack_file" >/dev/null \
+      || exit 3
+  fi
+
+  # Validate envelope (Node + JSON.parse + required-field check).
+  local lessons_import_env
+  lessons_import_env=$(lessons_import_validate_envelope "$lessons_import_pack_file") || exit 3
+  local lessons_import_publisher lessons_import_version lessons_import_created
+  local lessons_import_pack_pksha lessons_import_pack_count
+  # The TSV's signature column is intentionally discarded into `_` -
+  # we re-derive the signature inside lessons_import_verify_signature
+  # from the pack file itself so the canonical body / signature pair
+  # stays atomic. Per LESSONS 2026-06-08 every middle column carries
+  # at least one non-empty token (the validator guarantees signature
+  # is a non-empty string) so the IFS=$'\t' read does not shift left.
+  IFS=$'\t' read -r lessons_import_publisher lessons_import_version lessons_import_created \
+    _ lessons_import_pack_pksha lessons_import_pack_count \
+    <<< "$lessons_import_env"
+
+  # Signature path: lookup publisher → trust file → pubkey payload →
+  # shasum cross-check → openssl verify. The --allow-unsigned override
+  # skips this branch but still records `unsigned=1` + reason in the
+  # event.
+  local lessons_import_signed=0
+  if [ "$lessons_import_allow_unsigned" != "1" ]; then
+    local lessons_import_trust_file
+    lessons_import_trust_file=$(lessons_import_resolve_pubkey_file) || exit 3
+    local lessons_import_pubkey
+    if ! lessons_import_pubkey=$(lessons_import_lookup_publisher "$lessons_import_trust_file" "$lessons_import_publisher"); then
+      printf -- 'lessons-import: publisher %s not in trusted-pubkeys.txt. add the pubkey first, OR re-run with --allow-unsigned --reason "<text>".\n' \
+        "$lessons_import_publisher" >&2
+      exit 3
+    fi
+    local lessons_import_actual_pksha
+    if ! lessons_import_actual_pksha=$(lessons_import_check_pubkey_sha "$lessons_import_pubkey" "$lessons_import_pack_pksha"); then
+      printf -- 'lessons-import: pubkey_sha256 in pack (%s) does not match resolved key (%s)\n' \
+        "$lessons_import_pack_pksha" "$lessons_import_actual_pksha" >&2
+      exit 3
+    fi
+    if ! lessons_import_verify_signature "$lessons_import_pack_file" "$lessons_import_pubkey"; then
+      printf -- 'lessons-import: signature verification failed for %s v%s\n' \
+        "$lessons_import_publisher" "$lessons_import_version" >&2
+      exit 3
+    fi
+    lessons_import_signed=1
+  fi
+
+  # Walk the pack into TSV rows + per-lesson body-file paths.
+  local lessons_import_tsv
+  lessons_import_tsv=$(lessons_import_walk_pack "$lessons_import_pack_file" "$lessons_import_workdir")
+
+  # Build the dedupe needle set from the existing CROSS_LESSONS.md.
+  local lessons_import_target
+  lessons_import_target=$(lessons_import_resolve_target_path)
+  local lessons_import_existing
+  lessons_import_existing=$(lessons_import_existing_shas "$lessons_import_target" | LC_ALL=C sort -u)
+
+  local lessons_import_heading
+  lessons_import_heading=$(lessons_import_build_section_heading \
+    "$lessons_import_publisher" "$lessons_import_version")
+
+  # Partition: build the new-paragraph TSV (rows whose text_sha is NOT
+  # in the existing set) and count skips. Per LESSONS 2026-06-08
+  # `IFS=$'\t'` middle-empty collapse uses `-` sentinel - the walker
+  # already emits `-` for null expires, so every row has exactly five
+  # fields.
+  local lessons_import_new_count=0 lessons_import_skip_count=0
+  local lessons_import_new_tsv="" lessons_import_dates=""
+  local lessons_import_date lessons_import_title lessons_import_sha
+  local lessons_import_expires lessons_import_bodyfile
+  while IFS=$'\t' read -r lessons_import_date lessons_import_title lessons_import_sha \
+                            lessons_import_expires lessons_import_bodyfile; do
+    [ -z "$lessons_import_date" ] && continue
+    if printf -- '%s\n' "$lessons_import_existing" | grep -qxF -- "$lessons_import_sha"; then
+      lessons_import_skip_count=$(( lessons_import_skip_count + 1 ))
+      continue
+    fi
+    lessons_import_new_count=$(( lessons_import_new_count + 1 ))
+    if [ -z "$lessons_import_new_tsv" ]; then
+      lessons_import_new_tsv="$lessons_import_date	$lessons_import_title	$lessons_import_sha	$lessons_import_expires	$lessons_import_bodyfile"
+    else
+      lessons_import_new_tsv="$lessons_import_new_tsv
+$lessons_import_date	$lessons_import_title	$lessons_import_sha	$lessons_import_expires	$lessons_import_bodyfile"
+    fi
+    if [ -z "$lessons_import_dates" ]; then
+      lessons_import_dates="$lessons_import_date"
+    else
+      lessons_import_dates="$lessons_import_dates,$lessons_import_date"
+    fi
+  done <<< "$lessons_import_tsv"
+
+  # First-3-dates preview slice (CSV).
+  local lessons_import_dates_preview
+  lessons_import_dates_preview=$(printf -- '%s' "$lessons_import_dates" | awk -F',' '
+    BEGIN { count = 0 }
+    {
+      for (i = 1; i <= NF && i <= 3; i = i + 1) {
+        if (i > 1) printf(",")
+        printf("%s", $i)
+      }
+    }
+  ')
+
+  # Dry-run path: render preview, no writes, no event.
+  if [ "$lessons_import_dry_run" = "1" ]; then
+    if [ "$lessons_import_json" = "1" ]; then
+      lessons_import_render_json \
+        "$lessons_import_publisher" "$lessons_import_version" \
+        "$lessons_import_created" "true" \
+        "$( [ "$lessons_import_signed" = "1" ] && printf -- 'true' || printf -- 'false' )" \
+        "$lessons_import_new_count" "$lessons_import_skip_count" \
+        "$lessons_import_heading" "$lessons_import_dates_preview"
+    else
+      lessons_import_render_preview "dry-run" \
+        "$lessons_import_publisher" "$lessons_import_version" \
+        "$lessons_import_created" "$lessons_import_heading" \
+        "$lessons_import_pack_count" "$lessons_import_new_count" \
+        "$lessons_import_skip_count" "$lessons_import_dates_preview"
+    fi
+    exit 0
+  fi
+
+  # Mutation path: insert every new paragraph under the namespace
+  # section. Per LESSONS 2026-06-15 the section-finder uses the
+  # cursor-walk pattern; the inserter creates the section once at EOF
+  # if absent, then appends paragraphs.
+  if [ "$lessons_import_new_count" -gt 0 ]; then
+    while IFS=$'\t' read -r lessons_import_date lessons_import_title lessons_import_sha \
+                              lessons_import_expires lessons_import_bodyfile; do
+      [ -z "$lessons_import_date" ] && continue
+      lessons_import_insert_paragraph "$lessons_import_target" \
+        "$lessons_import_heading" "$lessons_import_date" "$lessons_import_title" \
+        "$lessons_import_bodyfile" "$lessons_import_expires"
+    done <<< "$lessons_import_new_tsv"
+  fi
+
+  # Emit the event AFTER the writes so a partial-write does not get
+  # double-counted in a future re-run. Per LESSONS 2026-06-13 the
+  # event payload escaping happens inside fleet_emit_event itself.
+  local lessons_import_unsigned_flag
+  if [ "$lessons_import_signed" = "1" ]; then
+    lessons_import_unsigned_flag=0
+  else
+    lessons_import_unsigned_flag=1
+  fi
+  lessons_import_emit_event \
+    "$lessons_import_publisher" "$lessons_import_version" \
+    "$lessons_import_new_count" "$lessons_import_skip_count" \
+    "$lessons_import_unsigned_flag" "$lessons_import_reason"
+
+  # Render the final result block.
+  if [ "$lessons_import_json" = "1" ]; then
+    lessons_import_render_json \
+      "$lessons_import_publisher" "$lessons_import_version" \
+      "$lessons_import_created" "true" \
+      "$( [ "$lessons_import_signed" = "1" ] && printf -- 'true' || printf -- 'false' )" \
+      "$lessons_import_new_count" "$lessons_import_skip_count" \
+      "$lessons_import_heading" "$lessons_import_dates_preview"
+  else
+    lessons_import_render_preview "imported" \
+      "$lessons_import_publisher" "$lessons_import_version" \
+      "$lessons_import_created" "$lessons_import_heading" \
+      "$lessons_import_pack_count" "$lessons_import_new_count" \
+      "$lessons_import_skip_count" "$lessons_import_dates_preview"
+    printf -- '  wrote: %s paragraphs to %s\n' \
+      "$lessons_import_new_count" "$lessons_import_target"
+    printf -- '  event: lessons_imported source=%s version=%s count=%s dedup_skipped=%s unsigned=%s\n' \
+      "$lessons_import_publisher" "$lessons_import_version" \
+      "$lessons_import_new_count" "$lessons_import_skip_count" \
+      "$lessons_import_unsigned_flag"
+  fi
+  exit 0
+}
+
+if [ "$CMD" = "lessons-import" ]; then
+  lessons_import "$@"
 fi
 
 # --- lessons-rank (ticket 0057) ------------------------------------------
