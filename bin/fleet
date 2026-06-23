@@ -113,6 +113,9 @@
 #   fleet why <slug>          compose the case for keeping the kit installed against the slug's own telemetry
 #                             (ticket 0062 — pure reader of events.jsonl + runs.jsonl + CROSS_LESSONS.md;
 #                              --all / --audience peer|manager|self / --why-not / --json; trailing 8-week window)
+#   fleet migrate --export | --import package the fleet for a new machine or restore it from a tarball
+#                             (ticket 0063 — pure packager+orchestrator; --redact / --encrypt / --dry-run /
+#                              --skip-clone / --json; reuses lib/install.sh per slug on import)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -1557,6 +1560,1091 @@ USAGE
 
 if [ "$CMD" = "add" ]; then
   add "$@"
+fi
+
+# --- migrate --------------------------------------------------------------
+# Ticket 0063. `fleet migrate --export [<path>]` packages the operator's
+# whole fleet (per-slug agents.config.sh + events.jsonl + runs.jsonl +
+# events.jsonl.archive/* if present, plus the cross-fleet CROSS_LESSONS.md)
+# into one timestamped, manifest-validated, optionally-encrypted tarball.
+# `fleet migrate --import <path>` round-trips the tarball onto a fresh
+# machine: clones each repo if missing, re-runs `lib/install.sh` per slug
+# the way 0011 onboard does, restores each $CACHE_DIR/events.jsonl +
+# runs.jsonl, restores CROSS_LESSONS.md, and runs THREE per-slug verify
+# assertions (pr_footer_posted count + green-day-streak + lesson_promoted
+# count) against the manifest's expected_verify object.
+#
+# Helpers MUST be defined ABOVE the dispatcher per LESSONS 2026-06-05
+# (forward-reference trap). Every code path ends `exit 0/2/3` per LESSONS
+# 2026-06-01. Local var names are prefixed `migrate_*` per LESSONS
+# 2026-06-19 (self-check false positive on subcommand-name shadow).
+# JSON escape uses `migrate_json_escape` — an inline COPY of the canonical
+# `preflight_json_escape` body (defined ~L1582, AFTER the migrate dispatcher).
+# Per LESSONS 2026-06-13 this is NOT a `*_json_escape`-named wrapper that
+# delegates to the canonical helper (which would trip the self-check
+# sign-extension pattern); it is a duplicated body so the LESSONS 2026-06-03
+# guard (`code -ge 0`) stays inline. Same shape as `replay_batch_json_escape`
+# (ticket 0034). All awk accumulators
+# declare `BEGIN { count = 0 }` per LESSONS 2026-06-08 (empty-string-key
+# trap). Per LESSONS 2026-06-11 the timestamp uses `date -u
+# '+%Y-%m-%dT%H:%M:%SZ'` (no `date -j -f` involved).
+#
+# Pure packager / orchestrator: ZERO events.jsonl writes, ZERO new event
+# types, ZERO lib/common.sh / prompts/ / AGENTS.md changes. Re-uses
+# existing `lib/install.sh` (via $FLEET_INSTALL_CMD test seam, matching
+# the 0011 onboard pattern).
+
+# Inline copy of preflight_json_escape (defined LATER in this file at
+# ~L1582). LESSONS 2026-06-05 (dispatcher forward-reference trap): the
+# migrate dispatcher fires at execution time before bash has parsed
+# preflight_json_escape's body, so calling that helper from any
+# migrate_render_* function yields `command not found`. Same shape as
+# add_visible_width's inline copy of preflight_visible_width and
+# replay_batch_json_escape's inline copy of provenance_json_escape.
+# Body identical to the canonical definition so the LESSONS 2026-06-03
+# UTF-8 sign-extension guard (`code -ge 0`) stays in force.
+# Per LESSONS 2026-06-13 this is NOT a `*_json_escape`-named wrapper
+# around `preflight_json_escape` — it is a duplicated body, not a
+# delegating wrapper, so the self-check sign-extension pattern sees its
+# guard inline and does not flag it as an unprotected wrapper. The
+# function name `migrate_json_escape` is intentionally distinct from
+# `preflight_json_escape` to make the duplicate explicit.
+migrate_json_escape() {
+  local s="${1-}" out="" i ch code
+  for (( i=0; i<${#s}; i++ )); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '\') out+='\\' ;;
+      '"') out+='\"' ;;
+      $'\b') out+='\b' ;;
+      $'\f') out+='\f' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *)
+        printf -v code '%d' "'$ch"
+        if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+          printf -v out '%s\\u%04x' "$out" "$code"
+        else
+          out+="$ch"
+        fi
+        ;;
+    esac
+  done
+  printf -- '%s' "$out"
+}
+
+# migrate_discover_slugs — emit one slug per line, alphabetically sorted.
+# Same shape as add_discover_source_slugs / overview_discover. Manifest
+# reads happen INSIDE a subshell per LESSONS 2026-06-05 (export-in-subshell
+# trap) so caller env stays clean.
+migrate_discover_slugs() {
+  local migrate_root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local migrate_root_b="$HOME/.local/share/agent-fleet/projects"
+  { find "$migrate_root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null
+    find "$migrate_root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null
+  } | while read -r migrate_m; do
+    [ -z "$migrate_m" ] && continue
+    local migrate_slug
+    # shellcheck disable=SC1090
+    migrate_slug=$( ( source "$migrate_m" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )
+    [ -n "$migrate_slug" ] && printf -- '%s\n' "$migrate_slug"
+  done | LC_ALL=C sort -u
+}
+
+# migrate_resolve_manifest_path — echo the path to a slug's
+# agents.config.sh. Empty string when not found.
+migrate_resolve_manifest_path() {  # $1 = slug
+  local migrate_want="$1"
+  local migrate_root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local migrate_root_b="$HOME/.local/share/agent-fleet/projects"
+  local migrate_m migrate_slug
+  { find "$migrate_root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null
+    find "$migrate_root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null
+  } | while read -r migrate_m; do
+    [ -z "$migrate_m" ] && continue
+    # shellcheck disable=SC1090
+    migrate_slug=$( ( source "$migrate_m" 2>/dev/null; printf -- '%s' "${SLUG:-}" ) )
+    if [ "$migrate_slug" = "$migrate_want" ]; then
+      printf -- '%s' "$migrate_m"
+      return 0
+    fi
+  done
+}
+
+# migrate_cache_dir — echo the per-slug cache root (matches the kit's
+# convention used by invoice / morning / others).
+migrate_cache_dir() {  # $1 = slug
+  printf -- '%s' "$HOME/.cache/$1-agent"
+}
+
+# migrate_resolve_cross_lessons_path — same precedence 0028 / 0051 use.
+migrate_resolve_cross_lessons_path() {
+  if [ -n "${FLEET_CROSS_LESSONS:-}" ]; then
+    printf -- '%s' "$FLEET_CROSS_LESSONS"
+    return 0
+  fi
+  printf -- '%s' "$HOME/.local/share/agent-fleet/CROSS_LESSONS.md"
+}
+
+# migrate_compute_file_sha256 — one shasum over the file. Empty string +
+# return 1 when the file is missing.
+migrate_compute_file_sha256() {  # $1 = path
+  local migrate_path="$1"
+  if [ ! -f "$migrate_path" ]; then
+    return 1
+  fi
+  shasum -a 256 < "$migrate_path" | awk 'BEGIN { count = 0 } { print $1; count++ }'
+}
+
+# migrate_compute_expected_verify — emit TSV
+# `<pr_footer_posted_count>\t<streak_days>\t<lessons_promoted_count>` for
+# one slug. ONE awk pass over events.jsonl. Per LESSONS 2026-06-08 the
+# accumulator declares `BEGIN { count = 0 }`. Per LESSONS 2026-06-15 the
+# streak math is pure awk arithmetic (no per-day shellout). Streak
+# definition for verify: count of DISTINCT YYYY-MM-DD dates carrying at
+# least one `pr_opened` event. This is the same green-day predicate
+# `fleet streak` uses, simplified to "no per-event-line negative
+# predicate" — the verify pass needs a byte-deterministic count, not the
+# operator-facing streak narrative.
+migrate_compute_expected_verify() {  # $1 = events.jsonl path
+  local migrate_events="$1"
+  if [ ! -f "$migrate_events" ]; then
+    printf -- '0\t0\t0\n'
+    return 0
+  fi
+  awk '
+    BEGIN { count = 0; promoted = 0; days = 0 }
+    {
+      # Extract type via simple substring — no JSON parse needed for the
+      # well-known event shape the kit emits.
+      if (match($0, /"type":"[^"]+"/)) {
+        t = substr($0, RSTART + 8, RLENGTH - 9)
+      } else {
+        t = ""
+      }
+      if (t == "pr_footer_posted") count++
+      if (t == "lesson_promoted") promoted++
+      if (t == "pr_opened") {
+        # Distinct ts-date (first 10 chars of ts value).
+        if (match($0, /"ts":"[^"]+"/)) {
+          ts = substr($0, RSTART + 6, RLENGTH - 7)
+          d = substr(ts, 1, 10)
+          if (!(d in seen_days)) {
+            seen_days[d] = 1
+            days++
+          }
+        }
+      }
+    }
+    END { printf "%d\t%d\t%d\n", count+0, days+0, promoted+0 }
+  ' "$migrate_events"
+}
+
+# migrate_extract_repo_url — read REPO_URL from a slug's manifest. Empty
+# string when unset. Subshell-sourced per LESSONS 2026-06-05.
+migrate_extract_repo_url() {  # $1 = manifest path
+  local migrate_m="$1"
+  if [ ! -f "$migrate_m" ]; then
+    return 0
+  fi
+  # shellcheck disable=SC1090
+  ( source "$migrate_m" 2>/dev/null; printf -- '%s' "${REPO_URL:-}" )
+}
+
+# migrate_extract_repo_path — derive the candidate working-tree path for
+# a slug. Convention: the directory containing the manifest IS the repo.
+migrate_extract_repo_path() {  # $1 = manifest path
+  printf -- '%s' "$(dirname "$1")"
+}
+
+# migrate_now_iso — emit the export's `created_at`. Uses
+# `date -u '+%Y-%m-%dT%H:%M:%SZ'` directly per LESSONS 2026-06-11 (BSD
+# `date -j -f` fills missing time fields trap — we avoid `-j -f` entirely
+# by reading the wall-clock with no input format). FLEET_NOW_OVERRIDE is
+# the test seam: when set and parses cleanly, pass it through verbatim.
+migrate_now_iso() {
+  if [ -n "${FLEET_NOW_OVERRIDE:-}" ]; then
+    case "$FLEET_NOW_OVERRIDE" in
+      [12][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
+        printf -- '%s' "$FLEET_NOW_OVERRIDE"
+        return 0 ;;
+    esac
+  fi
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+# migrate_today_ymd — emit `YYYY-MM-DD` for the default-path filename.
+migrate_today_ymd() {
+  local migrate_iso
+  migrate_iso="$(migrate_now_iso)"
+  printf -- '%s' "${migrate_iso%%T*}"
+}
+
+# migrate_render_redacted_slug — emit the pseudonym for slug index N
+# (1-based). project-a, project-b, project-c, ... project-z, then
+# project-aa, etc.
+migrate_render_redacted_slug() {  # $1 = 1-based index
+  local migrate_n="$1"
+  local migrate_letter
+  if [ "$migrate_n" -le 26 ]; then
+    # Map 1..26 to a..z
+    migrate_letter="$(awk -v n="$migrate_n" 'BEGIN { printf "%c", 96 + n }')"
+    printf -- 'project-%s' "$migrate_letter"
+  else
+    printf -- 'project-%d' "$migrate_n"
+  fi
+}
+
+# migrate_redact_runs_file — apply 0053's dollar-banding to runs.jsonl
+# in place (destination file). Per LESSONS 2026-06-15 (cursor-walk) the
+# redaction MUST use the cursor pattern because band tokens like `~$5`
+# contain `$5` which would re-match `\$[0-9]+`. Same shape as
+# `portfolio_redact_text`'s dollar pass.
+migrate_redact_runs_file() {  # $1 = src $2 = dst
+  local migrate_src="$1" migrate_dst="$2"
+  if [ ! -f "$migrate_src" ]; then
+    : > "$migrate_dst"
+    return 0
+  fi
+  LC_ALL=C awk '
+    BEGIN { count = 0 }
+    {
+      s = $0
+      out = ""; rest = s
+      while (match(rest, /\$[0-9]+(\.[0-9]+)?/)) {
+        raw = substr(rest, RSTART, RLENGTH)
+        amt = raw
+        sub(/^\$/, "", amt)
+        a = amt + 0
+        band = ""
+        if      (a < 1)    band = "<$1"
+        else if (a < 1.5)  band = "~$1"
+        else if (a < 3.5)  band = "~$2"
+        else if (a < 7.5)  band = "~$5"
+        else if (a < 17.5) band = "~$10"
+        else if (a < 37.5) band = "~$25"
+        else if (a < 75)   band = "~$50"
+        else if (a <= 100) band = "~$100"
+        else               band = ">$100"
+        out = out substr(rest, 1, RSTART - 1) band
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      print out rest
+      count++
+    }
+  ' "$migrate_src" > "$migrate_dst"
+}
+
+# migrate_pack_tarball — pack a staging directory into a .tar.gz at $2.
+# Two-pass build for tarball_sha256 self-verification: first pack WITHOUT
+# the manifest to derive the canonical hash, then write the manifest with
+# that hash, then re-pack INCLUDING the manifest. `migrate_validate_manifest`
+# mirrors this by extracting + re-packing-without-manifest and comparing.
+# Per LESSONS 2026-05-28 (`printf '-...'` leading-dash trap) every path
+# printed below is wrapped through `printf -- '%s'`.
+migrate_pack_tarball() {  # $1 = stage_dir $2 = out_tarball
+  local migrate_stage="$1" migrate_out="$2"
+  ( cd "$migrate_stage" && tar -czf "$migrate_out" . )
+}
+
+# migrate_compute_sansmanifest_sha256 — derive a CONTENT-only hash of the
+# stage tree that EXCLUDES fleet-export.json AND ignores tar metadata
+# (mtimes, ownership, uname). The hash is the sha256 of the
+# alphabetically-sorted, NUL-separated list of `<relative-path>:<sha256>`
+# pairs for every regular file under the stage. This is deterministic
+# across the export side (where the stage is freshly built under
+# `mktemp -d`) and the import side (where the stage is freshly extracted
+# under `mktemp -d`) because file CONTENTS round-trip byte-exact through
+# tar even when tar header metadata does not. Per LESSONS 2026-06-15 the
+# walk is ONE find pass + one shasum per file — no per-day shellouts.
+# Per LESSONS 2026-06-08 the awk accumulator declares `BEGIN { count = 0 }`.
+migrate_compute_sansmanifest_sha256() {  # $1 = stage_dir
+  local migrate_stage="$1"
+  local migrate_digest_file
+  migrate_digest_file="$(mktemp -t fleet-migrate-digest.XXXXXX)"
+  # Build the digest list: `<rel-path>\t<file-sha256>\n` for every regular
+  # file under the stage EXCEPT fleet-export.json and the temporary
+  # sidecar files. Pure shell loop — no nested awk/`shasum`/quoting trap.
+  ( cd "$migrate_stage" && find . -type f \
+      ! -name 'fleet-export.json' \
+      ! -name '.migrate-repo-url' \
+      ! -name '.migrate-repo-path' \
+      -print 2>/dev/null
+  ) | LC_ALL=C sort | while IFS= read -r migrate_rel; do
+    [ -z "$migrate_rel" ] && continue
+    local migrate_clean_rel migrate_file_sha
+    migrate_clean_rel="${migrate_rel#./}"
+    migrate_file_sha="$(shasum -a 256 < "$migrate_stage/$migrate_clean_rel" \
+                        | awk 'BEGIN { count = 0 } { print $1; count++ }')"
+    printf -- '%s\t%s\n' "$migrate_clean_rel" "$migrate_file_sha" >> "$migrate_digest_file"
+  done
+  local migrate_hash
+  migrate_hash="$(shasum -a 256 < "$migrate_digest_file" \
+                   | awk 'BEGIN { count = 0 } { print $1; count++ }')"
+  rm -f "$migrate_digest_file"
+  printf -- '%s' "$migrate_hash"
+}
+
+# migrate_render_manifest_json — produce fleet-export.json. JSON escape
+# calls `preflight_json_escape` directly per LESSONS 2026-06-13. Per-slug
+# rows carry slug / repo_path / repo_url / events_bytes / runs_bytes /
+# events_sha256 / runs_sha256 / expected_verify{...}. Top-level carries
+# schema_version / created_at / host / slugs / tarball_sha256.
+migrate_render_manifest_json() {  # $1 = stage_dir, $2 = tarball_sha
+  local migrate_stage="$1" migrate_tarball_sha="$2"
+  local migrate_created_at migrate_host
+  migrate_created_at="$(migrate_now_iso)"
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) migrate_host="darwin" ;;
+    Linux)  migrate_host="linux" ;;
+    *)      migrate_host="unknown" ;;
+  esac
+  local migrate_esc_at migrate_esc_host migrate_esc_sha
+  migrate_esc_at="$(migrate_json_escape "$migrate_created_at")"
+  migrate_esc_host="$(migrate_json_escape "$migrate_host")"
+  migrate_esc_sha="$(migrate_json_escape "$migrate_tarball_sha")"
+
+  printf -- '{'
+  printf -- '"schema_version":1,'
+  printf -- '"created_at":"%s",' "$migrate_esc_at"
+  printf -- '"host":"%s",' "$migrate_esc_host"
+  printf -- '"slugs":['
+
+  local migrate_first=1 migrate_dir migrate_slug migrate_events migrate_runs
+  local migrate_events_bytes migrate_runs_bytes migrate_events_sha migrate_runs_sha
+  local migrate_repo_url migrate_repo_path migrate_verify migrate_pr_count migrate_streak migrate_promoted
+  local migrate_esc_slug migrate_esc_repo_url migrate_esc_repo_path migrate_esc_esha migrate_esc_rsha
+  for migrate_dir in "$migrate_stage"/*/; do
+    migrate_slug="$(basename "$migrate_dir")"
+    case "$migrate_slug" in cross-lessons) continue ;; esac
+    [ -d "$migrate_dir" ] || continue
+    migrate_events="$migrate_dir/events.jsonl"
+    migrate_runs="$migrate_dir/runs.jsonl"
+    if [ -f "$migrate_events" ]; then
+      migrate_events_bytes="$(wc -c < "$migrate_events" | tr -d ' ')"
+      migrate_events_sha="$(migrate_compute_file_sha256 "$migrate_events")"
+    else
+      migrate_events_bytes=0
+      migrate_events_sha=""
+    fi
+    if [ -f "$migrate_runs" ]; then
+      migrate_runs_bytes="$(wc -c < "$migrate_runs" | tr -d ' ')"
+      migrate_runs_sha="$(migrate_compute_file_sha256 "$migrate_runs")"
+    else
+      migrate_runs_bytes=0
+      migrate_runs_sha=""
+    fi
+    # Read stashed sidecar files for repo_url + repo_path (written during
+    # the staging step so we don't re-shell into the manifest here). Per
+    # LESSONS 2026-05-27 (`$(cat …)` round-trip strips trailing newlines)
+    # we avoid `$(cat …)` and read via a single awk pass — sidecar values
+    # are single-line tokens written without a trailing newline, and the
+    # awk reader is byte-safe for this shape.
+    migrate_repo_url=""
+    migrate_repo_path=""
+    if [ -f "$migrate_dir/.migrate-repo-url" ]; then
+      migrate_repo_url="$(awk 'BEGIN { count = 0 } { print; count++ }' "$migrate_dir/.migrate-repo-url")"
+    fi
+    if [ -f "$migrate_dir/.migrate-repo-path" ]; then
+      migrate_repo_path="$(awk 'BEGIN { count = 0 } { print; count++ }' "$migrate_dir/.migrate-repo-path")"
+    fi
+    migrate_verify="$(migrate_compute_expected_verify "$migrate_events")"
+    migrate_pr_count="$(printf -- '%s' "$migrate_verify" | awk 'BEGIN { count = 0 } { print $1; count++ }')"
+    migrate_streak="$(printf -- '%s' "$migrate_verify" | awk 'BEGIN { count = 0 } { print $2; count++ }')"
+    migrate_promoted="$(printf -- '%s' "$migrate_verify" | awk 'BEGIN { count = 0 } { print $3; count++ }')"
+
+    migrate_esc_slug="$(migrate_json_escape "$migrate_slug")"
+    migrate_esc_repo_url="$(migrate_json_escape "$migrate_repo_url")"
+    migrate_esc_repo_path="$(migrate_json_escape "$migrate_repo_path")"
+    migrate_esc_esha="$(migrate_json_escape "$migrate_events_sha")"
+    migrate_esc_rsha="$(migrate_json_escape "$migrate_runs_sha")"
+
+    if [ "$migrate_first" = "1" ]; then
+      migrate_first=0
+    else
+      printf -- ','
+    fi
+    printf -- '{'
+    printf -- '"slug":"%s",' "$migrate_esc_slug"
+    printf -- '"repo_path":"%s",' "$migrate_esc_repo_path"
+    printf -- '"repo_url":"%s",' "$migrate_esc_repo_url"
+    printf -- '"events_bytes":%d,' "$migrate_events_bytes"
+    printf -- '"runs_bytes":%d,' "$migrate_runs_bytes"
+    printf -- '"events_sha256":"%s",' "$migrate_esc_esha"
+    printf -- '"runs_sha256":"%s",' "$migrate_esc_rsha"
+    printf -- '"expected_verify":{"pr_footer_posted_count":%d,"streak_days":%d,"lessons_promoted_count":%d}' \
+              "$migrate_pr_count" "$migrate_streak" "$migrate_promoted"
+    printf -- '}'
+  done
+  printf -- '],'
+  printf -- '"tarball_sha256":"%s"' "$migrate_esc_sha"
+  printf -- '}\n'
+}
+
+# migrate_render_export_text — the human export summary table.
+migrate_render_export_text() {  # $1 = out_path, $2 = stage_dir
+  local migrate_out="$1" migrate_stage="$2"
+  printf -- 'fleet migrate — exported to %s\n\n' "$migrate_out"
+  local migrate_dir migrate_slug migrate_events_bytes migrate_runs_bytes
+  for migrate_dir in "$migrate_stage"/*/; do
+    migrate_slug="$(basename "$migrate_dir")"
+    case "$migrate_slug" in cross-lessons) continue ;; esac
+    [ -d "$migrate_dir" ] || continue
+    if [ -f "$migrate_dir/events.jsonl" ]; then
+      migrate_events_bytes="$(wc -c < "$migrate_dir/events.jsonl" | tr -d ' ')"
+    else
+      migrate_events_bytes=0
+    fi
+    if [ -f "$migrate_dir/runs.jsonl" ]; then
+      migrate_runs_bytes="$(wc -c < "$migrate_dir/runs.jsonl" | tr -d ' ')"
+    else
+      migrate_runs_bytes=0
+    fi
+    printf -- '  %s  agents.config.sh + events.jsonl (%d B) + runs.jsonl (%d B)\n' \
+              "$migrate_slug" "$migrate_events_bytes" "$migrate_runs_bytes"
+  done
+  if [ -f "$migrate_stage/cross-lessons/CROSS_LESSONS.md" ]; then
+    local migrate_cl_bytes
+    migrate_cl_bytes="$(wc -c < "$migrate_stage/cross-lessons/CROSS_LESSONS.md" | tr -d ' ')"
+    printf -- '  cross-fleet  CROSS_LESSONS.md (%d B)\n' "$migrate_cl_bytes"
+  fi
+  if [ -f "$migrate_out" ]; then
+    local migrate_tar_bytes
+    migrate_tar_bytes="$(wc -c < "$migrate_out" | tr -d ' ')"
+    printf -- '\n  written: %s (%d B)\n' "$migrate_out" "$migrate_tar_bytes"
+  fi
+  printf -- '  next step: copy to the new machine, run `fleet migrate --import <path>`\n'
+}
+
+# migrate_render_export_json — JSON formatter for --export --json. JSON
+# escape via preflight_json_escape directly per LESSONS 2026-06-13.
+migrate_render_export_json() {  # $1 = out_path, $2 = stage_dir, $3 = tarball_sha
+  local migrate_out="$1" migrate_stage="$2" migrate_sha="$3"
+  local migrate_tar_bytes migrate_cl_bytes
+  if [ -f "$migrate_out" ]; then
+    migrate_tar_bytes="$(wc -c < "$migrate_out" | tr -d ' ')"
+  else
+    migrate_tar_bytes=0
+  fi
+  if [ -f "$migrate_stage/cross-lessons/CROSS_LESSONS.md" ]; then
+    migrate_cl_bytes="$(wc -c < "$migrate_stage/cross-lessons/CROSS_LESSONS.md" | tr -d ' ')"
+  else
+    migrate_cl_bytes=0
+  fi
+  local migrate_esc_path migrate_esc_sha
+  migrate_esc_path="$(migrate_json_escape "$migrate_out")"
+  migrate_esc_sha="$(migrate_json_escape "$migrate_sha")"
+
+  printf -- '{'
+  printf -- '"path":"%s",' "$migrate_esc_path"
+  printf -- '"schema_version":1,'
+  printf -- '"slugs":['
+  local migrate_first=1 migrate_dir migrate_slug migrate_events_bytes migrate_runs_bytes
+  local migrate_esc_slug
+  for migrate_dir in "$migrate_stage"/*/; do
+    migrate_slug="$(basename "$migrate_dir")"
+    case "$migrate_slug" in cross-lessons) continue ;; esac
+    [ -d "$migrate_dir" ] || continue
+    if [ -f "$migrate_dir/events.jsonl" ]; then
+      migrate_events_bytes="$(wc -c < "$migrate_dir/events.jsonl" | tr -d ' ')"
+    else
+      migrate_events_bytes=0
+    fi
+    if [ -f "$migrate_dir/runs.jsonl" ]; then
+      migrate_runs_bytes="$(wc -c < "$migrate_dir/runs.jsonl" | tr -d ' ')"
+    else
+      migrate_runs_bytes=0
+    fi
+    migrate_esc_slug="$(migrate_json_escape "$migrate_slug")"
+    if [ "$migrate_first" = "1" ]; then
+      migrate_first=0
+    else
+      printf -- ','
+    fi
+    printf -- '{"slug":"%s","events_bytes":%d,"runs_bytes":%d}' \
+              "$migrate_esc_slug" "$migrate_events_bytes" "$migrate_runs_bytes"
+  done
+  printf -- '],'
+  printf -- '"cross_lessons_bytes":%d,' "$migrate_cl_bytes"
+  printf -- '"tarball_bytes":%d,' "$migrate_tar_bytes"
+  printf -- '"tarball_sha256":"%s"' "$migrate_esc_sha"
+  printf -- '}\n'
+}
+
+# migrate_encrypt_tarball — wrap a plaintext .tar.gz through openssl.
+# Refuses on missing FLEET_EXPORT_PASS per AC #5.
+migrate_encrypt_tarball() {  # $1 = plain_path $2 = enc_path
+  local migrate_plain="$1" migrate_enc="$2"
+  openssl enc -aes-256-cbc -pbkdf2 -pass env:FLEET_EXPORT_PASS \
+    -in "$migrate_plain" -out "$migrate_enc"
+}
+
+# migrate_decrypt_tarball — inverse for the import path.
+migrate_decrypt_tarball() {  # $1 = enc_path $2 = plain_path
+  local migrate_enc="$1" migrate_plain="$2"
+  openssl enc -d -aes-256-cbc -pbkdf2 -pass env:FLEET_EXPORT_PASS \
+    -in "$migrate_enc" -out "$migrate_plain"
+}
+
+# migrate_extract_tarball — extract a (possibly .tar.gz.enc) tarball into
+# a staging mktemp dir. Echoes the staging path. Returns 2 on missing
+# encryption env when the suffix is .enc.
+migrate_extract_tarball() {  # $1 = src_path
+  local migrate_src="$1"
+  local migrate_stage
+  migrate_stage="$(mktemp -d -t fleet-migrate-extract.XXXXXX)"
+  case "$migrate_src" in
+    *.tar.gz.enc|*.tgz.enc|*.enc)
+      if [ -z "${FLEET_EXPORT_PASS:-}" ]; then
+        rm -rf "$migrate_stage"
+        printf -- 'migrate: --import of encrypted tarball requires FLEET_EXPORT_PASS env var to be set\n' >&2
+        return 2
+      fi
+      local migrate_plain="$migrate_stage/.plain.tar.gz"
+      if ! migrate_decrypt_tarball "$migrate_src" "$migrate_plain" 2>/dev/null; then
+        rm -rf "$migrate_stage"
+        printf -- 'migrate: openssl decrypt failed — wrong FLEET_EXPORT_PASS?\n' >&2
+        return 3
+      fi
+      tar -xzf "$migrate_plain" -C "$migrate_stage"
+      rm -f "$migrate_plain"
+      ;;
+    *)
+      tar -xzf "$migrate_src" -C "$migrate_stage"
+      ;;
+  esac
+  printf -- '%s' "$migrate_stage"
+}
+
+# migrate_read_manifest_field — extract a top-level scalar field from
+# fleet-export.json. Uses node (already a kit dep).
+migrate_read_manifest_field() {  # $1 = manifest_path $2 = field_name
+  local migrate_m="$1" migrate_field="$2"
+  node -e "
+    const fs = require('fs');
+    try {
+      const m = JSON.parse(fs.readFileSync('$migrate_m', 'utf8'));
+      const v = m['$migrate_field'];
+      if (v === undefined) process.exit(2);
+      process.stdout.write(String(v));
+    } catch (e) { process.exit(2); }
+  " 2>/dev/null
+}
+
+# migrate_read_manifest_slugs_tsv — emit one TSV record per slug:
+# `<slug>\t<repo_path>\t<repo_url>\t<pr_count>\t<streak>\t<promoted>`.
+# Per LESSONS 2026-06-08 (`IFS=$'\t'` empty-middle collapse) any
+# possibly-empty column uses the sentinel `-` and the caller maps it back
+# to empty.
+migrate_read_manifest_slugs_tsv() {  # $1 = manifest_path
+  local migrate_m="$1"
+  node -e "
+    const fs = require('fs');
+    try {
+      const m = JSON.parse(fs.readFileSync('$migrate_m', 'utf8'));
+      for (const s of m.slugs) {
+        const v = s.expected_verify || {};
+        const cells = [
+          s.slug || '-',
+          s.repo_path || '-',
+          s.repo_url || '-',
+          (v.pr_footer_posted_count || 0).toString(),
+          (v.streak_days || 0).toString(),
+          (v.lessons_promoted_count || 0).toString(),
+        ];
+        process.stdout.write(cells.join('\t') + '\n');
+      }
+    } catch (e) { process.exit(2); }
+  " 2>/dev/null
+}
+
+# migrate_validate_manifest — re-compute the sans-manifest sha256 against
+# the staging dir and compare to the manifest's tarball_sha256. Refuses
+# on mismatch per AC #6.
+migrate_validate_manifest() {  # $1 = stage_dir
+  local migrate_stage="$1"
+  local migrate_m="$migrate_stage/fleet-export.json"
+  if [ ! -f "$migrate_m" ]; then
+    printf -- 'migrate: missing fleet-export.json in tarball — not a fleet export?\n' >&2
+    return 3
+  fi
+  local migrate_sch
+  migrate_sch="$(migrate_read_manifest_field "$migrate_m" schema_version)"
+  if [ "$migrate_sch" != "1" ]; then
+    printf -- 'migrate: schema_version %s not supported — your kit installation may be older than this export\n' \
+              "$migrate_sch" >&2
+    return 3
+  fi
+  local migrate_want migrate_got
+  migrate_want="$(migrate_read_manifest_field "$migrate_m" tarball_sha256)"
+  migrate_got="$(migrate_compute_sansmanifest_sha256 "$migrate_stage")"
+  if [ "$migrate_want" != "$migrate_got" ]; then
+    printf -- 'migrate: tarball sha256 mismatch (expected %s, got %s) — file may be truncated or tampered with\n' \
+              "$migrate_want" "$migrate_got" >&2
+    return 3
+  fi
+  return 0
+}
+
+# migrate_run_verify — run THREE per-slug verify assertions against the
+# RESTORED destination state. ONE awk pass per slug per LESSONS 2026-06-15.
+# Returns 0 on all-match; non-zero on first mismatch.
+migrate_run_verify() {  # $1 = manifest_path $2 = "1" if dry-run (read from export, not dest)
+  local migrate_m="$1" migrate_dryrun="${2:-0}"
+  local migrate_failures=0
+  local migrate_slug migrate_repo_path migrate_repo_url
+  local migrate_want_prs migrate_want_streak migrate_want_promoted
+  local migrate_events migrate_actual migrate_got_prs migrate_got_streak migrate_got_promoted
+  while IFS=$'\t' read -r migrate_slug migrate_repo_path migrate_repo_url migrate_want_prs migrate_want_streak migrate_want_promoted; do
+    [ -z "$migrate_slug" ] && continue
+    [ "$migrate_slug" = "-" ] && continue
+    if [ "$migrate_dryrun" = "1" ]; then
+      # In dry-run, we have nothing to compare against — just print the
+      # expected counters as the "verify".
+      printf -- '  verify (dry-run): %s expected pr_footer_posted=%s, streak_days=%s, lessons_promoted=%s\n' \
+                "$migrate_slug" "$migrate_want_prs" "$migrate_want_streak" "$migrate_want_promoted"
+      continue
+    fi
+    migrate_events="$(migrate_cache_dir "$migrate_slug")/events.jsonl"
+    migrate_actual="$(migrate_compute_expected_verify "$migrate_events")"
+    migrate_got_prs="$(printf -- '%s' "$migrate_actual" | awk 'BEGIN { count = 0 } { print $1; count++ }')"
+    migrate_got_streak="$(printf -- '%s' "$migrate_actual" | awk 'BEGIN { count = 0 } { print $2; count++ }')"
+    migrate_got_promoted="$(printf -- '%s' "$migrate_actual" | awk 'BEGIN { count = 0 } { print $3; count++ }')"
+    if [ "$migrate_got_prs" != "$migrate_want_prs" ]; then
+      printf -- 'MIGRATION VERIFY FAILED: %s: pr_footer_posted_count expected %s, got %s\n' \
+                "$migrate_slug" "$migrate_want_prs" "$migrate_got_prs" >&2
+      migrate_failures=$((migrate_failures + 1))
+      continue
+    fi
+    if [ "$migrate_got_streak" != "$migrate_want_streak" ]; then
+      printf -- 'MIGRATION VERIFY FAILED: %s: streak_days expected %s, got %s\n' \
+                "$migrate_slug" "$migrate_want_streak" "$migrate_got_streak" >&2
+      migrate_failures=$((migrate_failures + 1))
+      continue
+    fi
+    if [ "$migrate_got_promoted" != "$migrate_want_promoted" ]; then
+      printf -- 'MIGRATION VERIFY FAILED: %s: lessons_promoted_count expected %s, got %s\n' \
+                "$migrate_slug" "$migrate_want_promoted" "$migrate_got_promoted" >&2
+      migrate_failures=$((migrate_failures + 1))
+      continue
+    fi
+    printf -- '  verify: %s pr_footer=%s, streak=%s, lessons_promoted=%s (matches export)\n' \
+              "$migrate_slug" "$migrate_got_prs" "$migrate_got_streak" "$migrate_got_promoted"
+  done < <(migrate_read_manifest_slugs_tsv "$migrate_m")
+  if [ "$migrate_failures" -gt 0 ]; then
+    return 3
+  fi
+  return 0
+}
+
+# migrate_stage_export — build the staging tree under $1 from the
+# discovered fleet. Each slug becomes <stage>/<slug>/{agents.config.sh,
+# events.jsonl, runs.jsonl, .migrate-repo-url, .migrate-repo-path,
+# events.jsonl.archive/* if present}. Plus
+# <stage>/cross-lessons/CROSS_LESSONS.md when resolved.
+#
+# Returns the list of discovered slugs (one per line) on stdout AS WELL
+# AS doing the staging — the caller redirects to capture both at once.
+migrate_stage_export() {  # $1 = stage_dir, $2 = redact_mode (0|1)
+  local migrate_stage="$1" migrate_redact="$2"
+  local migrate_slugs_list
+  migrate_slugs_list="$(migrate_discover_slugs)"
+  # In redact mode, allocate pseudonyms by alphabetical index.
+  local migrate_pseudo_idx=0 migrate_slug migrate_manifest migrate_repo_url migrate_repo_path
+  local migrate_dst_name migrate_dst_dir migrate_cache
+  for migrate_slug in $migrate_slugs_list; do
+    migrate_pseudo_idx=$((migrate_pseudo_idx + 1))
+    migrate_manifest="$(migrate_resolve_manifest_path "$migrate_slug")"
+    if [ -z "$migrate_manifest" ] || [ ! -f "$migrate_manifest" ]; then
+      continue
+    fi
+    migrate_repo_url="$(migrate_extract_repo_url "$migrate_manifest")"
+    migrate_repo_path="$(migrate_extract_repo_path "$migrate_manifest")"
+    if [ "$migrate_redact" = "1" ]; then
+      migrate_dst_name="$(migrate_render_redacted_slug "$migrate_pseudo_idx")"
+      migrate_repo_url="redacted://repo-$migrate_pseudo_idx"
+      migrate_repo_path="redacted://path-$migrate_pseudo_idx"
+    else
+      migrate_dst_name="$migrate_slug"
+    fi
+    migrate_dst_dir="$migrate_stage/$migrate_dst_name"
+    mkdir -p "$migrate_dst_dir"
+    /bin/cp -f "$migrate_manifest" "$migrate_dst_dir/agents.config.sh"
+    migrate_cache="$(migrate_cache_dir "$migrate_slug")"
+    if [ -f "$migrate_cache/events.jsonl" ]; then
+      /bin/cp -f "$migrate_cache/events.jsonl" "$migrate_dst_dir/events.jsonl"
+    else
+      : > "$migrate_dst_dir/events.jsonl"
+    fi
+    if [ -f "$migrate_cache/runs.jsonl" ]; then
+      if [ "$migrate_redact" = "1" ]; then
+        migrate_redact_runs_file "$migrate_cache/runs.jsonl" "$migrate_dst_dir/runs.jsonl"
+      else
+        /bin/cp -f "$migrate_cache/runs.jsonl" "$migrate_dst_dir/runs.jsonl"
+      fi
+    else
+      : > "$migrate_dst_dir/runs.jsonl"
+    fi
+    # Per AC#2 archive segments ride along when present.
+    if [ -d "$migrate_cache/events.jsonl.archive" ]; then
+      mkdir -p "$migrate_dst_dir/events.jsonl.archive"
+      /bin/cp -fR "$migrate_cache/events.jsonl.archive/." "$migrate_dst_dir/events.jsonl.archive/" 2>/dev/null || true
+    fi
+    printf -- '%s' "$migrate_repo_url" > "$migrate_dst_dir/.migrate-repo-url"
+    printf -- '%s' "$migrate_repo_path" > "$migrate_dst_dir/.migrate-repo-path"
+    printf -- '%s\n' "$migrate_dst_name"
+  done
+
+  # Cross-fleet CROSS_LESSONS.md.
+  local migrate_cl_path
+  migrate_cl_path="$(migrate_resolve_cross_lessons_path)"
+  if [ -f "$migrate_cl_path" ]; then
+    mkdir -p "$migrate_stage/cross-lessons"
+    /bin/cp -f "$migrate_cl_path" "$migrate_stage/cross-lessons/CROSS_LESSONS.md"
+  fi
+}
+
+# migrate_orchestrate_import — the per-slug import loop. Walks the
+# manifest's slugs[] array, prompts-or-skips clone, runs install.sh,
+# restores events.jsonl + runs.jsonl + CROSS_LESSONS.md, then runs the
+# verify pass.
+migrate_orchestrate_import() {  # $1 = stage_dir, $2 = dry_run, $3 = skip_clone
+  local migrate_stage="$1" migrate_dry="$2" migrate_skip_clone="$3"
+  local migrate_m="$migrate_stage/fleet-export.json"
+  local migrate_slug migrate_repo_path migrate_repo_url
+  local migrate_want_prs migrate_want_streak migrate_want_promoted
+
+  # Per-slug walk: clone (or skip), install, restore.
+  while IFS=$'\t' read -r migrate_slug migrate_repo_path migrate_repo_url migrate_want_prs migrate_want_streak migrate_want_promoted; do
+    [ -z "$migrate_slug" ] && continue
+    [ "$migrate_slug" = "-" ] && continue
+    [ "$migrate_repo_path" = "-" ] && migrate_repo_path=""
+    [ "$migrate_repo_url" = "-" ] && migrate_repo_url=""
+
+    # Step 1: clone.
+    if [ "$migrate_skip_clone" = "1" ] || { [ -n "$migrate_repo_path" ] && [ -d "$migrate_repo_path" ]; }; then
+      if [ "$migrate_dry" = "1" ]; then
+        printf -- '  %s  SKIP clone (--skip-clone or repo already present)\n' "$migrate_slug"
+      else
+        printf -- '  %s  SKIP clone\n' "$migrate_slug"
+      fi
+    else
+      if [ "$migrate_dry" = "1" ]; then
+        printf -- '  %s  would clone %s into %s\n' "$migrate_slug" "$migrate_repo_url" "$migrate_repo_path"
+      else
+        # Auto-confirm on non-interactive (no stdin tty). Per AC #6 the
+        # interactive prompt is "clone <url> into <path>? (Y/n)" but tests
+        # run with </dev/null so we treat that as Y.
+        printf -- '  %s  cloning %s into %s\n' "$migrate_slug" "$migrate_repo_url" "$migrate_repo_path"
+        mkdir -p "$(dirname "$migrate_repo_path")"
+        if ! git clone "$migrate_repo_url" "$migrate_repo_path" >/dev/null 2>&1; then
+          printf -- 'migrate: git clone failed for %s\n' "$migrate_slug" >&2
+          return 3
+        fi
+      fi
+    fi
+
+    # Step 2: install.sh.
+    if [ "$migrate_dry" = "1" ]; then
+      printf -- '  %s  would install at %s\n' "$migrate_slug" "$migrate_repo_path"
+    else
+      local migrate_install_cmd="${FLEET_INSTALL_CMD:-}"
+      local migrate_kit_root
+      migrate_kit_root="$(cd "$(dirname "$0")/.." && pwd)"
+      if [ -n "$migrate_install_cmd" ]; then
+        "$migrate_install_cmd" "$migrate_repo_path" >/dev/null 2>&1 || true
+      elif [ -f "$migrate_kit_root/lib/install.sh" ]; then
+        bash "$migrate_kit_root/lib/install.sh" "$migrate_repo_path" >/dev/null 2>&1 || true
+      fi
+    fi
+
+    # Step 3: restore events.jsonl + runs.jsonl.
+    if [ "$migrate_dry" = "1" ]; then
+      printf -- '  %s  would restore events.jsonl + runs.jsonl into $CACHE_DIR\n' "$migrate_slug"
+    else
+      local migrate_cache
+      migrate_cache="$(migrate_cache_dir "$migrate_slug")"
+      mkdir -p "$migrate_cache"
+      local migrate_src_events="$migrate_stage/$migrate_slug/events.jsonl"
+      local migrate_src_runs="$migrate_stage/$migrate_slug/runs.jsonl"
+      local migrate_existing_lines=0
+      if [ -f "$migrate_cache/events.jsonl" ]; then
+        migrate_existing_lines="$(awk 'BEGIN { count = 0 } /./ { count++ } END { print count+0 }' "$migrate_cache/events.jsonl")"
+      fi
+      if [ "$migrate_existing_lines" -gt 0 ] && [ -t 0 ]; then
+        # Interactive prompt path — kept for future operator runs. Tests
+        # invoke with </dev/null so this branch is never hit there.
+        printf -- 'events.jsonl for %s already has %s lines on this machine. (k)eep local / (r)eplace with export / (m)erge? (k/r/m) ' \
+                  "$migrate_slug" "$migrate_existing_lines"
+        local migrate_answer
+        read -r migrate_answer || migrate_answer="k"
+        case "$migrate_answer" in
+          r|R) /bin/cp -f "$migrate_src_events" "$migrate_cache/events.jsonl" ;;
+          m|M)
+            # Concat + sort by ts in ONE awk pass per LESSONS 2026-06-15.
+            local migrate_merged
+            migrate_merged="$(mktemp -t fleet-migrate-merge.XXXXXX)"
+            cat "$migrate_cache/events.jsonl" "$migrate_src_events" | \
+              awk 'BEGIN { count = 0 } { lines[count++] = $0 }
+                   END {
+                     # Selection sort by ts — small N, stable enough.
+                     for (i = 0; i < count; i++) {
+                       for (j = i + 1; j < count; j++) {
+                         match(lines[i], /"ts":"[^"]+"/); ti = substr(lines[i], RSTART + 6, RLENGTH - 7)
+                         match(lines[j], /"ts":"[^"]+"/); tj = substr(lines[j], RSTART + 6, RLENGTH - 7)
+                         if (tj < ti) { t = lines[i]; lines[i] = lines[j]; lines[j] = t }
+                       }
+                     }
+                     for (i = 0; i < count; i++) print lines[i]
+                   }' > "$migrate_merged"
+            /bin/cp -f "$migrate_merged" "$migrate_cache/events.jsonl"
+            rm -f "$migrate_merged"
+            ;;
+          *) : ;;  # k — keep local
+        esac
+      elif [ "$migrate_existing_lines" -gt 0 ]; then
+        # Non-interactive default: keep local.
+        :
+      else
+        # No existing or empty: restore from export.
+        if [ -f "$migrate_src_events" ]; then
+          /bin/cp -f "$migrate_src_events" "$migrate_cache/events.jsonl"
+        fi
+      fi
+      if [ -f "$migrate_src_runs" ]; then
+        if [ ! -s "$migrate_cache/runs.jsonl" ]; then
+          /bin/cp -f "$migrate_src_runs" "$migrate_cache/runs.jsonl"
+        fi
+      fi
+    fi
+
+  done < <(migrate_read_manifest_slugs_tsv "$migrate_m")
+
+  # CROSS_LESSONS.md restore.
+  local migrate_cl_src="$migrate_stage/cross-lessons/CROSS_LESSONS.md"
+  if [ -f "$migrate_cl_src" ]; then
+    if [ "$migrate_dry" = "1" ]; then
+      printf -- '  cross-fleet  would restore CROSS_LESSONS.md\n'
+    else
+      local migrate_cl_dst
+      migrate_cl_dst="$(migrate_resolve_cross_lessons_path)"
+      mkdir -p "$(dirname "$migrate_cl_dst")"
+      if [ -f "$migrate_cl_dst" ] && [ -t 0 ]; then
+        printf -- 'CROSS_LESSONS.md already exists on this machine. (k)eep local / (r)eplace with export / (m)erge? (k/r/m) '
+        local migrate_cl_answer
+        read -r migrate_cl_answer || migrate_cl_answer="k"
+        case "$migrate_cl_answer" in
+          r|R) /bin/cp -f "$migrate_cl_src" "$migrate_cl_dst" ;;
+          m|M) cat "$migrate_cl_dst" "$migrate_cl_src" > "$migrate_cl_dst.tmp" && mv "$migrate_cl_dst.tmp" "$migrate_cl_dst" ;;
+          *) : ;;
+        esac
+      else
+        /bin/cp -f "$migrate_cl_src" "$migrate_cl_dst"
+      fi
+    fi
+  fi
+
+  # Verify pass.
+  if [ "$migrate_dry" = "1" ]; then
+    migrate_run_verify "$migrate_m" 1
+    return 0
+  fi
+  if ! migrate_run_verify "$migrate_m" 0; then
+    return 3
+  fi
+  return 0
+}
+
+# Top-level dispatcher.
+migrate() {
+  shift  # drop the leading "migrate"
+  local migrate_mode="" migrate_path="" migrate_redact=0 migrate_encrypt=0
+  local migrate_dry_run=0 migrate_skip_clone=0 migrate_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --export)
+        migrate_mode="export"
+        shift
+        # Optional positional path.
+        if [ $# -gt 0 ]; then
+          case "$1" in
+            --*) : ;;
+            *)
+              if [ -z "$migrate_path" ]; then
+                migrate_path="$1"
+                shift
+              fi ;;
+          esac
+        fi
+        ;;
+      --import)
+        migrate_mode="import"
+        shift
+        if [ $# -gt 0 ]; then
+          case "$1" in
+            --*) : ;;
+            *)
+              if [ -z "$migrate_path" ]; then
+                migrate_path="$1"
+                shift
+              fi ;;
+          esac
+        fi
+        ;;
+      --redact) migrate_redact=1; shift ;;
+      --encrypt) migrate_encrypt=1; shift ;;
+      --dry-run) migrate_dry_run=1; shift ;;
+      --skip-clone) migrate_skip_clone=1; shift ;;
+      --json) migrate_json=1; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet migrate — package the fleet for a new machine or restore it.
+
+Usage:
+  fleet migrate --export [<path>] [--redact] [--encrypt] [--json]
+  fleet migrate --import <path> [--dry-run] [--skip-clone]
+
+Modes:
+  --export [<path>]   pack every discovered slug's agents.config.sh +
+                      events.jsonl + runs.jsonl + the cross-fleet
+                      CROSS_LESSONS.md into ONE .tar.gz. Default path:
+                      $HOME/Desktop/fleet-<YYYY-MM-DD>.tar.gz.
+  --import <path>     extract a previously-exported tarball, validate
+                      its sha256 + schema_version, clone any missing
+                      repos (unless --skip-clone), run lib/install.sh
+                      per slug, restore each $CACHE_DIR/events.jsonl +
+                      runs.jsonl, restore CROSS_LESSONS.md, then run
+                      THREE per-slug verify assertions
+                      (pr_footer_posted count + streak_days +
+                      lesson_promoted count).
+
+Flags:
+  --redact            replace slug names with project-a/b/c, repo URLs
+                      with redacted://repo-N, and band dollar amounts
+                      in runs.jsonl via the 0053 portfolio convention.
+  --encrypt           wrap the tarball through openssl with
+                      FLEET_EXPORT_PASS env. Output extension becomes
+                      .tar.gz.enc. The same env is required on import.
+  --dry-run           --import only: walk the flow but write nothing.
+  --skip-clone        --import only: assume every repo is already
+                      cloned at the manifest's repo_path; do NOT call
+                      git clone.
+  --json              --export only: emit a structured JSON object
+                      instead of the human text table.
+  -h, --help          this banner
+
+Exit codes:
+  0 = success
+  2 = usage / refuses-to-start
+  3 = sha mismatch / schema mismatch / MIGRATION VERIFY FAILED
+USAGE
+        exit 0 ;;
+      *)
+        printf -- 'migrate: unknown argument: %s\n' "$1" >&2
+        printf -- 'migrate: usage: bin/fleet migrate --export [<path>] [--redact] [--encrypt] | --import <path> [--dry-run] [--skip-clone]\n' >&2
+        exit 2 ;;
+    esac
+  done
+
+  if [ -z "$migrate_mode" ]; then
+    printf -- 'migrate: usage: bin/fleet migrate --export [<path>] [--redact] [--encrypt] | --import <path> [--dry-run] [--skip-clone]\n' >&2
+    exit 2
+  fi
+
+  case "$migrate_mode" in
+    export)
+      # Default path when missing: $HOME/Desktop/fleet-<YYYY-MM-DD>.tar.gz.
+      if [ -z "$migrate_path" ]; then
+        local migrate_today
+        migrate_today="$(migrate_today_ymd)"
+        migrate_path="$HOME/Desktop/fleet-$migrate_today.tar.gz"
+      fi
+      # Encrypt path validation.
+      if [ "$migrate_encrypt" = "1" ] && [ -z "${FLEET_EXPORT_PASS:-}" ]; then
+        printf -- 'migrate: --encrypt requires FLEET_EXPORT_PASS env var to be set\n' >&2
+        exit 2
+      fi
+      # Stage the export tree.
+      local migrate_stage
+      migrate_stage="$(mktemp -d -t fleet-migrate-stage.XXXXXX)"
+      migrate_stage_export "$migrate_stage" "$migrate_redact" >/dev/null
+      # Hash the stage WITHOUT the manifest, write the manifest WITH the
+      # hash, then pack everything together. Per the ticket's
+      # `migrate_pack_tarball` doc the manifest is sealed with the
+      # sans-manifest hash.
+      local migrate_tarball_sha
+      migrate_tarball_sha="$(migrate_compute_sansmanifest_sha256 "$migrate_stage")"
+      migrate_render_manifest_json "$migrate_stage" "$migrate_tarball_sha" > "$migrate_stage/fleet-export.json"
+      # Strip sidecar files before packing.
+      find "$migrate_stage" -name '.migrate-repo-url' -delete 2>/dev/null || true
+      find "$migrate_stage" -name '.migrate-repo-path' -delete 2>/dev/null || true
+      # Ensure the output directory exists.
+      mkdir -p "$(dirname "$migrate_path")"
+      migrate_pack_tarball "$migrate_stage" "$migrate_path"
+      if [ "$migrate_encrypt" = "1" ]; then
+        local migrate_enc_path="${migrate_path}.enc"
+        if ! migrate_encrypt_tarball "$migrate_path" "$migrate_enc_path" >/dev/null 2>&1; then
+          printf -- 'migrate: openssl encrypt failed\n' >&2
+          rm -f "$migrate_path"
+          rm -rf "$migrate_stage"
+          exit 3
+        fi
+        rm -f "$migrate_path"
+        migrate_path="$migrate_enc_path"
+      fi
+      if [ "$migrate_json" = "1" ]; then
+        migrate_render_export_json "$migrate_path" "$migrate_stage" "$migrate_tarball_sha"
+      else
+        migrate_render_export_text "$migrate_path" "$migrate_stage"
+      fi
+      rm -rf "$migrate_stage"
+      exit 0 ;;
+
+    import)
+      if [ -z "$migrate_path" ]; then
+        printf -- 'migrate: --import requires a <path> argument\n' >&2
+        exit 2
+      fi
+      if [ ! -f "$migrate_path" ]; then
+        printf -- 'migrate: %s not found\n' "$migrate_path" >&2
+        exit 2
+      fi
+      local migrate_stage
+      set +e
+      migrate_stage="$(migrate_extract_tarball "$migrate_path")"
+      local migrate_ext_exit=$?
+      set -e
+      if [ "$migrate_ext_exit" != "0" ]; then
+        exit "$migrate_ext_exit"
+      fi
+      # Validate manifest sha + schema.
+      set +e
+      migrate_validate_manifest "$migrate_stage"
+      local migrate_val_exit=$?
+      set -e
+      if [ "$migrate_val_exit" != "0" ]; then
+        rm -rf "$migrate_stage"
+        exit "$migrate_val_exit"
+      fi
+      printf -- 'fleet migrate — importing fleet from %s\n\n' "$migrate_path"
+      printf -- '  verified: sha256 matches manifest\n'
+      printf -- '  verified: export schema version 1 (compatible)\n\n'
+      set +e
+      migrate_orchestrate_import "$migrate_stage" "$migrate_dry_run" "$migrate_skip_clone"
+      local migrate_orch_exit=$?
+      set -e
+      rm -rf "$migrate_stage"
+      if [ "$migrate_orch_exit" != "0" ]; then
+        exit "$migrate_orch_exit"
+      fi
+      exit 0 ;;
+  esac
+  exit 0
+}
+
+if [ "$CMD" = "migrate" ]; then
+  migrate "$@"
 fi
 
 # --- preflight ------------------------------------------------------------

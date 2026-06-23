@@ -1,0 +1,9 @@
+{"ts":"2026-06-01T10:00:00Z","slug":"gamma-busy","phase":"ship","type":"run_started","pid":"300"}
+{"ts":"2026-06-01T10:05:00Z","slug":"gamma-busy","phase":"ship","type":"pr_opened","number":"20","branch":"feat/g1"}
+{"ts":"2026-06-01T11:00:00Z","slug":"gamma-busy","phase":"ship","type":"pr_footer_posted","pr":"20"}
+{"ts":"2026-06-02T10:05:00Z","slug":"gamma-busy","phase":"ship","type":"pr_opened","number":"21","branch":"feat/g2"}
+{"ts":"2026-06-02T11:00:00Z","slug":"gamma-busy","phase":"ship","type":"pr_footer_posted","pr":"21"}
+{"ts":"2026-06-02T15:00:00Z","slug":"gamma-busy","phase":"promote","type":"lesson_promoted","source":"gamma-busy","text_sha":"11112222","scope":"all"}
+{"ts":"2026-06-03T10:05:00Z","slug":"gamma-busy","phase":"ship","type":"pr_opened","number":"22","branch":"feat/g3"}
+{"ts":"2026-06-03T11:00:00Z","slug":"gamma-busy","phase":"ship","type":"pr_footer_posted","pr":"22"}
+{"ts":"2026-06-03T15:00:00Z","slug":"gamma-busy","phase":"ship","type":"pr_footer_posted","pr":"23"}
