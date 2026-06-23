@@ -116,6 +116,9 @@
 #   fleet migrate --export | --import package the fleet for a new machine or restore it from a tarball
 #                             (ticket 0063 — pure packager+orchestrator; --redact / --encrypt / --dry-run /
 #                              --skip-clone / --json; reuses lib/install.sh per slug on import)
+#   fleet catchup             re-orientation briefing after a >=72h absence — ranked actions, three at a time
+#                             (ticket 0064 — pure reader of events.jsonl + runs.jsonl + morning/inbox state mtimes;
+#                              --since Nh|Nd|YYYY-MM-DD / --all / --slug / --json; no writes, no new event types)
 #
 # Discovers projects by scanning for */agents.config.sh under FLEET_PROJECTS_ROOT
 # (default ~/Desktop/projects). Run interactively — it reads from ~/Desktop, so
@@ -20166,6 +20169,876 @@ EOS
 
 if [ "$CMD" = "morning" ]; then
   morning "$@"
+  exit $?
+fi
+
+# --- catchup (ticket 0064) -----------------------------------------------
+# `fleet catchup` is a PURE READER that composes a re-orientation briefing
+# after the operator's been away >=72h. Detects "last seen" from the newer
+# of `morning-last-run` and `inbox-state` file mtimes (or accepts an
+# explicit `--since Nh|Nd|YYYY-MM-DD`). Renders a one-paragraph verdict,
+# a 3-item ranked-actions list (capped unless `--all`), and a per-slug
+# footer with PR count + spend + verdict.
+#
+# Pure reader, per the ticket's hard NOs:
+#   - NO events.jsonl writes, NO fleet_emit_event, NO new event types.
+#   - NO `lib/common.sh` edits, NO `prompts/` edits, NO new manifest knob.
+#   - NO touch of the morning/inbox state files (mtimes are READ only).
+#
+# All helpers are prefixed `catchup_*` and defined BELOW this comment.
+# Per LESSONS 2026-06-05 (dispatcher forward-reference), every helper is
+# defined ABOVE the dispatcher block. Per LESSONS 2026-06-13 the JSON
+# renderer calls `preflight_json_escape` directly — no `*_json_escape`
+# wrapper. Per LESSONS 2026-06-15 the events walk is ONE awk pass per
+# slug and the verdict template substitution uses the CURSOR-based walk
+# pattern (replacement values may include `$<digits>` substrings).
+
+# Threshold: under this many hours of absence, redirect to `fleet morning`.
+CATCHUP_AWAY_THRESHOLD_HOURS=72
+
+# Discover slugs alphabetically. Wraps the discovery roots used by every
+# other fleet-wide reader (overview/recap/inbox/morning).
+catchup_discover_slugs() {
+  local _seen="" m slug
+  local root_a="${FLEET_DISCOVERY_ROOT:-$HOME/Desktop/projects}"
+  local root_b="$HOME/.local/share/agent-fleet/projects"
+  { find "$root_a" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+    find "$root_b" -maxdepth 2 -name agents.config.sh 2>/dev/null | sort
+  } | while read -r m; do
+    [ -z "$m" ] && continue
+    # shellcheck disable=SC1090
+    slug=$( (source "$m"; echo "${SLUG:-}") 2>/dev/null )
+    [ -z "$slug" ] && continue
+    case " $_seen " in *" $slug "*) continue ;; esac
+    _seen="$_seen $slug"
+    printf -- '%s\t%s\t%s\n' "$slug" "$m" "$HOME/.cache/${slug}-agent"
+  done | LC_ALL=C sort -t $'\t' -k1,1
+}
+
+# Resolve "last seen" epoch from the newer of morning-last-run and
+# inbox-state mtimes. Echoes the epoch (integer) or the literal string
+# `none` when both files are missing.
+catchup_resolve_last_seen() {
+  local m_state="$HOME/.local/state/agent-fleet/morning-last-run"
+  local i_state="${XDG_CACHE_HOME:-$HOME/.cache}/fleet/inbox-state"
+  local m_ep=0 i_ep=0
+  if [ -f "$m_state" ]; then
+    m_ep="$(stat -f %m "$m_state" 2>/dev/null || stat -c %Y "$m_state" 2>/dev/null || echo 0)"
+  fi
+  if [ -f "$i_state" ]; then
+    i_ep="$(stat -f %m "$i_state" 2>/dev/null || stat -c %Y "$i_state" 2>/dev/null || echo 0)"
+  fi
+  if [ "$m_ep" = "0" ] && [ "$i_ep" = "0" ]; then
+    printf -- 'none\n'
+    return 0
+  fi
+  if [ "$m_ep" -gt "$i_ep" ]; then
+    printf -- '%s\n' "$m_ep"
+  else
+    printf -- '%s\n' "$i_ep"
+  fi
+}
+
+# Humanize a duration in seconds: "5d 14h", "2w 3d", "8h", "12h".
+# Pure shell arithmetic — per LESSONS 2026-06-11 NOT `date -j -f`.
+catchup_humanize_duration() {
+  local s="${1:-0}"
+  case "$s" in
+    ''|*[!0-9]*) s=0 ;;
+  esac
+  local h=$(( s / 3600 ))
+  if [ "$h" -lt 24 ]; then
+    printf -- '%dh\n' "$h"
+    return 0
+  fi
+  local d=$(( h / 24 ))
+  local rh=$(( h - d * 24 ))
+  if [ "$d" -lt 14 ]; then
+    if [ "$rh" -gt 0 ]; then
+      printf -- '%dd %dh\n' "$d" "$rh"
+    else
+      printf -- '%dd\n' "$d"
+    fi
+    return 0
+  fi
+  local w=$(( d / 7 ))
+  local rd=$(( d - w * 7 ))
+  if [ "$rd" -gt 0 ]; then
+    printf -- '%dw %dd\n' "$w" "$rd"
+  else
+    printf -- '%dw\n' "$w"
+  fi
+}
+
+# Parse `--since` value into a seconds-ago integer. Accepts:
+#   Nh  → hours
+#   Nd  → days
+#   YYYY-MM-DD  → epoch delta (per LESSONS 2026-06-11 the full format
+#                 with T00:00:00 is used to avoid BSD date NOW-of-day fill)
+# Echoes the seconds; non-zero exit on invalid shape.
+catchup_parse_since() {
+  local raw="${1-}"
+  case "$raw" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+      local now target since
+      now="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+      target="$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "${raw}T00:00:00" '+%s' 2>/dev/null \
+                || date -u -d "${raw}T00:00:00Z" +%s 2>/dev/null \
+                || echo "")"
+      [ -z "$target" ] && return 1
+      since=$(( now - target ))
+      [ "$since" -lt 0 ] && since=0
+      printf -- '%s\n' "$since"
+      ;;
+    *h)
+      local n="${raw%h}"
+      case "$n" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      printf -- '%s\n' $(( n * 3600 ))
+      ;;
+    *d)
+      local n2="${raw%d}"
+      case "$n2" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      printf -- '%s\n' $(( n2 * 86400 ))
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Render an ISO8601 timestamp from an epoch (UTC).
+catchup_iso_at() {
+  local ep="$1"
+  date -u -r "$ep" +%FT%TZ 2>/dev/null || date -u -d "@$ep" +%FT%TZ 2>/dev/null
+}
+
+# Collect ship_paused events that have NOT been resumed within the
+# absence window. ONE awk pass per slug. Echoes TSV rows:
+#   `paused\t<slug>\t<count>\t<headline>`
+# where `count` is the number of unresolved pauses for that slug.
+# Per LESSONS 2026-06-08 BEGIN { count = 0 }.
+catchup_collect_paused_unresumed() {
+  local slug="$1" events="$2" cutoff_iso="$3"
+  [ -f "$events" ] || return 0
+  awk -v cutoff_iso="$cutoff_iso" -v slug="$slug" '
+    BEGIN { count = 0; paused = 0; resumed = 0 }
+    {
+      ts=""; type=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (ts == "" || type == "") next
+      norm = ts
+      sub(/\.[0-9]+Z$/, "Z", norm)
+      if (substr(norm, length(norm), 1) != "Z") norm = norm "Z"
+      if (norm < cutoff_iso) next
+      if (type == "ship_paused")  { paused++; count++ }
+      if (type == "ship_resumed") { resumed++ }
+    }
+    END {
+      unresolved = paused - resumed
+      if (unresolved < 0) unresolved = 0
+      if (unresolved > 0) {
+        printf("paused\t%s\t%d\tship_paused without ship_resumed\n", slug, unresolved)
+      }
+    }
+  ' "$events"
+}
+
+# Collect budget_block events in the absence window. ONE awk pass.
+# Echoes TSV:
+#   `budget\t<slug>\t<count>\t<spent>\t<cap>`
+catchup_collect_budget_blocks() {
+  local slug="$1" events="$2" cutoff_iso="$3"
+  [ -f "$events" ] || return 0
+  awk -v cutoff_iso="$cutoff_iso" -v slug="$slug" '
+    BEGIN { count = 0; last_spent = ""; last_cap = "" }
+    {
+      ts=""; type=""; spent=""; cap=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"spent"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        spent=substr($0, RSTART, RLENGTH)
+        sub(/.*"spent"[[:space:]]*:[[:space:]]*"/, "", spent); sub(/".*/, "", spent)
+      }
+      if (match($0, /"cap"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        cap=substr($0, RSTART, RLENGTH)
+        sub(/.*"cap"[[:space:]]*:[[:space:]]*"/, "", cap); sub(/".*/, "", cap)
+      }
+      if (ts == "" || type == "") next
+      norm = ts
+      sub(/\.[0-9]+Z$/, "Z", norm)
+      if (substr(norm, length(norm), 1) != "Z") norm = norm "Z"
+      if (norm < cutoff_iso) next
+      if (type == "budget_block") {
+        count++
+        last_spent = spent; last_cap = cap
+      }
+    }
+    END {
+      if (count > 0) {
+        if (last_spent == "") last_spent = "-"
+        if (last_cap == "")   last_cap = "-"
+        printf("budget\t%s\t%d\t%s\t%s\n", slug, count, last_spent, last_cap)
+      }
+    }
+  ' "$events"
+}
+
+# Collect lesson_draft_emitted events with no subsequent lesson_promoted
+# for the same PR. Pairs drafts/promotions in ONE awk pass over events.
+# Per LESSONS 2026-06-08 BEGIN { count = 0 }.
+catchup_collect_unpromoted_drafts() {
+  local slug="$1" events="$2" cutoff_iso="$3"
+  [ -f "$events" ] || return 0
+  awk -v cutoff_iso="$cutoff_iso" -v slug="$slug" '
+    BEGIN { count = 0; n_drafts = 0; n_proms = 0 }
+    {
+      ts=""; type=""; pr=""
+      if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        type=substr($0, RSTART, RLENGTH)
+        sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+      }
+      if (match($0, /"pr"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        pr=substr($0, RSTART, RLENGTH)
+        sub(/.*"pr"[[:space:]]*:[[:space:]]*"/, "", pr); sub(/".*/, "", pr)
+      }
+      if (ts == "" || type == "") next
+      norm = ts
+      sub(/\.[0-9]+Z$/, "Z", norm)
+      if (substr(norm, length(norm), 1) != "Z") norm = norm "Z"
+      if (norm < cutoff_iso) next
+      if (type == "lesson_draft_emitted") {
+        if (pr == "") pr = "-"
+        drafts[pr] = 1; n_drafts++
+      }
+      if (type == "lesson_promoted") {
+        if (pr != "") proms[pr] = 1
+        n_proms++
+      }
+    }
+    END {
+      unresolved = 0
+      for (k in drafts) {
+        if (!(k in proms)) unresolved++
+      }
+      if (unresolved > 0) {
+        printf("drafts\t%s\t%d\tlesson drafts unpromoted\n", slug, unresolved)
+      }
+    }
+  ' "$events"
+}
+
+# Compute $/PR for the absence window vs the prior equal-length window.
+# Flags slugs where the absence-window $/PR jumped >25% over the prior.
+# Pure-awk arithmetic per LESSONS 2026-06-15 (no per-day shellouts).
+catchup_collect_cost_regressions() {
+  local slug="$1" runs="$2" cutoff_iso="$3" prior_iso="$4"
+  [ -f "$runs" ] || return 0
+  awk -v cutoff_iso="$cutoff_iso" -v prior_iso="$prior_iso" -v slug="$slug" '
+    BEGIN { cur_prs = 0; cur_spend = 0; prior_prs = 0; prior_spend = 0 }
+    {
+      ts=""; head=""; cost = 0
+      if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        ts=substr($0, RSTART, RLENGTH)
+        sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+      }
+      if (match($0, /"result_head"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        head=substr($0, RSTART, RLENGTH)
+        sub(/.*"result_head"[[:space:]]*:[[:space:]]*"/, "", head); sub(/".*/, "", head)
+      }
+      if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+        c = substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", c)
+        cost = c + 0
+      }
+      if (ts == "") next
+      norm = ts
+      sub(/\.[0-9]+Z$/, "Z", norm)
+      if (substr(norm, length(norm), 1) != "Z") norm = norm "Z"
+      if (norm < prior_iso) next
+      is_ship = (substr(head, 1, 5) == "SHIP ")
+      if (norm >= cutoff_iso) {
+        cur_spend += cost
+        if (is_ship) cur_prs++
+      } else {
+        prior_spend += cost
+        if (is_ship) prior_prs++
+      }
+    }
+    END {
+      if (cur_prs <= 0 || prior_prs <= 0) exit 0
+      cur_dpp = cur_spend / cur_prs
+      prior_dpp = prior_spend / prior_prs
+      if (prior_dpp <= 0) exit 0
+      pct = (cur_dpp - prior_dpp) / prior_dpp * 100
+      if (pct > 25) {
+        printf("cost\t%s\t%d\t%.2f\t%.2f\n", slug, int(pct + 0.5), cur_dpp, prior_dpp)
+      }
+    }
+  ' "$runs"
+}
+
+# Compute per-slug footer row: PR count + total spend + verdict.
+# ONE awk pass over runs.jsonl + ONE awk pass over events.jsonl.
+catchup_footer_row() {
+  local slug="$1" runs="$2" events="$3" cutoff_iso="$4"
+  local prs=0 spend="0.00"
+  if [ -f "$runs" ]; then
+    IFS=$'\t' read -r prs spend <<<"$(awk -v cutoff_iso="$cutoff_iso" '
+      BEGIN { prs = 0; spend = 0 }
+      {
+        ts=""; head=""; cost = 0
+        if (match($0, /"ts_start"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts=substr($0, RSTART, RLENGTH)
+          sub(/.*"ts_start"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"result_head"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          head=substr($0, RSTART, RLENGTH)
+          sub(/.*"result_head"[[:space:]]*:[[:space:]]*"/, "", head); sub(/".*/, "", head)
+        }
+        if (match($0, /"total_cost_usd"[[:space:]]*:[[:space:]]*-?[0-9.eE+-]+/)) {
+          c = substr($0, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", c)
+          cost = c + 0
+        }
+        if (ts == "") next
+        norm = ts
+        sub(/\.[0-9]+Z$/, "Z", norm)
+        if (substr(norm, length(norm), 1) != "Z") norm = norm "Z"
+        if (norm < cutoff_iso) next
+        spend += cost
+        if (substr(head, 1, 5) == "SHIP ") prs++
+      }
+      END { printf("%d\t%.2f", prs + 0, spend + 0) }
+    ' "$runs")"
+    [ -z "$prs" ] && prs=0
+    [ -z "$spend" ] && spend="0.00"
+  fi
+  # Determine verdict: paused / capped / shipped clean / quiet / slowdown.
+  local paused=0 budgeted=0
+  if [ -f "$events" ]; then
+    paused="$(awk -v cutoff_iso="$cutoff_iso" '
+      BEGIN { count = 0; p = 0; r = 0 }
+      {
+        ts=""; type=""
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts=substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          type=substr($0, RSTART, RLENGTH)
+          sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+        }
+        if (ts == "" || type == "") next
+        norm = ts
+        sub(/\.[0-9]+Z$/, "Z", norm)
+        if (substr(norm, length(norm), 1) != "Z") norm = norm "Z"
+        if (norm < cutoff_iso) next
+        if (type == "ship_paused") p++
+        if (type == "ship_resumed") r++
+      }
+      END { print (p - r > 0) ? (p - r) : 0 }
+    ' "$events")"
+    budgeted="$(awk -v cutoff_iso="$cutoff_iso" '
+      BEGIN { count = 0; n = 0 }
+      {
+        ts=""; type=""
+        if (match($0, /"ts"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          ts=substr($0, RSTART, RLENGTH)
+          sub(/.*"ts"[[:space:]]*:[[:space:]]*"/, "", ts); sub(/".*/, "", ts)
+        }
+        if (match($0, /"type"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          type=substr($0, RSTART, RLENGTH)
+          sub(/.*"type"[[:space:]]*:[[:space:]]*"/, "", type); sub(/".*/, "", type)
+        }
+        if (ts == "" || type == "") next
+        norm = ts
+        sub(/\.[0-9]+Z$/, "Z", norm)
+        if (substr(norm, length(norm), 1) != "Z") norm = norm "Z"
+        if (norm < cutoff_iso) next
+        if (type == "budget_block") n++
+      }
+      END { print n + 0 }
+    ' "$events")"
+    [ -z "$paused" ] && paused=0
+    [ -z "$budgeted" ] && budgeted=0
+  fi
+  local verdict
+  if [ "$paused" -gt 0 ]; then
+    verdict="paused"
+  elif [ "$budgeted" -gt 0 ]; then
+    verdict="capped"
+  elif [ "$prs" -gt 0 ]; then
+    verdict="shipped clean"
+  else
+    verdict="quiet"
+  fi
+  printf -- '%s\t%s\t%s\t%s\n' "$slug" "$prs" "$spend" "$verdict"
+}
+
+# Compose the verdict sentence via template substitution. Per LESSONS
+# 2026-06-15 (awk while-match repl-with-self-match infinite-loop trap)
+# the substitution uses the CURSOR-based walk pattern because `repl`
+# values may include `$<digits>` substrings (e.g. cap values like
+# "$5.00") that re-match a naive `\$[0-9]+` regex.
+catchup_compose_verdict() {
+  local duration="$1" items_count="$2" fire_state="$3"
+  local tmpl='you were away <DURATION>. verdict: <N> things need you now. <FIRE>.'
+  # Cursor-based walk: substitute each placeholder by scanning the
+  # not-yet-rewritten tail. The replacement values may include `<`
+  # or `$` characters; the cursor pattern bounds the regex window so
+  # the rewrite never re-matches itself.
+  printf -- '%s' "$tmpl" | awk -v dur="$duration" -v n="$items_count" -v fire="$fire_state" '
+    {
+      out = ""; rest = $0
+      while (match(rest, /<(DURATION|N|FIRE)>/)) {
+        token = substr(rest, RSTART, RLENGTH)
+        repl = ""
+        if (token == "<DURATION>") repl = dur
+        else if (token == "<N>")   repl = n
+        else if (token == "<FIRE>") repl = fire
+        out = out substr(rest, 1, RSTART - 1) repl
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      printf("%s%s", out, rest)
+    }
+  '
+}
+
+# Format a per-action block (text mode). Each action carries:
+#   <PRIORITY>. <HEADLINE>
+#      → <ACTION>
+#      → <FOLLOWUP>     (optional)
+catchup_compose_action_line() {
+  local rank="$1" headline="$2" action="$3" followup="${4:-}"
+  printf -- '  %s. %s\n' "$rank" "$headline"
+  if [ -n "$action" ]; then
+    printf -- '     → %s\n' "$action"
+  fi
+  if [ -n "$followup" ]; then
+    printf -- '     → %s\n' "$followup"
+  fi
+}
+
+# Render the catchup briefing in text mode. Inputs:
+#   $1 = duration (humanized)
+#   $2 = items_count
+#   $3 = fire_state
+#   $4 = actions tsv file (rank<TAB>cat<TAB>slug<TAB>headline<TAB>action<TAB>followup)
+#   $5 = footer tsv file (slug<TAB>prs<TAB>spend<TAB>verdict)
+#   $6 = total_spent
+catchup_render_text() {
+  local duration="$1" items_count="$2" fire_state="$3"
+  local actions_file="$4" footer_file="$5" total_spent="$6"
+
+  printf -- 'catchup — %s\n' "$(catchup_compose_verdict "$duration" "$items_count" "$fire_state")"
+  printf -- '\n'
+
+  if [ "$items_count" -gt 0 ]; then
+    printf -- '  needs you, in priority order:\n'
+    printf -- '\n'
+    local rank cat slug headline action followup
+    while IFS=$'\t' read -r rank cat slug headline action followup; do
+      [ -z "$rank" ] && continue
+      [ "$followup" = "-" ] && followup=""
+      catchup_compose_action_line "$rank" "$headline" "$action" "$followup"
+    done < "$actions_file"
+    printf -- '\n'
+  fi
+
+  # Footer: render only when at least one slug had activity.
+  local footer_lines
+  footer_lines="$(awk 'BEGIN { count = 0 } NF { count++ } END { print count + 0 }' "$footer_file")"
+  if [ "$footer_lines" -gt 0 ]; then
+    printf -- '  what happened while you were away ($%s total):\n' "$total_spent"
+    local f_slug f_prs f_spend f_verdict
+    while IFS=$'\t' read -r f_slug f_prs f_spend f_verdict; do
+      [ -z "$f_slug" ] && continue
+      printf -- '    %-14s %s PR  $%s  (%s)\n' "$f_slug" "$f_prs" "$f_spend" "$f_verdict"
+    done < "$footer_file"
+    printf -- '\n'
+  fi
+
+  printf -- '  next: fleet morning (your normal daily briefing)\n'
+}
+
+# Render the catchup briefing as a single JSON object. Per LESSONS
+# 2026-06-13 the escape calls `preflight_json_escape` directly.
+catchup_render_json() {
+  local away_seconds="$1" duration="$2" items_count="$3" fire_state="$4"
+  local actions_file="$5" footer_file="$6" total_spent="$7"
+
+  local verdict_text
+  verdict_text="$(catchup_compose_verdict "$duration" "$items_count" "$fire_state")"
+
+  local esc_human esc_verdict
+  esc_human="$(preflight_json_escape "$duration")"
+  esc_verdict="$(preflight_json_escape "$verdict_text")"
+
+  local fire_bool="false"
+  case "$fire_state" in
+    *"on fire"*) fire_bool="true" ;;
+  esac
+
+  # actions JSON array.
+  local actions_json="["
+  local first=1 rank cat slug headline action followup
+  local esc_cat esc_slug esc_head esc_act esc_fup
+  while IFS=$'\t' read -r rank cat slug headline action followup; do
+    [ -z "$rank" ] && continue
+    [ "$followup" = "-" ] && followup=""
+    esc_cat="$(preflight_json_escape "$cat")"
+    esc_slug="$(preflight_json_escape "$slug")"
+    esc_head="$(preflight_json_escape "$headline")"
+    esc_act="$(preflight_json_escape "$action")"
+    if [ -z "$followup" ]; then
+      esc_fup="null"
+    else
+      esc_fup="\"$(preflight_json_escape "$followup")\""
+    fi
+    if [ "$first" = "1" ]; then first=0; else actions_json="${actions_json},"; fi
+    actions_json="${actions_json}{\"priority\":${rank},\"category\":\"${esc_cat}\",\"slug\":\"${esc_slug}\",\"headline\":\"${esc_head}\",\"command\":\"${esc_act}\",\"followup\":${esc_fup}}"
+  done < "$actions_file"
+  actions_json="${actions_json}]"
+
+  # footer JSON array.
+  local footer_json="["
+  local f_first=1 f_slug f_prs f_spend f_verdict esc_fslug esc_fverd
+  while IFS=$'\t' read -r f_slug f_prs f_spend f_verdict; do
+    [ -z "$f_slug" ] && continue
+    esc_fslug="$(preflight_json_escape "$f_slug")"
+    esc_fverd="$(preflight_json_escape "$f_verdict")"
+    if [ "$f_first" = "1" ]; then f_first=0; else footer_json="${footer_json},"; fi
+    footer_json="${footer_json}{\"slug\":\"${esc_fslug}\",\"prs\":${f_prs},\"spent_usd\":${f_spend},\"verdict\":\"${esc_fverd}\"}"
+  done < "$footer_file"
+  footer_json="${footer_json}]"
+
+  printf -- '{"away_seconds":%s,"away_human":"%s","verdict":{"items_count":%s,"fire":%s,"summary":"%s"},"actions":%s,"footer":%s,"total_spent_usd":%s}\n' \
+    "$away_seconds" "$esc_human" "$items_count" "$fire_bool" "$esc_verdict" \
+    "$actions_json" "$footer_json" "$total_spent"
+}
+
+# Rank + cap. Reads candidates from a TSV file with the shape:
+#   priority<TAB>category<TAB>slug<TAB>severity<TAB>headline<TAB>action<TAB>followup
+# Sorts by priority ASC, then severity DESC, then slug ASC. Caps at 3
+# unless want_all=1. Emits:
+#   rank<TAB>category<TAB>slug<TAB>headline<TAB>action<TAB>followup
+catchup_rank_and_cap() {
+  local in_file="$1" want_all="$2"
+  local cap=3
+  if [ "$want_all" = "1" ]; then cap=99999; fi
+  # Stable sort: priority (numeric, asc), severity (numeric, desc), slug (asc).
+  awk -F'\t' 'NF >= 7' "$in_file" \
+    | LC_ALL=C sort -t $'\t' -k1,1n -k4,4nr -k3,3 \
+    | awk -F'\t' -v cap="$cap" '
+        BEGIN { count = 0; rank = 0 }
+        {
+          rank++
+          if (rank > cap) exit 0
+          # Emit rank, category, slug, headline, action, followup.
+          printf("%d\t%s\t%s\t%s\t%s\t%s\n", rank, $2, $3, $5, $6, $7)
+        }
+      '
+}
+
+catchup() {
+  shift  # drop the leading "catchup"
+  local want_json=0 want_all=0 slug_filter="" since_raw=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      --all)  want_all=1;  shift ;;
+      --slug)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "catchup: --slug requires a value" >&2
+          exit 2
+        fi
+        slug_filter="$2"; shift 2 ;;
+      --slug=*)
+        slug_filter="${1#--slug=}"
+        if [ -z "$slug_filter" ]; then
+          echo "catchup: --slug requires a value" >&2
+          exit 2
+        fi
+        shift ;;
+      --since)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "catchup: --since requires Nh|Nd|YYYY-MM-DD" >&2
+          exit 2
+        fi
+        since_raw="$2"; shift 2 ;;
+      --since=*)
+        since_raw="${1#--since=}"
+        if [ -z "$since_raw" ]; then
+          echo "catchup: --since requires Nh|Nd|YYYY-MM-DD" >&2
+          exit 2
+        fi
+        shift ;;
+      -h|--help)
+        cat <<'USAGE'
+fleet catchup — re-orientation briefing after a >=72h absence.
+
+Usage:
+  fleet catchup                       auto-detect "last seen" from the newer
+                                      of $HOME/.local/state/agent-fleet/
+                                      morning-last-run and $HOME/.cache/fleet/
+                                      inbox-state mtimes
+  fleet catchup --since 5d            override window (Nh, Nd, or YYYY-MM-DD)
+  fleet catchup --since 120h
+  fleet catchup --since 2026-06-18
+  fleet catchup --all                 lift the 3-item ranked-actions cap
+  fleet catchup --slug NAME           restrict to one slug
+  fleet catchup --json                machine-readable single JSON object
+  fleet catchup --help                this banner
+
+Output (text mode):
+  catchup — you were away <DURATION>. verdict: <N> things need you now.
+            <FIRE_STATE>.
+
+    needs you, in priority order:
+      1. <headline>
+         → <command>
+         → <followup>
+      ...
+
+    what happened while you were away ($<TOTAL> total):
+      <slug>  <PRS> PR  $<SPEND>  (<verdict>)
+      ...
+
+    next: fleet morning (your normal daily briefing)
+
+Ranking priority (highest first):
+  1. ship_paused without ship_resumed in the absence window
+  2. budget_block in the absence window
+  3. stuck PRs (DRAFT_armed / BEHIND / account_suspended / infra_flake_loop)
+  4. lesson_draft_emitted with no subsequent lesson_promoted for the PR
+  5. slugs where the absence-window $/PR jumped >25% over the prior
+
+Pure reader: no events.jsonl writes, no `fleet_emit_event` calls, no
+`lib/` / `prompts/` edits, no new event types, no manifest knobs.
+Exit code: 0 on success; 2 on usage error.
+USAGE
+        exit 0 ;;
+      *)
+        printf -- 'catchup: unknown flag %s\n' "$1" >&2
+        exit 2 ;;
+    esac
+  done
+
+  local now_epoch
+  now_epoch="${FLEET_NOW_OVERRIDE:-$(date -u +%s)}"
+
+  # Resolve absence window. --since wins; otherwise auto-detect from state
+  # file mtimes. Per LESSONS 2026-06-11 the YYYY-MM-DD form normalizes to
+  # T00:00:00 inside catchup_parse_since.
+  local away_seconds=0 last_seen_epoch=0
+  if [ -n "$since_raw" ]; then
+    if ! away_seconds="$(catchup_parse_since "$since_raw")"; then
+      printf -- 'catchup: --since must be Nh|Nd|YYYY-MM-DD (got %s)\n' "$since_raw" >&2
+      exit 2
+    fi
+    last_seen_epoch=$(( now_epoch - away_seconds ))
+  else
+    local resolved
+    resolved="$(catchup_resolve_last_seen)"
+    if [ "$resolved" = "none" ]; then
+      printf -- 'catchup: no morning-last-run or inbox-state file found. run `fleet morning` or `fleet inbox` yet — run those first, then `fleet catchup`.\n'
+      exit 0
+    fi
+    last_seen_epoch="$resolved"
+    away_seconds=$(( now_epoch - last_seen_epoch ))
+    [ "$away_seconds" -lt 0 ] && away_seconds=0
+  fi
+
+  # Under-threshold redirect.
+  local away_hours=$(( away_seconds / 3600 ))
+  if [ "$away_hours" -lt "$CATCHUP_AWAY_THRESHOLD_HOURS" ]; then
+    printf -- 'catchup: you were last here %sh ago. you haven'\''t been away. run `fleet morning` for your daily briefing.\n' "$away_hours" >&2
+    exit 0
+  fi
+
+  # Cutoff = absence window start (ISO8601 UTC).
+  local cutoff_iso
+  cutoff_iso="$(catchup_iso_at "$last_seen_epoch")"
+  # Prior-window cutoff (equal length, immediately before the absence).
+  local prior_epoch=$(( last_seen_epoch - away_seconds ))
+  [ "$prior_epoch" -lt 0 ] && prior_epoch=0
+  local prior_iso
+  prior_iso="$(catchup_iso_at "$prior_epoch")"
+
+  # Discover slugs and apply --slug filter.
+  local discovery_tmp; discovery_tmp="$(mktemp -t fleet-catchup-disc.XXXXXX)"
+  trap 'rm -f "$discovery_tmp"' RETURN
+  catchup_discover_slugs > "$discovery_tmp"
+
+  if [ -n "$slug_filter" ]; then
+    local found=0 known=""
+    local d_slug d_manifest d_cache
+    while IFS=$'\t' read -r d_slug d_manifest d_cache; do
+      [ -z "$d_slug" ] && continue
+      [ "$d_slug" = "$slug_filter" ] && found=1
+      if [ -z "$known" ]; then known="$d_slug"; else known="$known $d_slug"; fi
+      : "$d_manifest" "$d_cache"
+    done < "$discovery_tmp"
+    if [ "$found" = "0" ]; then
+      printf -- 'catchup: slug %s not found. discovered slugs: %s\n' \
+        "$slug_filter" "$known" >&2
+      rm -f "$discovery_tmp"
+      exit 2
+    fi
+    # Filter discovery to one slug.
+    awk -F'\t' -v s="$slug_filter" '$1 == s' "$discovery_tmp" > "${discovery_tmp}.f"
+    mv "${discovery_tmp}.f" "$discovery_tmp"
+  fi
+
+  # Collect candidate actions across slugs.
+  # Each row: priority<TAB>category<TAB>slug<TAB>severity<TAB>headline<TAB>action<TAB>followup
+  local candidates; candidates="$(mktemp -t fleet-catchup-cand.XXXXXX)"
+  local footer_tmp; footer_tmp="$(mktemp -t fleet-catchup-foot.XXXXXX)"
+
+  local c_slug c_manifest c_cache events_path runs_path
+  while IFS=$'\t' read -r c_slug c_manifest c_cache; do
+    [ -z "$c_slug" ] && continue
+    : "$c_manifest"
+    events_path="$c_cache/events.jsonl"
+    runs_path="$c_cache/runs.jsonl"
+
+    # Priority 1: ship_paused unresumed.
+    local paused_row
+    paused_row="$(catchup_collect_paused_unresumed "$c_slug" "$events_path" "$cutoff_iso")"
+    if [ -n "$paused_row" ]; then
+      # Parse: paused<TAB>slug<TAB>count<TAB>headline
+      local p_count p_head
+      p_count="$(printf -- '%s' "$paused_row" | awk -F'\t' '{ print $3 + 0 }')"
+      p_head="$(printf -- '%s' "$paused_row" | awk -F'\t' '{ print $4 }')"
+      local act="fleet resume ${c_slug} --reason \"back, drafts reviewed\""
+      local fup="paused ${p_count}x"
+      printf -- '1\tpaused\t%s\t%s\tresume %s (%s)\t%s\t%s\n' \
+        "$c_slug" "$p_count" "$c_slug" "$p_head" "$act" "$fup" >> "$candidates"
+    fi
+
+    # Priority 2: budget_block.
+    local budget_row
+    budget_row="$(catchup_collect_budget_blocks "$c_slug" "$events_path" "$cutoff_iso")"
+    if [ -n "$budget_row" ]; then
+      # Parse: budget<TAB>slug<TAB>count<TAB>spent<TAB>cap
+      local b_count b_spent b_cap
+      b_count="$(printf -- '%s' "$budget_row" | awk -F'\t' '{ print $3 + 0 }')"
+      b_spent="$(printf -- '%s' "$budget_row" | awk -F'\t' '{ print $4 }')"
+      b_cap="$(printf -- '%s' "$budget_row" | awk -F'\t' '{ print $5 }')"
+      local act2="fleet invoice ${c_slug}"
+      # Followup mentions the cap value (e.g. "$5.00") — this is the
+      # cursor-walk trap LESSONS 2026-06-15 guards against in the verdict
+      # template substitution. Action lines are plain printf, not awk.
+      local fup2="capped at \$${b_cap} (spent \$${b_spent})"
+      printf -- '2\tbudget\t%s\t%s\tbudget cap hit on %s\t%s\t%s\n' \
+        "$c_slug" "$b_count" "$c_slug" "$act2" "$fup2" >> "$candidates"
+    fi
+
+    # Priority 4: unpromoted lesson drafts. (Priority 3 = stuck PRs from gh;
+    # rendered in a degraded form when gh is unavailable.)
+    local drafts_row
+    drafts_row="$(catchup_collect_unpromoted_drafts "$c_slug" "$events_path" "$cutoff_iso")"
+    if [ -n "$drafts_row" ]; then
+      local d_count
+      d_count="$(printf -- '%s' "$drafts_row" | awk -F'\t' '{ print $3 + 0 }')"
+      local act4="fleet inbox --slug ${c_slug}"
+      local fup4="${d_count} lesson drafts waiting"
+      printf -- '4\tdrafts\t%s\t%s\tpromote drafts in %s\t%s\t%s\n' \
+        "$c_slug" "$d_count" "$c_slug" "$act4" "$fup4" >> "$candidates"
+    fi
+
+    # Priority 5: cost regression vs prior window.
+    local cost_row
+    cost_row="$(catchup_collect_cost_regressions "$c_slug" "$runs_path" "$cutoff_iso" "$prior_iso")"
+    if [ -n "$cost_row" ]; then
+      local pct cur_dpp prior_dpp
+      pct="$(printf -- '%s' "$cost_row" | awk -F'\t' '{ print $3 + 0 }')"
+      cur_dpp="$(printf -- '%s' "$cost_row" | awk -F'\t' '{ print $4 }')"
+      prior_dpp="$(printf -- '%s' "$cost_row" | awk -F'\t' '{ print $5 }')"
+      local act5="fleet invoice ${c_slug}"
+      local fup5="\$/PR ${cur_dpp} vs prior ${prior_dpp}"
+      printf -- '5\tcost\t%s\t%s\t$/PR up %s%% in %s\t%s\t%s\n' \
+        "$c_slug" "$pct" "$pct" "$c_slug" "$act5" "$fup5" >> "$candidates"
+    fi
+
+    # Footer row — accumulate.
+    local foot_row
+    foot_row="$(catchup_footer_row "$c_slug" "$runs_path" "$events_path" "$cutoff_iso")"
+    # Only include slugs that had ANY activity (PR>0, spend>0, or paused/capped).
+    if [ -n "$foot_row" ]; then
+      local f_slug f_prs f_spend f_verdict
+      IFS=$'\t' read -r f_slug f_prs f_spend f_verdict <<<"$foot_row"
+      if [ "$f_prs" -gt 0 ] || [ "$f_verdict" != "quiet" ]; then
+        printf -- '%s\t%s\t%s\t%s\n' "$f_slug" "$f_prs" "$f_spend" "$f_verdict" >> "$footer_tmp"
+      fi
+    fi
+  done < "$discovery_tmp"
+
+  # Rank and cap actions.
+  local ranked; ranked="$(mktemp -t fleet-catchup-ranked.XXXXXX)"
+  catchup_rank_and_cap "$candidates" "$want_all" > "$ranked"
+
+  local items_count
+  items_count="$(awk 'BEGIN { count = 0 } NF { count++ } END { print count + 0 }' "$ranked")"
+
+  # Compose fire_state: any priority-1 ship_paused unresolved → fire.
+  local fire_state="nothing on fire"
+  if awk -F'\t' '$2 == "paused" { found = 1 } END { exit (found ? 0 : 1) }' "$ranked"; then
+    if [ "$items_count" -eq 1 ]; then
+      fire_state="1 thing on fire"
+    else
+      # Count paused items in ranked list.
+      local on_fire
+      on_fire="$(awk -F'\t' 'BEGIN { count = 0 } $2 == "paused" { count++ } END { print count + 0 }' "$ranked")"
+      if [ "$on_fire" = "1" ]; then
+        fire_state="1 thing on fire"
+      else
+        fire_state="${on_fire} things on fire"
+      fi
+    fi
+  fi
+
+  local duration_h
+  duration_h="$(catchup_humanize_duration "$away_seconds")"
+
+  # Total spend across the footer rows.
+  local total_spent
+  total_spent="$(awk -F'\t' 'BEGIN { sum = 0 } NF { sum += $3 + 0 } END { printf("%.2f", sum + 0) }' "$footer_tmp")"
+  [ -z "$total_spent" ] && total_spent="0.00"
+
+  if [ "$want_json" = "1" ]; then
+    catchup_render_json "$away_seconds" "$duration_h" "$items_count" \
+      "$fire_state" "$ranked" "$footer_tmp" "$total_spent"
+  else
+    catchup_render_text "$duration_h" "$items_count" "$fire_state" \
+      "$ranked" "$footer_tmp" "$total_spent"
+  fi
+
+  rm -f "$candidates" "$ranked" "$footer_tmp" "$discovery_tmp"
+  exit 0
+}
+
+if [ "$CMD" = "catchup" ]; then
+  catchup "$@"
   exit $?
 fi
 
