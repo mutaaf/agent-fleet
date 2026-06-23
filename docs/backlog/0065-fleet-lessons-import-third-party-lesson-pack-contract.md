@@ -1,7 +1,7 @@
 ---
 id: 0065
 title: fleet lessons-import codifies a third-party lesson-pack contract so a peer's hard-won LESSONS can pre-load a fresh fleet without copy-paste
-status: groomed
+status: in-progress
 priority: P2
 area: engine
 created: 2026-06-23
@@ -1122,3 +1122,11 @@ Files / patterns the dev should touch.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+- 2026-06-23 — implementation-dev: branch `feat/0065-lessons-import` opened;
+  flipped status groomed → in-progress; tests-first under
+  `tests/lessons-import.sh` with fixtures under
+  `tests/fixtures/lessons-import/`; helpers `lessons_import_*` all defined
+  ABOVE the dispatcher per LESSONS 2026-06-05; locals prefixed
+  `lessons_import_*` per LESSONS 2026-06-19; no changes to `lib/` or
+  `prompts/` (BREAKING=NO, Reinstall=NO).
