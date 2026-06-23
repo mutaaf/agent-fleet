@@ -1,7 +1,7 @@
 ---
 id: 0063
 title: fleet migrate --export / --import packages an operator's whole fleet into one tarball so a fresh MacBook is restored in 60 seconds
-status: groomed
+status: in-progress
 priority: P1
 area: engine
 created: 2026-06-23
@@ -863,3 +863,13 @@ doesn't have to re-discover the architecture.
 ## Implementation log
 
 (Appended by the implementation-dev agent during execution.)
+
+### 2026-06-23 — picked up by implementation-dev
+
+Flipped status `groomed` → `in-progress` on feat/0063-migrate-export-import.
+Plan: define ~16 `migrate_*` helpers ABOVE the dispatcher (between the
+`add` dispatcher at line ~1558 and the preflight section), wire the
+`migrate()` dispatcher next, add `tests/migrate.sh` exercising all 14
+acceptance boxes, then run the local gate. No `lib/common.sh` /
+`prompts/` / `AGENTS.md` changes. No new event types. Self-check
+baseline on main is 3 hits; PR must not exceed.
