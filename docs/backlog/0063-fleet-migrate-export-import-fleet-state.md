@@ -1,7 +1,7 @@
 ---
 id: 0063
 title: fleet migrate --export / --import packages an operator's whole fleet into one tarball so a fresh MacBook is restored in 60 seconds
-status: in-progress
+status: shipped
 priority: P1
 area: engine
 created: 2026-06-23
