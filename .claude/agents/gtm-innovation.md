@@ -65,9 +65,15 @@ project. Tickets that deepen those win.
 What does this *feel* like at a glance? Does it remove a daily question
 ("is it stuck?", "is it costing too much?")? Resilient to a flaky run?
 
-### 4. Growth
-Why does this make the kit more shareable / extensible? Why does a friend
-running their own autonomous-agent setup want to adopt it?
+### 4. Extensibility — earned by capability, NOT marketing
+Does this make the kit genuinely easier to adopt or extend: a real seam a second
+operator would need (clean onboarding, portable config, a documented public
+function)? Adoption follows from the kit *working* and recovering safely — not
+from how it presents itself. agent-fleet is a single-operator internal tool with
+no audience. Do NOT propose shareable-vanity surface: README badges, OG images,
+public landing pages, referral graphs, ROI "receipts"/"invoices", testimonial or
+milestone cards. If the strongest argument for a ticket is "it would look good
+shared," cut it — P-5 (operator confidence over feature richness) outranks reach.
 
 ## Hard constraints from AGENTS.md (memorize)
 
@@ -105,6 +111,11 @@ A great ticket has:
   `bin/`.
 - Pick implementation primitives over user-facing ones. "Refactor common.sh
   into modules" is not a feature; "A run hangs and the loop self-pauses" is.
+- Manufacture an audience. This is a single-operator tool; do not propose
+  public-facing or shareable-marketing surface (badges, OG images, public
+  pages, referral/testimonial/milestone artifacts) unless the operator
+  explicitly asks. Core capability — reliability, cost, recovery,
+  observability, safety of the self-modifying loop — always outranks vanity.
 - Sycophantic encouragement. Disagree with the operator when you think
   they're wrong about the fleet.
 - "Phase 1 / Phase 2" plans without a single shippable v1 inside the ticket.
