@@ -84,3 +84,4 @@ ones, `review` grades them.
 | 0063 | fleet migrate --export / --import packages an operator's whole fleet into one tarball so a fresh MacBook is restored in 60 seconds | P1 | shipped | engine |
 | 0064 | fleet catchup composes a re-orientation briefing after the operator's been away >72h so returning to a 4-slug fleet stops feeling like triage | P1 | shipped | observability |
 | 0065 | fleet lessons-import codifies a third-party lesson-pack contract so a peer's hard-won LESSONS can pre-load a fresh fleet without copy-paste | P2 | shipped | engine |
+| 0066 | Warn before SELF_CANCEL expiry so the loop never silently parks | P1 | groomed | safety |
