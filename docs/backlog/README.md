@@ -85,3 +85,6 @@ ones, `review` grades them.
 | 0064 | fleet catchup composes a re-orientation briefing after the operator's been away >72h so returning to a 4-slug fleet stops feeling like triage | P1 | shipped | observability |
 | 0065 | fleet lessons-import codifies a third-party lesson-pack contract so a peer's hard-won LESSONS can pre-load a fresh fleet without copy-paste | P2 | shipped | engine |
 | 0066 | Warn before SELF_CANCEL expiry so the loop never silently parks | P1 | groomed | safety |
+| 0067 | fleet stuck fifth cause — flag PRs whose head SHA never got a check-run | P1 | groomed | safety |
+| 0068 | Warn before daily budget cap trips so the operator raises or waits on purpose | P1 | groomed | governance |
+| 0069 | fleet uninstall --verify confirms a slug reversed cleanly | P2 | groomed | engine |
