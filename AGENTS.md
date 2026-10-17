@@ -26,6 +26,7 @@ seatbelt. Hand-merge the first few PRs to be safe, then trust the loop.
   to "fix":
   - `shellcheck`
   - `validate`
+  - `review-gate` — the reviewer's `FLEET-VERDICT` on the head commit (ticket 0070, P-10)
 - **Agent branch prefixes**:
   - `feat/` — feature work (ship agent)
   - `chore/gtm-` — backlog refresh (groom agent)

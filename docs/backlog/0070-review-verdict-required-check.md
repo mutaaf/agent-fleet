@@ -61,7 +61,7 @@ proves it" is the screenshot that makes another engineering lead trust the kit.
       verdict from it. (AC#6, review-lesson-draft AC#2/AC#8 updated)
 - [x] ship + eng prompts: no verdict yet → wait; blocking → bounded heal of what
       the review names, inside the two-attempt cap. P-10 + CHANGELOG entry. (AC#6)
-- [ ] Rollout, one repo at a time: copy the template + script, add `review-gate`
+- [ ] Rollout, one repo at a time (agent-fleet adopted 2026-10-17): copy the template + script, add `review-gate`
       to main's required status checks and to AGENTS.md § Gating checks, re-run
       `lib/install.sh`. agent-fleet first, then the other five.
 
