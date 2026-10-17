@@ -88,3 +88,4 @@ ones, `review` grades them.
 | 0067 | fleet stuck fifth cause — flag PRs whose head SHA never got a check-run | P1 | groomed | safety |
 | 0068 | Warn before daily budget cap trips so the operator raises or waits on purpose | P1 | groomed | governance |
 | 0069 | fleet uninstall --verify confirms a slug reversed cleanly | P2 | groomed | engine |
+| 0070 | Make the reviewer's verdict a required check so auto-merge waits for it | P0 | in-progress | governance |

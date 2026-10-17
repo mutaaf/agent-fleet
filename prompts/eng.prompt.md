@@ -13,7 +13,9 @@ separately — AGENTS.md says which).
 
 PHASE 1 — Tend the in-flight `eng/` PR with the SAME self-healing logic as the
 Ship runner (cases a–e: bounded red-CI recovery, BEHIND → update-branch, DIRTY →
-merge, PENDING → wait, CLEAN → arm auto-merge). Heal OR ship, never both. If no
+merge, PENDING → wait, CLEAN → arm auto-merge), INCLUDING the REVIEW GATE rule
+(ticket 0070: no verdict on the head yet → wait; `FLEET-VERDICT: blocking` → bounded
+heal of what the review names). Heal OR ship, never both. If no
 open `eng/` PR, go to PHASE 2.
 
 PHASE 2 — Pick the highest-priority groomed engineering ticket (FILE status is

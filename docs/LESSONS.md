@@ -604,3 +604,15 @@ the content-digest-list shape is portable across all of them. (A
 deterministic `tar` does exist via `--mtime --owner --group --sort` on
 GNU `tar` but NOT on BSD `tar` — and the kit dogfoods macOS where BSD
 `tar` ships by default. Don't go down that path.)
+
+## 2026-10-17 — a review that auto-merge can ignore is not a gate
+
+Symptom: across six fleet repos only 150 of 638 merged agent PRs had a review
+before merging, and 26 merged while the reviewer's last word was BLOCKING.
+Cause: the reviewer runs as the PR author, so GitHub rejects its
+`--request-changes` (and `--approve`); verdicts fell back to plain comments,
+which auto-merge never reads — and CI usually went green before the 5-minute
+review poll anyway. Fix (ticket 0070): verdicts carry `FLEET-VERDICT: clean|
+blocking` on the first line, and a required `review-gate` check passes only on
+a clean verdict for the current head commit. Never "fix" the gate by editing or
+dismissing a review; heal what it names.

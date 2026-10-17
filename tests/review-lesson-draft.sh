@@ -25,7 +25,8 @@
 #         draft mechanism; prompts/CHANGELOG.md gains a matching entry.
 #   AC#7  lib/review.sh references the helper / mentions the LESSONS draft
 #         contract, so the prompt instructs the agent to call it.
-#   AC#8  Public `gh pr review` argv unchanged on the send-back path (the
+#   AC#8  Public `gh pr review` argv shape on the send-back path (updated by
+#         ticket 0070: FLEET-VERDICT --comment reviews; was --request-changes) (the
 #         review body bytes that flow into `gh pr review` are not mutated
 #         by the helper).
 #
@@ -223,19 +224,19 @@ if ! grep -q '_review_emit_lesson_draft' "$REPO_ROOT/lib/review.sh"; then
   echo "FAIL: AC#2 lib/review.sh does not reference _review_emit_lesson_draft at all"
   exit 1
 fi
-# Per-line audit: the prompt MUST contain a "request-changes" guard for the
-# helper call. We grep for either "if ... posted --request-changes" or
-# "ONLY if you posted --request-changes" wording near the helper mention.
-if ! grep -qiE 'only.*--request-changes|if.*posted.*--request-changes' "$REPO_ROOT/lib/review.sh"; then
-  echo "FAIL: AC#2 prompt does not gate the helper call on --request-changes"
+# Per-line audit: the prompt MUST gate the helper call on a blocking verdict.
+# (Ticket 0070: verdicts are FLEET-VERDICT comments, since GitHub forbids
+# --request-changes from the PR author; "blocking" replaces "request-changes".)
+if ! grep -qiE 'only if.*verdict is blocking' "$REPO_ROOT/lib/review.sh"; then
+  echo "FAIL: AC#2 prompt does not gate the helper call on a blocking verdict"
   exit 1
 fi
 # Also assert the prompt explicitly tells the agent NOT to call the helper on sign-off.
-if ! grep -qiE 'do not call _review_emit_lesson_draft on the --comment' "$REPO_ROOT/lib/review.sh"; then
-  echo "FAIL: AC#2 prompt does not explicitly forbid helper on --comment path"
+if ! grep -qiE 'do not call _review_emit_lesson_draft on a clean verdict' "$REPO_ROOT/lib/review.sh"; then
+  echo "FAIL: AC#2 prompt does not explicitly forbid helper on the clean path"
   exit 1
 fi
-echo "ok: AC#2 helper only invoked under request-changes branch"
+echo "ok: AC#2 helper only invoked under a blocking verdict"
 
 # ===========================================================================
 # AC#4 — check-backlog.mjs passes with drafts present in LESSONS. Drafts live
@@ -275,20 +276,24 @@ fi
 echo "ok: AC#7 review.sh prompt wires the helper into the send-back path"
 
 # ===========================================================================
-# AC#8 — Public `gh pr review` invocation argv unchanged in shape: the
-# prompt still names `--request-changes` and `--comment` as the two verdicts
-# and the body fields are still passed via `--body`. We grep the prompt
-# heredoc directly.
+# AC#8 — Public `gh pr review` invocation argv shape. Ticket 0070 replaced the
+# `--request-changes` verdict (GitHub rejects it from the PR author) with two
+# `--comment --body "FLEET-VERDICT: …"` forms that the review-gate check reads.
+# We grep the prompt heredoc directly.
 # ===========================================================================
-if ! grep -qE 'gh pr review .* --request-changes --body' "$REPO_ROOT/lib/review.sh"; then
-  echo "FAIL: AC#8 gh pr review --request-changes --body argv shape changed"
+if ! grep -qE 'gh pr review .* --comment --body "FLEET-VERDICT: blocking' "$REPO_ROOT/lib/review.sh"; then
+  echo "FAIL: AC#8 blocking verdict is not a --comment --body \"FLEET-VERDICT: blocking\" review"
   exit 1
 fi
-if ! grep -qE 'gh pr review .* --comment --body' "$REPO_ROOT/lib/review.sh"; then
-  echo "FAIL: AC#8 gh pr review --comment --body argv shape changed"
+if ! grep -qE 'gh pr review .* --comment --body "FLEET-VERDICT: clean' "$REPO_ROOT/lib/review.sh"; then
+  echo "FAIL: AC#8 clean verdict is not a --comment --body \"FLEET-VERDICT: clean\" review"
   exit 1
 fi
-echo "ok: AC#8 gh pr review argv shape preserved"
+if grep -qE 'gh pr review .* --request-changes' "$REPO_ROOT/lib/review.sh"; then
+  echo "FAIL: AC#8 prompt still instructs --request-changes, which GitHub rejects from the PR author"
+  exit 1
+fi
+echo "ok: AC#8 gh pr review argv shape: two FLEET-VERDICT --comment forms"
 
 # ===========================================================================
 # AC#1 follow-up — AGENTS.md § Telemetry documents the new event type.

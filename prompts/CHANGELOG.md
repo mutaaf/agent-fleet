@@ -15,6 +15,20 @@ The companion command is `bin/fleet prompts-diff` (ticket 0013):
 - `fleet prompts-diff --changelog` — print all entries newer than the
   installed-prompts SHA (verbatim markdown from this file).
 
+## 2026-10-17 — the reviewer's verdict becomes a required check (ticket 0070)
+
+Measured across six fleet repos: only 150 of 638 merged agent PRs had a review
+before they merged, and 26 merged while the reviewer's last word was BLOCKING.
+Two causes: the reviewer runs as the PR author, so GitHub rejects its
+`--request-changes` and every verdict lands as a plain comment that auto-merge
+ignores; and CI usually finishes before the 5-minute review poll. The review
+prompt in `lib/review.sh` now posts every verdict as a `--comment` whose first
+line is `FLEET-VERDICT: clean|blocking`, and re-grades whenever the head commit
+moves. A new required `review-gate` check (`templates/workflows/review-gate.yml`)
+passes only on a clean verdict for the current head, so auto-merge waits for the
+reviewer. `ship.prompt.md` and `eng.prompt.md` learn the REVIEW GATE rule: no
+verdict yet → wait; blocking → bounded heal of what the review names (P-10).
+
 ## 2026-05-28 — review send-backs draft LESSONS skeletons for operator promotion
 
 Adds `P-9` to `prompts/PRINCIPLES.md`: every `--request-changes` review the

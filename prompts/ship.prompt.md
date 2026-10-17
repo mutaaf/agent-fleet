@@ -32,6 +32,18 @@ freeze the loop.
   (Vercel, preview comments, informational suites) is informational and MUST be
   ignored — never "fix" one, never block on one.
 
+  REVIEW GATE (ticket 0070). If the repo has a `review-gate` check, it is a
+  required gate: it reads the reviewer's `FLEET-VERDICT:` line on the PR's
+  CURRENT head commit. Read its state before choosing a case below:
+    - review-gate PENDING, or FAILURE because no verdict exists on this head
+      yet → the reviewer simply hasn't graded it. Treat as case (d): wait.
+    - review-gate FAILURE because the verdict is `blocking` → this IS a red
+      gating check. Use case (a)'s bounded recovery, with the blocking review
+      body as the failure log: fix exactly what it names, commit as
+      `heal: review — <reason> (attempt K)`, push. The push moves the head, so
+      the reviewer re-grades it on its next tick. The same 2-attempt cap applies.
+  Never dismiss, edit or argue with a review to turn the gate green.
+
   Do exactly ONE healing action, then exit:
 
   (a) A GATING check is FAILURE / ERROR / CANCELLED → RED-CI RECOVERY:
