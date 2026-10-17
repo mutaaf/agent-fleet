@@ -5,9 +5,10 @@
 #
 # Polls for open agent PRs not yet reviewed by the repo owner and grades each
 # against AGENTS.md + the referenced ticket. Runs as the PR author's gh identity,
-# so it never --approves (GitHub forbids self-approval): it posts
-#   --comment          clean sign-off (does not block)
-#   --request-changes  blocking issue (blocks auto-merge until dismissed)
+# so GitHub forbids both --approve and --request-changes. Every verdict is a
+# --comment review whose body carries `FLEET-VERDICT: clean|blocking`; the
+# required `review-gate` check (ticket 0070, templates/workflows/) reads that
+# marker on the PR's head commit, so auto-merge waits for the reviewer.
 #
 # Logs only when there is work, to avoid hundreds of empty logs/day.
 
@@ -30,11 +31,16 @@ fi
 # the canonical feature/groom/eng queues.
 AGENT_BRANCH_RE="${AGENT_BRANCH_RE:-^(feat/|chore/gtm-|eng/)}"
 
-# Open agent PRs without a review from us. One PR number per line.
+# Open agent PRs whose CURRENT head has no verdict from us (ticket 0070): a
+# heal push moves the head, so a blocked PR is re-graded automatically, and a
+# review that forgot the FLEET-VERDICT marker is retried on the next tick.
 UNREVIEWED=$(gh pr list --repo "$REPO" --state open --base main \
-  --json number,headRefName,reviews \
+  --json number,headRefName,headRefOid,reviews \
   --jq "[.[] | select(.headRefName | test(\"$AGENT_BRANCH_RE\"))
-            | select(.reviews | any(.author.login == \"$ME\") | not)
+            | .headRefOid as \$head
+            | select(.reviews | any(.author.login == \"$ME\"
+                                    and .commit.oid == \$head
+                                    and (.body | test(\"FLEET-VERDICT:\"; \"i\"))) | not)
             | .number] | .[]" 2>/dev/null)
 
 [ -z "$UNREVIEWED" ] && exit 0   # quiet exit — most ticks have no work
@@ -87,25 +93,33 @@ Read in order, then grade:
   3. /tmp/fleet-review/meta.json and /tmp/fleet-review/diff.patch
   4. docs/backlog/README.md and the ticket referenced in the PR body/branch
      (e.g. "Implements: docs/backlog/NNNN-..."). If no ticket reference exists,
-     post --request-changes and stop.
+     the verdict is blocking.
   5. .claude/agents/review.md — the full grading rubric for this project.
 
 Grade against: AGENTS.md hard NOs; ticket fit (every acceptance-criteria box
 covered by a test in the diff); test-first discipline (every src change has a
 matching test change); code quality; the project's voice/aesthetic rules;
 and prompts/PRINCIPLES.md — does the diff violate any principle? If yes,
-request changes and cite the P-N id.
+the verdict is blocking; cite the P-N id.
 
 If you discover a NOVEL operational lesson not already in docs/LESSONS.md, note
 it in your review body prefixed "LESSON:" so the next ship/groom run folds it in.
 Do NOT commit to the PR branch — you are read-only on the diff.
 
-Deliver exactly one verdict:
-  clean    → gh pr review $PR --repo $REPO --comment --body "<detailed sign-off>"
-  blocking → gh pr review $PR --repo $REPO --request-changes --body "<summary>"
-Never --approve.
+Deliver exactly one verdict, ALWAYS as a --comment review (you are the PR
+author: GitHub rejects both --approve and --request-changes from you). The
+FIRST line of the body must be exactly one of:
+  FLEET-VERDICT: clean
+  FLEET-VERDICT: blocking
+  clean    → gh pr review $PR --repo $REPO --comment --body "FLEET-VERDICT: clean
+<detailed sign-off>"
+  blocking → gh pr review $PR --repo $REPO --comment --body "FLEET-VERDICT: blocking
+<summary of what must change>"
+The required review-gate check reads that line on the PR's head commit:
+clean lets auto-merge proceed, blocking holds the merge until a new commit is
+re-graded. A body without the marker counts as no review at all.
 
-If (and ONLY if) you posted --request-changes, ALSO drop a LESSONS draft
+If (and ONLY if) your verdict is blocking, ALSO drop a LESSONS draft
 skeleton for the operator to promote later. Mechanism (ticket 0022):
 
   1. Write your review body verbatim to /tmp/fleet-review/draft-body.txt.
@@ -123,7 +137,7 @@ skeleton for the operator to promote later. Mechanism (ticket 0022):
        git push -u origin HEAD
        gh pr create --repo $REPO --base main --fill
 
-Do NOT call _review_emit_lesson_draft on the --comment sign-off path.
+Do NOT call _review_emit_lesson_draft on a clean verdict.
 Do NOT commit to the PR's own branch (you are read-only on the diff).
 
 End the session immediately after the gh pr review call (and the optional

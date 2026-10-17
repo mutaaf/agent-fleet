@@ -17,6 +17,7 @@ The engine is **shared across every project** — semantics (gating checks, bran
 - [Prerequisites](#prerequisites)
 - [Quickstart — adopt the fleet for an existing repo](#quickstart--adopt-the-fleet-for-an-existing-repo)
 - [The four agents](#the-four-agents)
+- [Review gate (required check)](#review-gate-required-check)
 - [Anatomy of a single run](#anatomy-of-a-single-run)
 - [The split: `agents.config.sh` vs `AGENTS.md`](#the-split-agentsconfigsh-vs-agentsmd)
 - [Onboarding a brand-new repo (the long form)](#onboarding-a-brand-new-repo-the-long-form)
@@ -276,6 +277,30 @@ Useful when the engineering backlog is big enough that letting it fight with fea
 </details>
 
 ---
+
+## Review gate (required check)
+
+The reviewer runs as the PR author, so GitHub won't accept its `--approve` or
+`--request-changes`. Its verdict is a comment whose first line is
+`FLEET-VERDICT: clean` or `FLEET-VERDICT: blocking`, and a **required
+`review-gate` check** turns that comment into a merge condition: it passes only
+when the newest verdict on the PR's *current head commit* is clean. Push a new
+commit and the old verdict stops counting; the reviewer re-grades on its next
+tick. Human-branch PRs pass the gate untouched. (Ticket 0070, principle P-10.)
+
+Adopt it per repo:
+
+```bash
+mkdir -p .github/workflows scripts
+cp <kit>/templates/workflows/review-gate.yml .github/workflows/
+cp <kit>/templates/scripts/review-gate.sh scripts/
+# add `review-gate` to AGENTS.md § Agent parameters → Gating checks, merge that PR, then:
+gh api -X POST repos/<owner>/<repo>/branches/main/protection/required_status_checks/contexts \
+  -f 'contexts[]=review-gate'
+bash <kit>/lib/install.sh /path/to/repo   # picks up the new reviewer + prompts
+```
+
+Expect merges to take one reviewer tick longer. That's the gate working.
 
 ## Anatomy of a single run
 
@@ -815,7 +840,7 @@ See [`DOCTRINE.md`](./DOCTRINE.md) for the full text. The 12 canonical decisions
 | D2 | Specs = 4-lens "Why now" + test-shaped acceptance criteria |
 | D3 | Feature queue required; engineering queue optional (`ENG_ENABLED`) |
 | D4 | Two-stage review: cheap self-check by worker, independent grader for the gate |
-| D5 | GitHub auto-merge does the landing; the reviewer votes but doesn't merge |
+| D5 | GitHub auto-merge does the landing; the reviewer votes but doesn't merge — and its vote is a required check (`review-gate`, 0070) |
 | D6 | Self-heal bounded to ≤ 2 attempts per PR before escalation |
 | D7 | `AGENTS.md` (singular) is the contract file |
 | D8 | Cadence: ship :41, groom 6h :17, review 5m, eng 6h :23 |

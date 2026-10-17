@@ -114,20 +114,32 @@ pattern another project already learned MUST inform this one.
 
 ## P-9 — Review send-backs draft LESSONS; the operator promotes
 
-Every `--request-changes` review is a candidate lesson. The reviewer drops
+Every blocking review (`FLEET-VERDICT: blocking`, ticket 0070) is a candidate lesson. The reviewer drops
 a date-stamped, HTML-comment-marked DRAFT block at the top of
 `docs/LESSONS.md` (on a side-PR, never on main directly); the operator
 promotes it to a real lesson or deletes it. Drafts are intentionally
 manual to promote — the operator stays responsible for what LESSONS says.
 
-What this looks like in practice: the review subagent that posts
-`gh pr review --request-changes` ALSO invokes
+What this looks like in practice: the review subagent that posts a
+`FLEET-VERDICT: blocking` review ALSO invokes
 `_review_emit_lesson_draft <pr> <body-file>` (from `lib/common.sh`,
 ticket 0022). The helper prepends a `<!-- DRAFT: reviewer send-back,
 PR #N, YYYY-MM-DD -->` block AFTER the file header and BEFORE the first
 promoted `## YYYY-MM-DD` entry, dedupe-replacing any existing draft for
 the same PR. A `lesson_draft_emitted {pr, headline}` event fires per
 call so the operator can read draft-promotion debt straight from
-`events.jsonl`. Sign-off (`--comment`) reviews never write to LESSONS —
+`events.jsonl`. Clean (`FLEET-VERDICT: clean`) reviews never write to LESSONS —
 only blocking verdicts do, because only those carry the failure mode
 worth remembering.
+
+## P-10 — A verdict only counts if the merge has to wait for it
+
+A review that auto-merge can ignore is commentary, not a gate. The reviewer
+runs as the PR author, so GitHub rejects its `--approve` and
+`--request-changes`; its verdict therefore travels as a `--comment` whose
+first line is `FLEET-VERDICT: clean` or `FLEET-VERDICT: blocking`, and a
+required `review-gate` check (ticket 0070) passes only on a clean verdict for
+the PR's current head commit. New commits invalidate old verdicts; the
+reviewer re-grades every head. Agents never dismiss, edit or argue with a
+review to make the gate pass — a blocking verdict is healed like red CI,
+inside the same two-attempt cap, and escalates to a human after that.
