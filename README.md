@@ -302,6 +302,10 @@ bash <kit>/lib/install.sh /path/to/repo   # picks up the new reviewer + prompts
 
 Expect merges to take one reviewer tick longer. That's the gate working.
 
+Bootstrap gotcha: the PR that *adds* the workflow fails its own `review-gate`,
+because the gate runs `main`'s copy of `scripts/review-gate.sh` and `main` doesn't
+have it yet. Merge it while the check is still optional, then make it required.
+
 ## Anatomy of a single run
 
 ```mermaid
