@@ -46,7 +46,7 @@ fleet_load_manifest() {
   : "${REPO_URL:?manifest missing REPO_URL}"
   : "${SELF_CANCEL:?manifest missing SELF_CANCEL}"
   PROJECT_NAME="${PROJECT_NAME:-$SLUG}"
-  MODEL="${MODEL:-claude-opus-4-7}"
+  MODEL="${MODEL:-claude-opus-5-5}"
   GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-$PROJECT_NAME Agent}"
   GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-noreply@anthropic.com}"
   # owner/name slug for `gh --repo`, derived from REPO_URL.
@@ -128,7 +128,7 @@ fleet_trainee_remaining() {
 # silently shifts.
 #
 # Formula (must match `bin/fleet prompts-sha`):
-#   find prompts -type f -name '*.md' | sort | xargs cat | shasum -a 256
+#   find prompts -type f -name '*.md' | LC_ALL=C sort | xargs cat | shasum -a 256
 #
 # Resolution of the kit's prompts dir:
 #   1. $FLEET_PROMPTS (set by this file at source time → the canonical path).
@@ -144,10 +144,13 @@ fleet_trainee_remaining() {
 #                          benign prompt edit.
 #
 # Public name: `fleet_check_prompts_sha` (peer of `fleet_check_budget`).
+# LC_ALL=C on the sort: launchd runs in the C locale (capitals first) while an interactive
+# shell sorts case-insensitively, so without it install.sh pinned one hash and every scheduled
+# run computed another, warning prompts_drift forever over identical prompts.
 _fleet_compute_prompts_sha() {
   local dir="${FLEET_PROMPTS:-${FLEET_KIT_ROOT:-}/prompts}"
   [ -d "$dir" ] || return 1
-  ( cd "$dir/.." && find prompts -type f -name '*.md' | sort | xargs cat ) \
+  ( cd "$dir/.." && find prompts -type f -name '*.md' | LC_ALL=C sort | xargs cat ) \
     | shasum -a 256 | awk '{print $1}'
 }
 

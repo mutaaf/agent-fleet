@@ -5,7 +5,7 @@
 #   1. `bin/fleet prompts-sha` prints a 64-hex SHA256 and is deterministic
 #      across two invocations (the headline test).
 #   2. `bin/fleet prompts-sha` matches what
-#      `find prompts -type f -name '*.md' | sort | xargs cat | shasum -a 256`
+#      `find prompts -type f -name '*.md' | LC_ALL=C sort | xargs cat | shasum -a 256`
 #      computes — i.e. it's the documented formula, not a black box.
 #   3. With `PROMPTS_SHA` unset in the manifest, fleet_check_prompts_sha
 #      returns 0 and emits no `prompts_drift` event (no-warn baseline).
@@ -52,8 +52,8 @@ if ! [[ "$SHA1" =~ ^[0-9a-f]{64}$ ]]; then
 fi
 echo "ok: prompts-sha is deterministic ($SHA1)"
 
-# --- assertion 2: matches the documented `find | sort | xargs cat | shasum` formula ---
-WANT=$( (cd "$REPO_ROOT" && find prompts -type f -name '*.md' | sort | xargs cat) | shasum -a 256 | awk '{print $1}' )
+# --- assertion 2: matches the documented `find | LC_ALL=C sort | xargs cat | shasum` formula ---
+WANT=$( (cd "$REPO_ROOT" && find prompts -type f -name '*.md' | LC_ALL=C sort | xargs cat) | shasum -a 256 | awk '{print $1}' )
 if [ "$SHA1" != "$WANT" ]; then
   echo "FAIL: prompts-sha mismatch with documented formula"
   echo "  bin/fleet: $SHA1"
@@ -61,6 +61,19 @@ if [ "$SHA1" != "$WANT" ]; then
   exit 1
 fi
 echo "ok: prompts-sha matches documented formula"
+
+# --- assertion 2b: the hash doesn't depend on the caller's locale ---------
+# launchd runs in the C locale, a terminal usually doesn't; prompts/ mixes CHANGELOG.md and
+# eng.prompt.md, which sort differently in the two. install.sh pins in one, runs check in the other.
+SHA_C=$(LC_ALL=C bash "$REPO_ROOT/bin/fleet" prompts-sha 2>/dev/null | tail -n 1)
+SHA_US=$(LC_ALL=en_US.UTF-8 bash "$REPO_ROOT/bin/fleet" prompts-sha 2>/dev/null | tail -n 1)
+LIB_C=$(LC_ALL=C bash -c 'source "$1/lib/common.sh"; _fleet_compute_prompts_sha' _ "$REPO_ROOT")
+LIB_US=$(LC_ALL=en_US.UTF-8 bash -c 'source "$1/lib/common.sh"; _fleet_compute_prompts_sha' _ "$REPO_ROOT")
+if [ "$SHA_C" != "$SHA_US" ] || [ "$LIB_C" != "$LIB_US" ] || [ "$SHA_C" != "$LIB_C" ]; then
+  echo "FAIL: prompts hash depends on locale (bin C=$SHA_C US=$SHA_US, lib C=$LIB_C US=$LIB_US)"
+  exit 1
+fi
+echo "ok: prompts hash is the same in the C and en_US locales"
 
 # --- shared fixture for the drift-check assertions -----------------------
 MANIFEST_DIR="$TMP/project"

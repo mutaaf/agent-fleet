@@ -59,7 +59,7 @@ CHG
 
 # Compute the kit's prompts SHA via the documented formula so the test can
 # match what --since accepts.
-KIT_SHA=$( (cd "$KIT" && find prompts -type f -name '*.md' | sort | xargs cat) \
+KIT_SHA=$( (cd "$KIT" && find prompts -type f -name '*.md' | LC_ALL=C sort | xargs cat) \
             | shasum -a 256 | awk '{print $1}' )
 
 export FLEET_KIT_ROOT="$KIT"

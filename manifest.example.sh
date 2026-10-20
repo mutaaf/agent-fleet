@@ -13,7 +13,7 @@ PROJECT_NAME="Almanac"                                  # human label, logs only
 SLUG="almanac"                                          # cache/log dir + filenames
 NAMESPACE="com.almanac"                                 # launchd label prefix
 REPO_URL="https://github.com/mutaaf/almanac"            # cloned into ~/.cache/<slug>-agent
-MODEL="claude-opus-4-7"                                 # all agents, all phases
+MODEL="claude-opus-5-5"                                 # all agents, all phases
 
 # Commits the agents author under this identity (your gh token still authorizes).
 GIT_AUTHOR_NAME="Almanac Agent"

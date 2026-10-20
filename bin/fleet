@@ -216,7 +216,7 @@ doctor_repo_lib() {
 doctor_lib_sha() {
   local dir="$1"
   [ -d "$dir" ] || return 0
-  (cd "$dir" && find . -type f -name '*.sh' | sort | xargs shasum 2>/dev/null) | shasum | awk '{print $1}'
+  (cd "$dir" && find . -type f -name '*.sh' | LC_ALL=C sort | xargs shasum 2>/dev/null) | shasum | awk '{print $1}'
 }
 
 # --- prompts-sha ----------------------------------------------------------
@@ -252,7 +252,7 @@ fleet_prompts_sha() {
   fi
   # The ticket's formula verbatim. `find | sort` makes the order stable;
   # `xargs cat` concatenates contents; `shasum -a 256` is on every macOS.
-  ( cd "$prompts_dir/.." && find prompts -type f -name '*.md' | sort | xargs cat ) \
+  ( cd "$prompts_dir/.." && find prompts -type f -name '*.md' | LC_ALL=C sort | xargs cat ) \
     | shasum -a 256 | awk '{print $1}'
 }
 
@@ -341,7 +341,7 @@ prompts_diff_changelog() {
   # the full CHANGELOG. The point of --changelog is to be informational;
   # silence is the wrong default.
   local kit_sha=""
-  kit_sha="$( ( cd "$kit_root" && find prompts -type f -name '*.md' | sort | xargs cat ) \
+  kit_sha="$( ( cd "$kit_root" && find prompts -type f -name '*.md' | LC_ALL=C sort | xargs cat ) \
                 | shasum -a 256 | awk '{print $1}' )"
   if [ -z "$pin" ] || [ "$pin" = "$kit_sha" ]; then
     cat "$kit_chg"
@@ -726,7 +726,7 @@ USAGE
   fi
 
   # Compute the current prompts SHA on disk (the kit's
-  # `find prompts -type f -name '*.md' | sort | xargs cat | shasum -a 256`
+  # `find prompts -type f -name '*.md' | LC_ALL=C sort | xargs cat | shasum -a 256`
   # formula). This is the value pinned in PROMPTS_SHA= manifests and the
   # value the prompts_reverted event records as `from`.
   local from_sha; from_sha="$(fleet_prompts_sha)"
@@ -899,7 +899,7 @@ PROJECT_NAME="$slug"
 SLUG="$slug"
 NAMESPACE="$namespace"
 REPO_URL="$repo_url"
-MODEL="claude-opus-4-7"
+MODEL="claude-opus-5-5"
 
 # Commits the agents author under this identity.
 GIT_AUTHOR_NAME="$slug Agent"
@@ -3368,7 +3368,7 @@ onboarding_check_prompts_sha() {
               printf -- '%s' "${PROMPTS_SHA:-}" ) )"
   fi
   # Compute the kit's current prompts SHA the same way `fleet prompts-sha`
-  # does (find prompts -type f -name '*.md' | sort | xargs cat | shasum).
+  # does (find prompts -type f -name '*.md' | LC_ALL=C sort | xargs cat | shasum).
   # We resolve the kit root via this script's path, the same way kickstart
   # --demo does (BASH_SOURCE-relative, no `dirname` dependency in case
   # PATH is minimal).
@@ -3382,7 +3382,7 @@ onboarding_check_prompts_sha() {
   kit_root="${bin_dir%/*}"
   if [ -d "$kit_root/prompts" ]; then
     cur="$( cd "$kit_root" && find prompts -type f -name '*.md' 2>/dev/null \
-              | sort | xargs cat 2>/dev/null | shasum -a 256 | awk '{print $1}' )"
+              | LC_ALL=C sort | xargs cat 2>/dev/null | shasum -a 256 | awk '{print $1}' )"
   fi
   if [ -z "$pin" ]; then
     printf 'yellow\tPROMPTS_SHA unset — drift events will fire silently forever\n'
@@ -15027,7 +15027,7 @@ STUB
   # `fleet digest` for any real project).
   mkdir -p "$CACHE_DIR"
   printf '{"slug":"%s","phase":"demo","ts_start":"%s","ts_end":"%s","exit":0,"model":"%s","total_cost_usd":0.0,"duration_ms":0,"result_head":"demo synthetic ship cycle"}\n' \
-    "$SLUG" "$RUN_STARTED_UTC" "$(date -u +%FT%TZ)" "${MODEL:-claude-opus-4-7}" \
+    "$SLUG" "$RUN_STARTED_UTC" "$(date -u +%FT%TZ)" "${MODEL:-claude-opus-5-5}" \
     >> "$CACHE_DIR/runs.jsonl"
 
   fleet_emit_event run_completed \
@@ -16212,7 +16212,7 @@ replay_batch() {
     source "$manifest"
     echo "slug='${SLUG:-}'"
     echo "repo_url='${REPO_URL:-}'"
-    echo "model='${MODEL:-claude-opus-4-7}'"
+    echo "model='${MODEL:-claude-opus-5-5}'"
   )"
   repo="$(echo "$repo_url" | sed -E 's#https?://github.com/##; s#\.git$##')"
   cache_dir="$HOME/.cache/${slug}-agent"
@@ -16404,7 +16404,7 @@ USAGE
     source "$manifest"
     echo "slug='${SLUG:-}'"
     echo "repo_url='${REPO_URL:-}'"
-    echo "model='${MODEL:-claude-opus-4-7}'"
+    echo "model='${MODEL:-claude-opus-5-5}'"
   )"
   repo="$(echo "$repo_url" | sed -E 's#https?://github.com/##; s#\.git$##')"
   cache_dir="$HOME/.cache/${slug}-agent"
