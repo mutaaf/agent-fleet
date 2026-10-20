@@ -145,7 +145,7 @@ draft side-PR for blocking verdicts).
 PROMPT
 
   cd "$CACHE_DIR/review-checkout" || { echo "review-checkout missing"; continue; }
-  git checkout main --quiet; git reset --hard origin/main --quiet
+  git checkout -f main --quiet; git reset --hard origin/main --quiet
 done
 
 git checkout main --quiet 2>/dev/null || true

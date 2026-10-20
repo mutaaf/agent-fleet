@@ -1000,7 +1000,12 @@ fleet_checkout() {
   fi
   cd "$workdir"
   git fetch origin --prune --quiet
-  git checkout main --quiet
+  # A run that died on its branch can leave tracked files modified (build steps
+  # regenerate them). A plain `git checkout main` then refuses, and every later
+  # run aborts here. Throw the leftovers away before switching.
+  git reset --hard --quiet
+  git clean -fdq
+  git checkout -f main --quiet
   git reset --hard origin/main --quiet
   git clean -fdq
   git config user.email "$GIT_AUTHOR_EMAIL"
