@@ -7,7 +7,7 @@ PROJECT_NAME="Agent Fleet"
 SLUG="agent-fleet"
 NAMESPACE="com.agent-fleet"
 REPO_URL="https://github.com/mutaaf/agent-fleet"
-MODEL="claude-opus-4-7"
+MODEL="claude-opus-5-5"
 
 GIT_AUTHOR_NAME="Agent Fleet Agent"
 GIT_AUTHOR_EMAIL="noreply@anthropic.com"

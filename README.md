@@ -365,7 +365,7 @@ PROJECT_NAME="Almanac"                                  # human label, logs only
 SLUG="almanac"                                          # cache/log dir + filenames (must equal repo name)
 NAMESPACE="com.almanac"                                 # launchd label prefix
 REPO_URL="https://github.com/mutaaf/almanac"            # cloned into ~/.cache/<slug>-agent
-MODEL="claude-opus-4-7"                                 # all agents, all phases
+MODEL="claude-opus-5-5"                                 # all agents, all phases
 
 # Commits the agents author under this identity (your gh token still authorizes).
 GIT_AUTHOR_NAME="Almanac Agent"
@@ -703,7 +703,7 @@ Each `fleet_run_claude` call writes one line to `~/.cache/<slug>-agent/runs.json
   "ts_start": "2026-05-25T09:41:00Z",
   "ts_end": "2026-05-25T09:47:23Z",
   "exit": 0,
-  "model": "claude-opus-4-7",
+  "model": "claude-opus-5-5",
   "session_id": "...",
   "total_cost_usd": 0.42,
   "duration_ms": 383000,
@@ -822,7 +822,7 @@ Usually one of:
 
 **Can the agents push to `main` directly?** No. Hard rule. Every change goes through a `feat/` / `chore/gtm-` / `eng/` PR, gets graded by review, merges only when CI is green via `--auto --squash`.
 
-**What model do the agents use?** Whatever you set `MODEL=` to in the manifest. Defaults to `claude-opus-4-7` because the work (planning a ticket end-to-end, reading a diff for subtle issues, healing a CI failure) benefits from the strongest reasoning. You can run a project on Sonnet by setting `MODEL="claude-sonnet-4-6"` if you want to test cost trade-offs.
+**What model do the agents use?** Whatever you set `MODEL=` to in the manifest. Defaults to `claude-opus-5-5` because the work (planning a ticket end-to-end, reading a diff for subtle issues, healing a CI failure) benefits from the strongest reasoning. You can run a project on Sonnet by setting `MODEL="claude-sonnet-5-5"` if you want to test cost trade-offs.
 
 **Does the eng agent compete with the ship agent for the same backlog?** No. They consume disjoint queues (feature tickets vs engineering tickets — they're filtered by area tag and branch prefix). Each runs an independent single-PR gate, so neither blocks the other.
 
@@ -851,7 +851,7 @@ See [`DOCTRINE.md`](./DOCTRINE.md) for the full text. The 12 canonical decisions
 | D9 | Naming: `com.<slug>.agent-*` (slug = repo name) |
 | D10 | Spend bound via `SELF_CANCEL`; `fleet status` warns ≤ 3 days out |
 | D11 | Local `claude` CLI on Max plan, no API keys in repos |
-| D12 | `claude-opus-4-7` is the default model for every agent |
+| D12 | `claude-opus-5-5` is the default model for every agent |
 
 ---
 

@@ -78,7 +78,7 @@ chmod +x "$INSTALL_ROOT/lib/"*.sh
 # reads. The two lines move together; the strip pattern catches both.
 PROMPTS_DIR_FOR_PIN="$INSTALL_ROOT/prompts"
 if [ -d "$PROMPTS_DIR_FOR_PIN" ]; then
-  PIN_SHA=$( (cd "$PROMPTS_DIR_FOR_PIN/.." && find prompts -type f -name '*.md' | sort | xargs cat) \
+  PIN_SHA=$( (cd "$PROMPTS_DIR_FOR_PIN/.." && find prompts -type f -name '*.md' | LC_ALL=C sort | xargs cat) \
               | shasum -a 256 | awk '{print $1}' )
   if [ -n "$PIN_SHA" ]; then
     # Ticket 0024: OLD is the previously-installed pin (captured before the
