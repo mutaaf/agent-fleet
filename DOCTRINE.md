@@ -63,7 +63,7 @@ one winner for each, and explains why.
 | D9 | Namespace | launchd label `com.<slug>.agent-*`; cache/logs `~/.cache/<slug>-agent/` | `<slug>` MUST equal the repo name. (fixes CourtIQ's `sportsiq` drift) |
 | D10 | Spend bound | `SELF_CANCEL` in the manifest; `fleet status` warns ≤3 days out | One place to see and bump every project's expiry. |
 | D11 | Cost model | Local `claude` CLI on the Max subscription; **no API keys in repos**, no remote per-session billing | Cheapest for high-frequency polling; no secret surface. (all three) |
-| D12 | Model | `claude-opus-4-7` for all agents | Full-context reasoning for code + review. (all three) |
+| D12 | Model | `claude-opus-5-5` for all agents (the default in lib/common.sh) | Full-context reasoning for code + review. (all three) |
 
 ---
 
